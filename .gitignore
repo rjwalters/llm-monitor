@@ -73,5 +73,15 @@ dist/
 .loom-local/
 # <<< loom-managed <<<
 
+# Sibling copies of Loom's token pool (e.g. `.loom/tokens.shadow-disabled-<ts>/`,
+# hand backups). Loom's managed block above ignores only the exact `.loom/tokens/`,
+# and a sibling copy of it is how 21 live OAuth tokens reached public
+# rjwalters/loom main (a9da48c2). Loom #9046 adds these rules to the managed block
+# on the next re-init; they live out here until then, so no Loom resync commit can
+# sweep a pool copy into this public repo.
+.loom/tokens.*/
+.loom/tokens-*/
+
+
 # Repo Skills machine-local install metadata (absolute source path + timestamp)
 .claude/skills/repo/.install-local.json
