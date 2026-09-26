@@ -955,12 +955,26 @@ class UsageStore: ObservableObject {
     /// two rows with neither id complete.
     // Pure function of its arguments — touches no instance/class main-actor
     // state.
-    private nonisolated static func mergeAccountRow(_ db: Connection, from loserId: String, into survivorId: String) {
+    @discardableResult
+    nonisolated static func mergeAccountRow(_ db: Connection, from loserId: String, into survivorId: String) -> Bool {
         do {
             try db.execute("BEGIN")
             try db.run("UPDATE usage_history SET account_id = ? WHERE account_id = ?", survivorId, loserId)
             try db.run("UPDATE probe_snapshots SET account_id = ? WHERE account_id = ?", survivorId, loserId)
             try db.run("UPDATE named_limits SET account_id = ? WHERE account_id = ?", survivorId, loserId)
+            // Transcript attribution and the calibration series are keyed on
+            // the account id too. A calibration row that would collide with the
+            // survivor's own for the same day is dropped; `recompute` rebuilds
+            // the window from `usage_history`, which now carries both rows'
+            // history under the survivor.
+            if !tableColumns(db, "token_sessions").isEmpty {
+                try db.run("UPDATE token_sessions SET override_account_id = ? WHERE override_account_id = ?", survivorId, loserId)
+                try db.run("UPDATE token_sessions SET inferred_account_id = ? WHERE inferred_account_id = ?", survivorId, loserId)
+            }
+            if !tableColumns(db, "quota_calibration_daily").isEmpty {
+                try db.run("UPDATE OR IGNORE quota_calibration_daily SET account_id = ? WHERE account_id = ?", survivorId, loserId)
+                try db.run("DELETE FROM quota_calibration_daily WHERE account_id = ?", loserId)
+            }
 
             // Exactly one credential survives: the most recently renewed
             // between the two rows (falling back to updated_at for a
@@ -995,16 +1009,47 @@ class UsageStore: ObservableObject {
             try db.run("DELETE FROM accounts WHERE id = ?", loserId)
             try db.execute("COMMIT")
             FileLogger.shared.info(
-                "mergeDuplicateAccountsSharingEmail: merged \(loserId) into \(survivorId)",
+                "mergeAccountRow: merged \(loserId.prefix(8))… into \(survivorId.prefix(8))…",
                 category: "DB"
             )
+            return true
         } catch {
             try? db.execute("ROLLBACK")
             FileLogger.shared.error(
-                "mergeDuplicateAccountsSharingEmail: merge of \(loserId) into \(survivorId) failed: \(error)",
+                "mergeAccountRow: merge of \(loserId.prefix(8))… into \(survivorId.prefix(8))… failed: \(error)",
                 category: "DB"
             )
+            return false
         }
+    }
+
+    /// Move account `oldId` — its row and all of its history — to `newId`.
+    ///
+    /// For a row whose stored id turned out to be wrong: a Claude row is keyed
+    /// on the org id its token reports, and when a (re-)minted token reports a
+    /// different org than the row holds, the history is still this account's,
+    /// only its key is wrong. Copies the row under `newId`, then merges `oldId`
+    /// into it with `mergeAccountRow`, so every account-keyed table moves in
+    /// one transaction. Refuses if `newId` already exists (that is a merge of
+    /// two real accounts, not a re-key).
+    @discardableResult
+    nonisolated static func rekeyAccount(_ db: Connection, from oldId: String, to newId: String) -> Bool {
+        guard oldId != newId,
+              (try? db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", newId)) as? Int64 == 0,
+              (try? db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", oldId)) as? Int64 == 1 else { return false }
+        let others = tableColumns(db, "accounts").subtracting(["id"]).sorted()
+        let list = others.joined(separator: ", ")
+        do {
+            try db.run("INSERT INTO accounts (id, \(list)) SELECT ?, \(list) FROM accounts WHERE id = ?", newId, oldId)
+        } catch {
+            FileLogger.shared.error("rekeyAccount: could not copy \(oldId.prefix(8))…: \(error)", category: "DB")
+            return false
+        }
+        guard mergeAccountRow(db, from: oldId, into: newId) else {
+            try? db.run("DELETE FROM accounts WHERE id = ?", newId)
+            return false
+        }
+        return true
     }
 
     /// Seconds until the account has capacity again — the reset of whichever
