@@ -6,8 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Rolled Claude tokens are read from `~/.claude-oauth` and the Loom pool.**
+  LLM Monitor is now a reader of tokens minted outside it (chezmoi on Macs,
+  and SSM → the Loom pool on workers), not their source. Each changed
+  token is mapped onto the account whose org id it reports, so history is kept.
+  It runs at launch and on every poll tick (an unchanged token costs no network
+  call), and there is `llm-monitor claude sync` to run it on demand. The rolled
+  accounts' keys in `accounts.env` are updated so loom-daemon's `bootstrap`
+  can't copy revoked tokens back.
+
 ### Fixed
 
+- **A Claude account stored under the wrong org id** (agent-18: `7fe8a5ad`,
+  while its token reports `1fdc58c0`) is re-keyed with all its history, and a
+  ping whose org doesn't match its row is now flagged as drift instead of
+  being silently recorded there.
+- **`--db` runs read and rewrote the live `accounts.env`.** The account lists now
+  resolve beside the database in use.
+- **Merging two account rows left transcript attribution and calibration rows
+  behind.** Both now move with the account.
 - **A Loom Codex profile with no reading kept a stale, misleading error.**
   Snapshot mode set the in-memory status but never rewrote
   `oauth_credentials.last_error`, so a linked pre-2.0 row went on showing its
@@ -19,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store but didn't export, so the file kept the previous process's account set
   until some account came due again. It is now exported right after the launch
   poll.
+
 
 ## [2.0.0] - 2026-09-25
 

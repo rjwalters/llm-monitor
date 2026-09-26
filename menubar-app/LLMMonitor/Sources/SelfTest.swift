@@ -74,6 +74,9 @@ enum SelfTest {
         testDataDirectoryMigration()
         testCodexRolloutSnapshotParsing()
         testCodexProfileSyncSnapshotMode()
+        testClaudeTokenFileScanning()
+        testClaudeTokenTargetAndAccountsEnv()
+        testClaudeAccountRekey()
         testCodexAuthParsing()
         testCodexAppServerFraming()
         testCodexAppServerEnvelopeDecoding()
@@ -602,6 +605,121 @@ enum SelfTest {
     /// The wire contract, mapped onto the shared model: windows filed by
     /// duration, a null secondary window left nil, identity picked up from the
     /// same response, and per-model sub-limits landing in `named`.
+    // MARK: Claude token files (chezmoi / Loom pool)
+
+    /// A syntactically valid, obviously fake token (never a real one).
+    static func fakeClaudeToken(_ tag: String) -> String {
+        "sk-ant-oat01-" + String(repeating: "x", count: 80) + tag
+    }
+
+    private static func testClaudeTokenFileScanning() {
+        withSelfTestTempDir("claude-token-files") { dir in
+            let fm = FileManager.default
+            let chezmoi = dir.appendingPathComponent("claude-oauth").path
+            let pool = dir.appendingPathComponent("loom-tokens").path
+            for d in [chezmoi, pool] { try? fm.createDirectory(atPath: d, withIntermediateDirectories: true) }
+            func put(_ d: String, _ name: String, _ body: String) {
+                try? body.write(toFile: (d as NSString).appendingPathComponent(name), atomically: true, encoding: .utf8)
+            }
+            put(chezmoi, "agent1-2amlogic.token", fakeClaudeToken("new") + "\n")
+            put(pool, "agent1-2amlogic.token", fakeClaudeToken("pool"))
+            put(pool, "agent18-2amlogic.token", "  " + fakeClaudeToken("18") + "\n")
+            put(pool, "broken.token", "not a token")
+            put(pool, ".hidden.token", fakeClaudeToken("hidden"))
+            put(pool, "index.json", #"{"version":3,"accounts":[{"name":"agent1-2amlogic","file":"agent1-2amlogic.token","email":"agent-1@example.com"},{"name":"agent18-2amlogic","file":"agent18-2amlogic.token","email":"agent-18@example.com"}]}"#)
+
+            let files = ClaudeTokenFiles.scan(directories: [chezmoi, pool])
+            expectEqual(files.map(\.name), ["agent1-2amlogic", "agent18-2amlogic"],
+                        "token files: malformed and hidden files are skipped, one entry per name")
+            expectEqual(files.first?.token, fakeClaudeToken("new"), "the chezmoi copy wins over the pool's for the same name")
+            expectEqual(files.first?.email, "agent-1@example.com", "the pool index supplies the email for a chezmoi file too")
+            expectEqual(files.last?.token, fakeClaudeToken("18"), "whitespace around a token is stripped")
+
+            expectEqual(ClaudeTokenFiles.directories(environment: ["LLM_MONITOR_CLAUDE_TOKEN_DIRS": "/a:/b"]), ["/a", "/b"],
+                        "LLM_MONITOR_CLAUDE_TOKEN_DIRS replaces the default list")
+            let noPool = ClaudeTokenFiles.directories(environment: ["LOOM_SHARED_TOKENS_DIR": " "])
+            expect(noPool.count == 1 && noPool[0].hasSuffix(".claude-oauth"),
+                   "an explicitly empty LOOM_SHARED_TOKENS_DIR drops the pool, as in loom-daemon")
+            expectEqual(ClaudeTokenFiles.directories(environment: ["LOOM_SHARED_TOKENS_DIR": "/pool"]).last, "/pool",
+                        "LOOM_SHARED_TOKENS_DIR moves the pool")
+            expect(ClaudeTokenFiles.parseToken("sk-ant-oat01-short") == nil, "a truncated token is rejected")
+        }
+    }
+
+    private static func testClaudeTokenTargetAndAccountsEnv() {
+        let ids: Set<String> = ["org-a", "org-wrong18"]
+        let byEmail = ["agent-1@x.com": "org-a", "agent-18@x.com": "org-wrong18"]
+        expectEqual(ClaudeTokenFiles.resolveTarget(reportedOrg: "org-a", fileEmail: "agent-1@x.com",
+                                                   existingIds: ids, claudeIdByEmail: byEmail),
+                    .roll(accountId: "org-a"), "a token whose org has a row rolls that row in place")
+        expectEqual(ClaudeTokenFiles.resolveTarget(reportedOrg: "org-real18", fileEmail: "AGENT-18@x.com",
+                                                   existingIds: ids, claudeIdByEmail: byEmail),
+                    .rekey(from: "org-wrong18", to: "org-real18"),
+                    "an unknown org plus a known email re-keys the mis-keyed row (the agent-18 case)")
+        expectEqual(ClaudeTokenFiles.resolveTarget(reportedOrg: "org-new", fileEmail: nil,
+                                                   existingIds: ids, claudeIdByEmail: byEmail),
+                    .create(accountId: "org-new"), "an unknown org with no email is a new account")
+
+        let env = """
+            # header comment
+            ACCOUNT_EMAIL_1=agent-1@x.com
+            ACCOUNT_KEY_1=OLD-1
+            ACCOUNT_EMAIL_2=robb@x.com
+            ACCOUNT_KEY_2=OLD-CLAUDE
+            ACCOUNT_EMAIL_3=robb@x.com
+            ACCOUNT_KEY_3=ZAI-KEY
+            ACCOUNT_PROVIDER_3=zai
+            """
+        let result = ClaudeTokenFiles.rewriteAccountsEnv(env, keysByEmail: ["agent-1@x.com": "NEW-1", "ROBB@x.com": "NEW-R"])
+        expectEqual(result?.replaced, 2, "both rolled Claude entries are replaced")
+        expect(result?.content.contains("ACCOUNT_KEY_1=NEW-1") == true && result?.content.contains("ACCOUNT_KEY_2=NEW-R") == true,
+               "rolled keys land on their own index")
+        expect(result?.content.contains("ACCOUNT_KEY_3=ZAI-KEY") == true,
+               "another provider's entry sharing the email is never given a Claude token")
+        expect(result?.content.hasPrefix("# header comment") == true, "comments and order are preserved")
+        expect(ClaudeTokenFiles.rewriteAccountsEnv(env, keysByEmail: ["agent-1@x.com": "OLD-1"]) == nil,
+               "an unchanged key rewrites nothing")
+
+        expect(OAuthPoller.claudeOrgDriftMessage(rowId: "org-a", reportedOrg: "org-a") == nil, "no drift for a matching org")
+        expect(OAuthPoller.claudeOrgDriftMessage(rowId: "org-a", reportedOrg: "") == nil, "no org reported is not drift")
+        expect(OAuthPoller.claudeOrgDriftMessage(rowId: "org-wrong18", reportedOrg: "org-real18")?.contains("org-real") == true,
+               "a mismatched org is reported, naming the org the token answers as")
+    }
+
+    private static func testClaudeAccountRekey() {
+        withSelfTestTempDir("claude-rekey") { dir in
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+            let db = try! openDatabase(dbPath)
+            try! db.run("INSERT INTO accounts (id, account_name, email, provider, sort_order) VALUES ('org-wrong18', 'agent-18', 'agent-18@x.com', 'anthropic', 7)")
+            try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES ('org-other', 'other', 'other@x.com', 'anthropic')")
+            try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic) VALUES ('org-wrong18', '2026-09-20T00:00:00Z', 40, 0)")
+            try! db.run("INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers) VALUES ('org-wrong18', '2026-09-20T00:00:00Z', 'haiku', 200, '{}')")
+            try! db.run("INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent) VALUES ('org-wrong18', '2026-09-20T00:00:00Z', 'x', 1)")
+            try! db.run("INSERT INTO oauth_credentials (account_id, label, source, access_token, is_active, created_at, updated_at) VALUES ('org-wrong18', 'agent-18', 'token', 'DEAD', 1, 'now', 'now')")
+            try! db.run("INSERT INTO token_sessions (session_id, first_message_ts, override_account_id) VALUES ('s1', '2026-09-20T00:00:00Z', 'org-wrong18')")
+            try! db.run("INSERT INTO quota_calibration_daily (day, scope, account_id, points_consumed, weights_version, computed_at) VALUES ('2026-09-20', 'account', 'org-wrong18', 3, 'test', '2026-09-20T00:00:00Z')")
+            try! db.run("INSERT OR REPLACE INTO settings (key, value) VALUES ('primary_account_id', 'org-wrong18')")
+
+            expect(!UsageStore.rekeyAccount(db, from: "org-wrong18", to: "org-other"),
+                   "re-keying onto an existing account is refused (that would merge two real accounts)")
+            expect(UsageStore.rekeyAccount(db, from: "org-wrong18", to: "org-real18"), "a mis-keyed row is re-keyed")
+
+            func count(_ sql: String) -> Int64 { (try? db.scalar(sql)) as? Int64 ?? -1 }
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = 'org-wrong18'"), 0, "the old id is gone")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = 'org-real18' AND email = 'agent-18@x.com' AND sort_order = 7"), 1,
+                        "the row keeps its email and position under the new id")
+            for (table, column) in [("usage_history", "account_id"), ("probe_snapshots", "account_id"),
+                                    ("named_limits", "account_id"), ("oauth_credentials", "account_id"),
+                                    ("token_sessions", "override_account_id"), ("quota_calibration_daily", "account_id")] {
+                expectEqual(count("SELECT COUNT(*) FROM \(table) WHERE \(column) = 'org-real18'"), 1,
+                            "re-key moves \(table).\(column) with the account")
+            }
+            expectEqual((try? db.scalar("SELECT value FROM settings WHERE key = 'primary_account_id'")) as? String, "org-real18",
+                        "a pinned menu-bar account follows the re-key")
+        }
+    }
+
     // MARK: Loom Codex profiles (snapshot mode)
 
     /// A real codex-cli 0.156 `token_count` line, identity fields removed.

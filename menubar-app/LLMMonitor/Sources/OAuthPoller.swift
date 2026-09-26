@@ -158,6 +158,18 @@ class OAuthPoller: ObservableObject {
     private let apiClient = AnthropicAPIClient()
     private let openAIClient = OpenAIAPIClient()
     private let zaiClient = ZaiAPIClient()
+    /// Claude rows whose org-id drift has been logged this process, so the
+    /// warning is written once, not every poll.
+    private var claudeDriftReported = Set<String>()
+
+    /// The drift diagnostic for a Claude row, or nil when the token reports
+    /// the row's own org (or no org at all). Pure, for the self-test.
+    nonisolated static func claudeOrgDriftMessage(rowId: String, reportedOrg: String) -> String? {
+        guard !reportedOrg.isEmpty, reportedOrg != rowId else { return nil }
+        return "This token answers as org \(reportedOrg.prefix(8))…, not this account's \(rowId.prefix(8))…, "
+            + "so its usage is not recorded here. Put the account's token in its token file "
+            + "(~/.claude-oauth or the Loom pool); the next sync re-keys or rolls the row."
+    }
     @Published var lastError: String?
     @Published var credentialStatuses: [CredentialStatus] = []
 
@@ -726,6 +738,126 @@ class OAuthPoller: ObservableObject {
         return results
     }
 
+    // MARK: - Claude token files (chezmoi / Loom pool)
+
+    /// Whether any credential row already holds exactly `token` — the cheap
+    /// check that keeps an unchanged token file from being re-pinged.
+    private func isClaudeTokenStored(_ token: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath, readonly: true) else { return false }
+        return ((try? db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE access_token = ?", token)) as? Int64 ?? 0) > 0
+    }
+
+    /// Read every Claude token file (`ClaudeTokenFiles.directories`) and map
+    /// each new or rolled token onto its account, keyed on the org id the
+    /// token itself reports:
+    ///
+    /// - **roll**: that org already has a row — its credential is replaced in
+    ///   place, so its history is kept (`token_rolled_at` is stamped).
+    /// - **re-key**: no row has that org, but the file's email names an
+    ///   existing Claude row stored under another id. The stored id is wrong
+    ///   (agent-18's case in the 2026-09-26 roll); the row and all its history
+    ///   move to the reported org (`UsageStore.rekeyAccount`).
+    /// - **create**: a new account.
+    ///
+    /// An unchanged token is skipped with no network call, so this runs on
+    /// every poll tick. A token the API rejects is reported and changes
+    /// nothing. Afterwards the operator's `accounts.env` files get the new
+    /// token for every account rolled here, because loom-daemon's `tokens
+    /// bootstrap` ranks that file first and would otherwise copy revoked
+    /// tokens back over the rolled pool.
+    @discardableResult
+    func syncClaudeTokenFiles(directories: [String] = ClaudeTokenFiles.directories()) async -> [EnvImportResult] {
+        var results: [EnvImportResult] = []
+        var rolledByEmail: [String: String] = [:]
+        for file in ClaudeTokenFiles.scan(directories: directories) where !isClaudeTokenStored(file.token) {
+            let label = file.email ?? file.name
+            let ping: PingResponse
+            do {
+                ping = try await apiClient.pingToken(accessToken: file.token)
+            } catch {
+                let why: String
+                if case ProviderAPIError.unauthorized = error {
+                    why = "token file \(file.name) was rejected (401): not a live token"
+                } else {
+                    why = "could not verify token file \(file.name): \(error.localizedDescription)"
+                }
+                flog.warning("syncClaudeTokenFiles: \(why)", category: fcat)
+                results.append(EnvImportResult(email: label, success: false, error: why))
+                continue
+            }
+            let org = ping.organizationId
+            guard !org.isEmpty, FileManager.default.fileExists(atPath: dbPath),
+                  let db = try? openDatabase(dbPath) else {
+                results.append(EnvImportResult(email: label, success: false, error: "token file \(file.name) reported no org id"))
+                continue
+            }
+            var existingIds = Set<String>()
+            var claudeIdByEmail: [String: String] = [:]
+            if let rows = try? db.prepare(
+                "SELECT id, lower(email) FROM accounts WHERE COALESCE(provider, 'anthropic') = 'anthropic'") {
+                for row in rows {
+                    guard let id = row[0] as? String else { continue }
+                    existingIds.insert(id)
+                    if let email = row[1] as? String, claudeIdByEmail[email] == nil { claudeIdByEmail[email] = id }
+                }
+            }
+            let target = ClaudeTokenFiles.resolveTarget(
+                reportedOrg: org, fileEmail: file.email,
+                existingIds: existingIds, claudeIdByEmail: claudeIdByEmail)
+            switch target {
+            case .rekey(let from, let to):
+                guard UsageStore.rekeyAccount(db, from: from, to: to) else {
+                    results.append(EnvImportResult(email: label, success: false,
+                                                   error: "could not move \(label) to the org its token reports"))
+                    continue
+                }
+                flog.warning("syncClaudeTokenFiles: \(file.name): stored id \(from.prefix(8))… was wrong; "
+                             + "moved the account and its history to \(to.prefix(8))…, the org its token reports",
+                             category: fcat)
+            case .roll(let id):
+                // The token belongs to this org's row. If the file's email
+                // names someone else, the file is mislabelled; the org wins.
+                if let fileEmail = file.email?.lowercased(),
+                   let rowEmail = claudeIdByEmail.first(where: { $0.value == id })?.key, rowEmail != fileEmail {
+                    flog.warning("syncClaudeTokenFiles: \(file.name) is labelled \(fileEmail) but its token answers as "
+                                 + "the account \(rowEmail); storing it there", category: fcat)
+                }
+            case .create:
+                break
+            }
+            saveCredentialForAccount(
+                accountId: org, email: file.email, orgName: nil, plan: "Max",
+                accessToken: file.token, source: "token-file")
+            writePingToDB(accountId: org, ping: ping)
+            if let email = claudeIdByEmail.first(where: { $0.value == org })?.key ?? file.email?.lowercased() {
+                rolledByEmail[email] = file.token
+            }
+            flog.info("syncClaudeTokenFiles: \(file.name) → org \(org.prefix(8))… (\(target))", category: fcat)
+            results.append(EnvImportResult(email: label, success: true, error: nil))
+        }
+        if !rolledByEmail.isEmpty { updateAccountsEnvFiles(keysByEmail: rolledByEmail) }
+        return results
+    }
+
+    /// Replace the rolled accounts' `ACCOUNT_KEY_N` in the master and local
+    /// `accounts.env` (only lines for those emails change; the file stays
+    /// `0600`, written atomically). Logs counts, never keys.
+    private func updateAccountsEnvFiles(keysByEmail: [String: String]) {
+        for path in [masterAccountsPath, localAccountsPath] {
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8),
+                  let (updated, replaced) = ClaudeTokenFiles.rewriteAccountsEnv(content, keysByEmail: keysByEmail)
+            else { continue }
+            do {
+                try updated.write(toFile: path, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+                flog.info("Updated \(replaced) rolled key(s) in \((path as NSString).lastPathComponent)", category: fcat)
+            } catch {
+                flog.error("Could not update \((path as NSString).lastPathComponent): \(error.localizedDescription)", category: fcat)
+            }
+        }
+    }
+
     // MARK: - Loom Codex profiles (snapshot mode)
 
     /// What a snapshot-mode row with no reading yet says. One literal for the
@@ -1273,13 +1405,17 @@ class OAuthPoller: ObservableObject {
     // MARK: - Account List Files (master + local override)
 
     /// Master account list — the shared source of truth.
+    /// Beside the database, like `ranking.json` for the CLIs: for the default
+    /// store that is `~/.llm-monitor/accounts.env`, and a `--db` run reads (and,
+    /// after a token roll, rewrites) the lists next to *its* database — never the
+    /// live ones.
     private var masterAccountsPath: String {
-        AppPaths.path("accounts.env")
+        ((dbPath as NSString).deletingLastPathComponent as NSString).appendingPathComponent("accounts.env")
     }
 
     /// Local override/additions — never shared; wins over master by email.
     private var localAccountsPath: String {
-        AppPaths.path("accounts.local.env")
+        ((dbPath as NSString).deletingLastPathComponent as NSString).appendingPathComponent("accounts.local.env")
     }
 
     /// Load the master account list plus the local override/additions file, merge
@@ -1336,7 +1472,7 @@ class OAuthPoller: ObservableObject {
 
         guard !merged.isEmpty else {
             flog.info("syncFromAccountFiles: no account list files found", category: fcat)
-            return zaiResults
+            return zaiResults + (await syncClaudeTokenFiles())
         }
 
         flog.info("syncFromAccountFiles: importing \(merged.count) merged account(s)", category: fcat)
@@ -1361,7 +1497,10 @@ class OAuthPoller: ObservableObject {
             let (_, error) = await addAccountWithToken(token, email: pair.email)
             results.append(EnvImportResult(email: pair.email, success: error == nil, error: error))
         }
-        return results + zaiResults
+        // Rolled Claude tokens (chezmoi / Loom pool) last, so a revoked key
+        // still sitting in accounts.env cannot win, and the file is corrected
+        // in the same pass.
+        return results + zaiResults + (await syncClaudeTokenFiles())
     }
 
     // MARK: - Save Credential for Account
@@ -1797,6 +1936,9 @@ class OAuthPoller: ObservableObject {
 
     /// Poll any accounts whose poll interval has elapsed. Returns count of accounts polled.
     func pollDue() async -> Int {
+        // A token rolled while the app runs is picked up within one tick; an
+        // unchanged token file costs a file read and no network call.
+        await syncClaudeTokenFiles()
         let credentials = loadActiveCredentials()
         reportStrandedCodexIdentities()
         guard !credentials.isEmpty else { return 0 }
@@ -2112,6 +2254,20 @@ class OAuthPoller: ObservableObject {
             flog.warning("Credential \(credential.label) has no account_id", category: fcat)
             return
         }
+
+        // A Claude row is keyed on the org its token reports. A mismatch means
+        // either the row's id is wrong or the token belongs to another account;
+        // both used to be written here silently under the row's id (agent-18
+        // in the 2026-09-26 roll). Flag it instead of attributing the reading.
+        if let message = Self.claudeOrgDriftMessage(rowId: accountId, reportedOrg: ping.organizationId) {
+            if claudeDriftReported.insert(accountId).inserted {
+                flog.warning("\(credential.label): \(message)", category: fcat)
+                if let id = credential.id { persistCredentialError(id: id, error: message) }
+            }
+            updateCredentialStatus(credential, status: .drifted, error: message)
+            return
+        }
+        claudeDriftReported.remove(accountId)
 
         writePingToDB(accountId: accountId, ping: ping)
         updateCredentialLastPoll(credential, error: nil)
