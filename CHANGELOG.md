@@ -4,7 +4,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.1.0] - 2026-09-26
+
+### Summary
+
+Follows the 2026-09-26 Claude OAuth pool roll. LLM Monitor now **reads** rolled
+Claude tokens from `~/.claude-oauth` (chezmoi) and the Loom pool, instead of
+being their source. Each token is mapped onto the account whose org id it
+reports, so every account keeps its history, and a mis-keyed account is re-keyed.
+The release also persists clearer diagnostics for Loom Codex profiles that aren't
+logged in, writes `ranking.json` on launch, and keeps sibling copies of the Loom
+token pool out of git.
 
 ### Added
 
@@ -19,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Sibling copies of the Loom token pool could be committed** (#217).
+  `.loom/tokens.*/` and `.loom/tokens-*/` are now ignored in this public repo;
+  a sibling copy is how the pool leaked into `rjwalters/loom`.
 - **A Claude account stored under the wrong org id** (agent-18: `7fe8a5ad`,
   while its token reports `1fdc58c0`) is re-keyed with all its history, and a
   ping whose org doesn't match its row is now flagged as drift instead of
