@@ -41,7 +41,11 @@ enum ClaudeCLI {
         }
         let directories = dirs.isEmpty ? ClaudeTokenFiles.directories() : dirs
         let files = ClaudeTokenFiles.scan(directories: directories)
-        print("Token directories: \(directories.map { ($0 as NSString).abbreviatingWithTildeInPath }.joined(separator: ", "))")
+        // `abbreviatingWithTildeInPath` is macOS-only; a home path names a user,
+        // so it is collapsed to `~` either way.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        func tilde(_ p: String) -> String { p.hasPrefix(home) ? "~" + p.dropFirst(home.count) : p }
+        print("Token directories: \(directories.map(tilde).joined(separator: ", "))")
         print("Token files found: \(files.count)")
 
         let storePath = dbPath
