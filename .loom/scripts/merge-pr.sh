@@ -1382,74 +1382,54 @@ info "Branch: $PR_BRANCH"
 # forge type elsewhere. Every step is best-effort and must never fail the merge.
 
 # Reset a single referenced issue's labels if — verified fresh at merge time —
-# it is still open and still carries loom:building. Idempotent: a no-op when the
-# issue is already closed, already lacks loom:building (e.g. re-claimed by a
-# second builder), or is actually a PR.
+# it is still open and still carries loom:building (reopening it first when
+# this very merge auto-closed it through a stray closing keyword, #4569).
+# Idempotent: a no-op when the issue is already closed, already lacks
+# loom:building (e.g. re-claimed by a second builder), or is actually a PR.
+#
+# The decision — which of those cases this is, and the log text for each — is
+# `loom-daemon merge-pr partial-reset` (Rust, loom-daemon/src/merge_pr/
+# partial_reset.rs — #8191 slice), fed the fresh issue body on stdin. It prints
+# the steps in order: `INFO`/`WARNING<TAB>text` to replay, `REOPEN`, `SWAP`.
+# Only the mutations and their audit comments stay here. The fresh read uses
+# plain `gh api` (uncached; not $GH, which may be gh-cached) so a stale cached
+# view cannot mask a re-claim. Best-effort like the rest of this pass: a daemon
+# that cannot plan (missing, or predating the verb) is a warning naming the
+# manual swap, never a guessed mutation. The plan is read on fd 3 so no forge
+# call below can consume it from stdin.
 _reset_one_partial_issue() {
-  local issue_num="$1"
-  local issue_json issue_state issue_labels reopened=false
-
-  # Fresh (uncached) read so we see the label state AS OF the merge, not as of
-  # PR creation. Plain `gh api` is uncached; use it directly (not $GH, which may
-  # be gh-cached) to avoid a stale cached view masking a fresh re-claim.
+  local issue_num="$1" issue_json reopened=false out rc=0 level text flags=()
   issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
-
-  # The GitHub issues endpoint also returns PRs (a PR is an issue with a
-  # .pull_request member). Never mutate a PR that slipped through the regex.
-  if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
-    return 0
-  fi
-
-  issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
-  if [[ "$issue_state" != "open" ]]; then
-    # #4569: a partial-increment issue that was OPEN pre-merge and is closed now
-    # was closed BY this merge. If the pre-merge guard recorded a closing
-    # reference to it from this very PR (a stray `close #N` in prose, or a
-    # Development-sidebar link), that close contradicts the PR's own declared
-    # `Part of` / `Contributes to` intent — revert it, then fall through to the
-    # normal label swap so the issue re-enters the ready queue.
-    if _partial_ref_is_conflicted "$issue_num"; then
-      warning "Partial-increment reset: issue #$issue_num was auto-closed by PR #$PR_NUMBER's merge despite its non-closing \`Part of\`/\`Contributes to\` reference (a closing reference to #$issue_num was detected pre-merge) — reopening (#4569)"
-      # forge_gh_reopen_issue_rl_safe (#4856): falls back to a REST PATCH
-      # (state=open) when `gh issue reopen`'s GraphQL mutation is rate-limited.
-      if forge_gh_reopen_issue_rl_safe "$REPO_NWO" "$issue_num" 2>/dev/null; then
-        success "Issue #$issue_num reopened (premature auto-close reverted)"
-        reopened=true
-        _post_premature_close_comment "$issue_num"
-      else
-        warning "Could not reopen issue #$issue_num after its premature auto-close — reopen manually: gh issue reopen $issue_num --repo $REPO_NWO"
-        return 0
-      fi
-    elif _partial_ref_was_open_before_merge "$issue_num"; then
-      # Open before the merge, closed after it, but this PR carries no closing
-      # reference we can attribute it to. Could be a deliberate close by a human
-      # or another agent in the same window, so do NOT revert it — just make the
-      # coincidence loud enough to investigate.
-      warning "Partial-increment reset: issue #$issue_num was open before PR #$PR_NUMBER merged and is now closed (state='${issue_state:-unknown}'), but no closing reference to it was detected on this PR — NOT reopening automatically (it may be a deliberate close). If this was a premature auto-close, reopen it with: gh issue reopen $issue_num --repo $REPO_NWO"
-      return 0
-    else
-      info "Partial-increment reset: issue #$issue_num is not open (state='${issue_state:-unknown}') — skipping"
-      return 0
-    fi
-  fi
-
-  issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
-  if ! printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
-    info "Partial-increment reset: issue #$issue_num is not loom:building — skipping (idempotent)"
-    return 0
-  fi
-
-  info "Partial-increment reset: PR #$PR_NUMBER merged as a partial slice of #$issue_num; returning it to the ready queue"
-  # forge_gh_swap_label_rl_safe (#4856): falls back to REST (DELETE the old
-  # label, POST the new one) when `gh issue edit`'s GraphQL mutation is
-  # rate-limited, rather than silently dropping the label swap.
-  if forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue" 2>/dev/null; then
-    success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
-    local ts comment reopen_note=""
-    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    [[ "$reopened" == "true" ]] && reopen_note="
+  ! _partial_ref_is_conflicted "$issue_num" || flags+=(--conflicted)
+  ! _partial_ref_was_open_before_merge "$issue_num" || flags+=(--open-before-merge)
+  out="$(printf '%s\n' "$issue_json" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr partial-reset --issue "$issue_num" --pr "$PR_NUMBER" --repo "$REPO_NWO" ${flags[@]+"${flags[@]}"} 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 ]]; then warning "Partial-increment reset for issue #$issue_num did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr partial-reset' exited $rc (a loom-daemon predating #8191's slice has no such verb). Advisory only — the merge already happened and #$issue_num was left untouched; if it is still open and loom:building, return it to the ready queue by hand: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building --add-label loom:issue $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; return 0; fi
+  while IFS=$'\t' read -r -u 3 level text; do
+    case "$level" in
+      INFO) info "$text" ;;
+      WARNING) warning "$text" ;;
+      REOPEN)
+        # forge_gh_reopen_issue_rl_safe (#4856): falls back to a REST PATCH
+        # (state=open) when `gh issue reopen`'s GraphQL mutation is rate-limited.
+        if forge_gh_reopen_issue_rl_safe "$REPO_NWO" "$issue_num" 2>/dev/null; then
+          success "Issue #$issue_num reopened (premature auto-close reverted)"
+          reopened=true
+          _post_premature_close_comment "$issue_num"
+        else
+          warning "Could not reopen issue #$issue_num after its premature auto-close — reopen manually: gh issue reopen $issue_num --repo $REPO_NWO"
+          return 0
+        fi ;;
+      SWAP)
+        # forge_gh_swap_label_rl_safe (#4856): falls back to REST (DELETE the old
+        # label, POST the new one) when `gh issue edit`'s GraphQL mutation is
+        # rate-limited, rather than silently dropping the label swap.
+        if forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue" 2>/dev/null; then
+          success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
+          local ts comment reopen_note=""
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          [[ "$reopened" == "true" ]] && reopen_note="
 - **Reopened** this issue (GitHub had auto-closed it from a stray closing keyword in PR #$PR_NUMBER's body or one of its commit messages — see #4569)"
-    comment="## Partial Increment Merged
+          comment="## Partial Increment Merged
 
 PR #$PR_NUMBER merged with a non-closing \`Part of\` / \`Contributes to\` reference, so this issue remains **open** for further work.
 
@@ -1461,13 +1441,16 @@ This issue is now available for the next increment (a subsequent \`/loom:sweep\`
 
 ---
 *Reset by merge-pr.sh (#3667) at $ts*"
-    # forge_gh_comment_rl_safe (#4856): falls back to the REST comments
-    # endpoint on a GraphQL rate-limit rejection.
-    forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment" 2>/dev/null || \
-      warning "Could not post partial-increment comment on issue #$issue_num (label swap still applied)"
-  else
-    warning "Could not reset labels on issue #$issue_num (partial increment) — may need manual 'gh issue edit'"
-  fi
+          # forge_gh_comment_rl_safe (#4856): falls back to the REST comments
+          # endpoint on a GraphQL rate-limit rejection.
+          forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment" 2>/dev/null || \
+            warning "Could not post partial-increment comment on issue #$issue_num (label swap still applied)"
+        else
+          warning "Could not reset labels on issue #$issue_num (partial increment) — may need manual 'gh issue edit'"
+        fi
+        ;;
+    esac
+  done 3<<< "$out"
 }
 
 # Audit trail for a reverted premature auto-close (#4569). Posted right after
@@ -1567,33 +1550,28 @@ _reset_partial_increment_labels() {
 # present. Idempotent: a no-op when the issue isn't actually closed (a
 # transient PR-close-target false positive, or #4569 reopened it above),
 # already lacks the label, or is actually a PR.
+#
+# The decision — which of those cases this is — is `loom-daemon merge-pr
+# closed-building` (Rust, loom-daemon/src/merge_pr/closed_building.rs — #8191
+# slice), fed the fresh issue body on stdin. It prints exactly one line:
+# `STRIP`, or `SKIP<TAB><reason>` which this pass deliberately discards (the
+# retired function's skips were silent and stdout stays byte-identical). Only
+# the mutation stays here. The fresh read uses plain `gh api` (uncached; not
+# $GH, which may be gh-cached) so a stale cached view cannot mask a fresh
+# re-claim — the same freshness discipline _reset_one_partial_issue keeps.
+# Best-effort like the rest of this pass: a daemon that cannot decide, or that
+# answers with anything but the two known lines, is a warning naming the manual
+# removal, never a guessed mutation. Silence is NOT read as `SKIP`.
 _strip_one_closed_issue_building_label() {
-  local issue_num="$1"
-  local issue_json issue_state issue_labels
+  local issue_num="$1" issue_json out rc=0
 
-  # Fresh (uncached) read, mirroring _reset_one_partial_issue's freshness
-  # discipline: we need the label/state AS OF right now, not as of PR
-  # creation or the GraphQL closingIssuesReferences snapshot.
   issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
-
-  # A PR is also an "issue" on this endpoint (has a .pull_request member).
-  if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+  out="$(printf '%s\n' "$issue_json" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr closed-building 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 || ( "$out" != "STRIP" && "$out" != "SKIP"$'\t'* ) ]]; then
+    warning "Closed-issue loom:building cleanup for issue #$issue_num did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr closed-building' exited $rc and printed '${out//$'\n'/ }' rather than STRIP or SKIP (a loom-daemon predating #8191's slice has no such verb). Advisory only — the merge already happened and #$issue_num was left untouched; if it is closed and still loom:building, drop the stale claim by hand: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
     return 0
   fi
-
-  issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
-  if [[ "$issue_state" != "closed" ]]; then
-    # Not (or no longer) closed — either a #4569 revert just reopened it, the
-    # forge's close hadn't landed yet when we read it, or it was never
-    # actually closed. Leave the label; a later merge or the standalone
-    # cleanup script will catch it once it genuinely closes.
-    return 0
-  fi
-
-  issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
-  if ! printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
-    return 0
-  fi
+  [[ "$out" == "STRIP" ]] || return 0
 
   if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" 2>/dev/null; then
     success "Issue #$issue_num: removed stale loom:building label (closed by this merge, #6199)"

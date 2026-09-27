@@ -37,6 +37,17 @@
 #            poll comes back complete.
 #   Part 4 — source-wiring assertions, so a refactor that drops `--paginate`
 #            or the short-read check fails here rather than in production.
+#   Part 5 — the GITEA branch's own pagination + fail-closed contract (#8987).
+#
+# Gitea follow-up (#8987): #8895 fixed only the GitHub branch. The Gitea branch
+# made ONE unpaginated `GET /repos/{o}/{r}/commits/{sha}/statuses` call, which
+# Gitea caps at `DEFAULT_PAGING_NUM` (30) / `MAX_RESPONSE_ITEMS` (50) — the same
+# truncation class — and derived `total_count` from `length` of the rows that
+# arrived, so no short-read check could ever fire there: a truncated read looked
+# self-consistent. Part 5 pins the fix: page to exhaustion through
+# `_forge_gitea_paginate` (which returns nonzero on ANY page failure or page-cap
+# trip rather than reporting a short list), so `total_count` counts a COMPLETE
+# read instead of one page.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-forge-check-runs-pagination.sh
@@ -119,6 +130,10 @@ source "$FORGE_HELPERS_SRC"
 set +e
 set -uo pipefail
 FORGE_TYPE="github"
+
+# Part 3 replaces forge_get_check_runs with a queue-replaying stub, so stash the
+# REAL definition now — Part 5 restores it to exercise the Gitea branch.
+_REAL_GET_CHECK_RUNS="$(declare -f forge_get_check_runs)"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR" 2>/dev/null || true' EXIT
@@ -464,6 +479,170 @@ assert_contains "$_fgcr_block" 'return "$FORGE_CHECK_RUNS_RC_TRUNCATED"' \
 _wfctsm_block="$(awk '/^_wait_for_checks_then_sync_merge\(\)/{f=1} f; /^\}/{if (f) exit}' "$MERGE_PR_SRC")"
 assert_contains "$_wfctsm_block" 'FORGE_CHECK_RUNS_RC_TRUNCATED' \
   "_wait_for_checks_then_sync_merge distinguishes a truncated read in its narration"
+
+# =============================================================================
+# Part 5: the GITEA branch pages to exhaustion and fails closed (#8987)
+# =============================================================================
+# `gitea_api` is stubbed as a shell function (rather than PATH-shimming curl) so
+# the assertions land on `forge_get_check_runs` + `_forge_gitea_paginate`
+# themselves: which paths are requested, and what the helper does with the pages
+# it gets back.
+echo ""
+echo "Testing forge_get_check_runs Gitea-branch pagination (#8987)..."
+
+GITEA_PAGES_DIR="$WORK_DIR/gitea-pages"
+GITEA_ARGV_FILE="$WORK_DIR/gitea-argv.txt"
+mkdir -p "$GITEA_PAGES_DIR"
+
+# Undo Part 3's stub: from here on, the REAL helper is under test again.
+eval "$_REAL_GET_CHECK_RUNS"
+FORGE_TYPE="gitea"
+
+# Stands in for the real `gitea_api GET <path>`: records the path, serves the
+# fixture for the requested page (an empty array when there is none), and fails
+# for any page marked to fail.
+gitea_api() {
+    printf '%s\n' "$*" >> "$GITEA_ARGV_FILE"
+    local path="${2:-}" page="1"
+    [[ "$path" =~ page=([0-9]+) ]] && page="${BASH_REMATCH[1]}"
+    if [[ -f "$GITEA_PAGES_DIR/fail-page-$page" ]]; then
+        echo "stub gitea_api: page $page unavailable" >&2
+        return 1
+    fi
+    local fixture="$GITEA_PAGES_DIR/page-$(printf '%03d' "$page").json"
+    if [[ -f "$fixture" ]]; then cat "$fixture"; else echo '[]'; fi
+}
+
+# One page of Gitea commit statuses. Contexts are named status-<n> so a fold
+# that drops or duplicates a page shows up in the unique-name count.
+mk_gitea_page() {  # <page-number> <row-count> <name-offset> [status]
+    jq -nc --argjson n "$2" --argjson off "$3" --arg st "${4:-success}" \
+      '[range($n) | {context: "status-\(. + $off)", status: $st,
+                     target_url: "https://gitea.test/\(. + $off)"}]' \
+      > "$GITEA_PAGES_DIR/page-$(printf '%03d' "$1").json"
+}
+
+reset_gitea_pages() {
+    rm -f "$GITEA_PAGES_DIR"/page-*.json "$GITEA_PAGES_DIR"/fail-page-*
+    : > "$GITEA_ARGV_FILE"
+}
+
+run_helper_gitea() {  # <sha>
+    local err_file rc=0
+    err_file="$(mktemp)"
+    HELPER_OUT="$(forge_get_check_runs "owner/repo" "$1" 2>"$err_file")" || rc=$?
+    HELPER_RC="$rc"
+    HELPER_ERR="$(cat "$err_file")"
+    rm -f "$err_file"
+}
+
+# (5a) THE bug: more statuses than one Gitea page holds. 120 statuses arrive as
+# 50 + 50 + 20 (the helper's own limit=50); the pre-fix helper returned the
+# first page only, with a self-consistent total_count of 50.
+reset_gitea_pages
+mk_gitea_page 1 50 0
+mk_gitea_page 2 50 50
+mk_gitea_page 3 20 100
+run_helper_gitea "sha-120"
+assert_eq "0" "$HELPER_RC" "(5a) 120 statuses across 3 pages: rc 0"
+assert_eq "120" "$(rows_in "$HELPER_OUT")" "(5a) 120 statuses: every page folded in (pre-fix: 50)"
+assert_eq "120" "$(uniq_rows_in "$HELPER_OUT")" "(5a) 120 statuses: no page dropped or double-counted"
+assert_eq "120" "$(total_in "$HELPER_OUT")" \
+  "(5a) 120 statuses: total_count counts the COMPLETE read, not one page (pre-fix: 50)"
+
+# Every page really was requested, with an explicit page/limit — not one bare
+# unpaginated call.
+gitea_argv="$(cat "$GITEA_ARGV_FILE")"
+assert_contains "$gitea_argv" "page=1" "(5a) requested page 1 explicitly"
+assert_contains "$gitea_argv" "page=2" "(5a) followed on to page 2"
+assert_contains "$gitea_argv" "page=3" "(5a) followed on to page 3 (the short final page)"
+assert_eq "3" "$(grep -c 'statuses' "$GITEA_ARGV_FILE")" \
+  "(5a) exactly 3 requests: paged to exhaustion, then stopped on the short page"
+
+# (5b) A page failure mid-pagination must fail CLOSED: nonzero rc and NO short
+# list on stdout. Page 1 succeeded, so a helper that emitted what it had would
+# hand back a 50-row subset that looks complete.
+reset_gitea_pages
+mk_gitea_page 1 50 0
+touch "$GITEA_PAGES_DIR/fail-page-2"
+run_helper_gitea "sha-page2-fails"
+assert_eq "true" "$([[ "$HELPER_RC" -ne 0 ]] && echo true || echo false)" \
+  "(5b) page 2 fails: nonzero rc (got $HELPER_RC)"
+assert_eq "" "$HELPER_OUT" "(5b) page 2 fails: the partial 50-row list is WITHHELD from stdout"
+
+# (5c) The very first page failing is the same refusal, with nothing on stdout.
+reset_gitea_pages
+touch "$GITEA_PAGES_DIR/fail-page-1"
+run_helper_gitea "sha-page1-fails"
+assert_eq "true" "$([[ "$HELPER_RC" -ne 0 ]] && echo true || echo false)" \
+  "(5c) page 1 fails: nonzero rc (got $HELPER_RC)"
+assert_eq "" "$HELPER_OUT" "(5c) page 1 fails: nothing emitted on stdout"
+
+# (5d) A commit with no statuses at all is a complete read of zero rows, not a
+# failure — Gitea repos without CI must keep working.
+reset_gitea_pages
+mk_gitea_page 1 0 0
+run_helper_gitea "sha-none"
+assert_eq "0" "$HELPER_RC" "(5d) zero statuses: rc 0"
+assert_eq "0" "$(rows_in "$HELPER_OUT")" "(5d) zero statuses: well-formed zero-row rollup"
+assert_eq "0" "$(total_in "$HELPER_OUT")" "(5d) zero statuses: total_count 0"
+
+# (5e) A single short page (under the limit) is one request and a complete read.
+reset_gitea_pages
+mk_gitea_page 1 7 0
+run_helper_gitea "sha-7"
+assert_eq "0" "$HELPER_RC" "(5e) 7 statuses on one page: rc 0"
+assert_eq "7" "$(rows_in "$HELPER_OUT")" "(5e) 7 statuses: all 7 rows returned"
+assert_eq "1" "$(grep -c 'statuses' "$GITEA_ARGV_FILE")" \
+  "(5e) 7 statuses: one request — a short page ends pagination"
+
+# (5f) Exactly one full page: the helper must ask for page 2 to learn there is
+# nothing more, and must not report the boundary as a truncated read.
+reset_gitea_pages
+mk_gitea_page 1 50 0
+run_helper_gitea "sha-50"
+assert_eq "0" "$HELPER_RC" "(5f) exactly 50 statuses (a full page): rc 0"
+assert_eq "50" "$(rows_in "$HELPER_OUT")" "(5f) exactly 50 statuses: all 50 rows returned"
+assert_eq "2" "$(grep -c 'statuses' "$GITEA_ARGV_FILE")" \
+  "(5f) exactly 50 statuses: probed page 2 before concluding the read was complete"
+
+# (5g) The Gitea->check-run field mapping survives the restructure, across page
+# boundaries: pending -> queued/null, success/failure/error/warning conclusions,
+# name from .context, html_url from .target_url.
+reset_gitea_pages
+jq -nc '[{context: "lint",  status: "pending", target_url: "https://gitea.test/lint"},
+         {context: "build", status: "success", target_url: "https://gitea.test/build"},
+         {context: "test",  status: "failure", target_url: "https://gitea.test/test"},
+         {context: "boom",  status: "error",   target_url: "https://gitea.test/boom"},
+         {context: "meh",   status: "warning", target_url: "https://gitea.test/meh"}]' \
+  > "$GITEA_PAGES_DIR/page-001.json"
+run_helper_gitea "sha-mapping"
+assert_eq "0" "$HELPER_RC" "(5g) mapping fixture: rc 0"
+assert_eq "queued null" "$(jq -r '.check_runs[] | select(.name=="lint") | "\(.status) \(.conclusion)"' <<<"$HELPER_OUT")" \
+  "(5g) pending -> status queued, conclusion null"
+assert_eq "completed success" "$(jq -r '.check_runs[] | select(.name=="build") | "\(.status) \(.conclusion)"' <<<"$HELPER_OUT")" \
+  "(5g) success -> completed/success"
+assert_eq "completed failure" "$(jq -r '.check_runs[] | select(.name=="test") | "\(.status) \(.conclusion)"' <<<"$HELPER_OUT")" \
+  "(5g) failure -> completed/failure"
+assert_eq "completed failure" "$(jq -r '.check_runs[] | select(.name=="boom") | "\(.status) \(.conclusion)"' <<<"$HELPER_OUT")" \
+  "(5g) error -> completed/failure"
+assert_eq "completed neutral" "$(jq -r '.check_runs[] | select(.name=="meh") | "\(.status) \(.conclusion)"' <<<"$HELPER_OUT")" \
+  "(5g) warning -> completed/neutral"
+assert_eq "https://gitea.test/build" "$(jq -r '.check_runs[] | select(.name=="build") | .html_url' <<<"$HELPER_OUT")" \
+  "(5g) target_url -> html_url"
+
+# (5h) Source wiring: the Gitea branch must go through the paginator, and must
+# not reintroduce either the bare unpaginated call or the `length`-derived
+# total_count that made a short read undetectable.
+_fgcr_gitea="$(awk '/^forge_get_check_runs\(\) \{/{f=1} f; /^\}/{if (f) exit}' "$FORGE_HELPERS_SRC")"
+assert_contains "$_fgcr_gitea" '_forge_gitea_paginate' \
+  "(5h) the Gitea branch pages through _forge_gitea_paginate"
+assert_not_contains "$_fgcr_gitea" 'total_count: (. | length)' \
+  "(5h) total_count is no longer derived from one page's row count"
+assert_eq "0" "$(grep -cE 'gitea_api GET "repos/\$FORGE_OWNER/\$FORGE_REPO/commits/\$commit/statuses"' <<<"$_fgcr_gitea")" \
+  "(5h) no bare unpaginated gitea_api call to the statuses endpoint remains"
+
+unset -f gitea_api
 
 echo ""
 echo "=== Test Summary ==="

@@ -58,6 +58,12 @@ natural key and call `TraceContext::derived`. If a derivation ever has to
 change, give it a new tag rather than silently changing its inputs, so old and
 new IDs cannot collide.
 
+Both rules scope to **spans Loom emits**. The opt-in worker-native sub-spans
+([`tracing.md`](tracing.md) → "Worker-native sub-spans", #9215) are minted by a
+spawned session's own OTel SDK: their IDs are random and they carry none of the
+provenance below. Loom's contribution there is the parent context alone, so they
+appear under a `loom.sweep` span whose identity does follow both rules.
+
 ## 2. Provenance
 
 | Attribute | On | Value |

@@ -28,7 +28,8 @@ checkout with no GitHub `origin`, or whose `repo_id` cannot be resolved
 (warned once per repo) get their own deterministic trace derived from the
 repo key and sweep id — never a random one. Before an owned sweep process is
 spawned, Loom persists its root identity under `.loom/logs/trace-context/` and
-passes `LOOM_TRACEPARENT` plus `LOOM_TRACE_CONTEXT_FILE` to that child. Reopening
+passes `LOOM_TRACEPARENT`, the standard W3C `TRACEPARENT` (same value, see
+"Worker-native sub-spans" below) plus `LOOM_TRACE_CONTEXT_FILE` to that child. Reopening
 the same execution after a daemon restart reuses its identity. A new attempt
 gets a new execution identity. The parser accepts strict W3C version-00 context;
 it rejects malformed, uppercase, and zero IDs.
@@ -81,8 +82,59 @@ after the fact (below). Rust worker launches
 record preflight and runtime spans; a rejected preflight does not create a runtime
 span. Pi and OpenCode receive the validated context through their environment,
 and the shared native read/write/edit/bash bridge records tool name and outcome.
-There are no spans for model HTTP requests or hidden third-party CLI operations.
+Loom itself emits no spans for model HTTP requests or hidden third-party CLI
+operations; a worker's own harness can, under the opt-in below.
 Resolved provider/model identity is distinct from a configured model alias.
+
+## Worker-native sub-spans (opt-in, #9215)
+
+A sweep dispatch is one `claude -p "/loom:sweep N …"` process that runs Curator
+→ Builder → Judge → Doctor → Merge inside itself, so Loom's own instrumentation
+can only time the whole session. Claude Code can emit the breakdown natively —
+`claude_code.llm_request` (with `ttft_ms`) and `claude_code.tool` /
+`claude_code.tool.execution` — and parents those spans on the **standard
+`TRACEPARENT`** environment variable, which is why `prepare_child` exports it
+alongside `LOOM_TRACEPARENT` with the same value, always together, and removes
+both whenever propagation is off. That mirror alone is harmless: a worker with
+no telemetry configuration reads it and does nothing. `TRACEPARENT` is honored
+in `-p`/Agent-SDK sessions only — an interactive CLI session ignores it rather
+than inherit an ambient value — and every owned dispatch is `-p`.
+
+Configuring the worker's exporter is a separate, **default-off** opt-in under
+`observability.claudeCodeTelemetry` (**env > config > default**, resolved by
+`loom-daemon/src/observability/claude_code_telemetry.rs`):
+
+| Config key | Env override | Default |
+|---|---|---|
+| `enabled` | `LOOM_CLAUDE_CODE_TELEMETRY_ENABLED` | `false` |
+| `endpoint` | `LOOM_CLAUDE_CODE_TELEMETRY_ENDPOINT` | `observability.endpoint`'s own resolution |
+| `protocol` | `LOOM_CLAUDE_CODE_TELEMETRY_PROTOCOL` | `http/json` (`grpc`, `http/protobuf`) |
+| `logToolDetails` | `LOOM_CLAUDE_CODE_TELEMETRY_LOG_TOOL_DETAILS` | `false` |
+
+With it on and a usable endpoint, the child receives
+`CLAUDE_CODE_ENABLE_TELEMETRY=1`, `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` (the
+traces exporter does nothing without it), `OTEL_TRACES_EXPORTER=otlp`, an
+explicit `OTEL_EXPORTER_OTLP_PROTOCOL` (OTLP has no silent default, so an
+omitted protocol is a feature that looks wired and exports nothing) and
+`OTEL_EXPORTER_OTLP_ENDPOINT`. The endpoint defaults to the same host-local
+edge the daemon's own OTLP sink targets and is held to the same policy — an
+HTTP(S) URL without credentials, query or fragment, never a reserved
+placeholder domain — so a stray `enabled: true` fails closed with a warning.
+These spans travel from the worker's own SDK to that endpoint; they never enter
+Loom's durable queue, and nothing in the daemon reads them back.
+
+Loom owns those six variables: they are removed unconditionally before any is
+set, so what reaches a worker is decided by this host's config and not by the
+daemon supervisor's ambient environment. `OTEL_EXPORTER_OTLP_HEADERS` is
+deliberately not among them — an edge requiring bearer auth is configured by
+exporting that variable to the daemon, which never handles the credential
+itself. `OTEL_LOG_TOOL_DETAILS` captures Bash command lines and tool input and
+therefore has its own sub-toggle that stays off when the master switch is on:
+"No prompt or tool payload capture is enabled" above describes Loom's own
+spans, and enabling span *timing* must never silently enable content capture.
+Containerized dispatch forwards `TRACEPARENT` and `OTEL_*` by name into the
+container (`spawn-claude.sh`'s containment allowlist); before #9215 it dropped
+both silently while bare-metal dispatch on the same host worked.
 
 Phase timing has two explicit forms. An explicitly launched role has an observed
 start; its checkpoint completes that attempt. A role performed inside one

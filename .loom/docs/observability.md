@@ -86,6 +86,13 @@ Precedence is **env > config > default**, the same rule every other
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
 | `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3) |
+| `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
+
+`claudeCodeTelemetry` is the one sub-block that configures **someone else's**
+exporter: the OTel environment a spawned worker's own Claude Code session needs
+to emit LLM-vs-tool sub-spans into the sweep's trace. Default off, four keys,
+its own precedence chain, and no effect on anything above — the full reference
+is [tracing](tracing.md) → "Worker-native sub-spans".
 
 **`endpoint` resolution order is env > `.loom-local/local.json` > the committed
 `.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so — like

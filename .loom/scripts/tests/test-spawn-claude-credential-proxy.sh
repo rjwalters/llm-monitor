@@ -195,6 +195,31 @@ echo '{"runtimes": {"containment": {"enabled": true, "claudeCredentialProxy": tr
 out="$(run_spawn LOOM_SWEEP_CREDENTIAL_PROXY=0 || true)"
 assert_not_contains "# LOOM_EGRESS_PROXY" "$out" "LOOM_SWEEP_CREDENTIAL_PROXY=0 wins over config true"
 
+# ------------------------------------------------- trace/OTel env passthrough
+# #9215: `TRACEPARENT` and `OTEL_*` match none of the allowlist's prefixes, so
+# before the case pattern was extended a contained dispatch dropped both the
+# trace parent the daemon exports (observability::tracing::prepare_child) and
+# the whole opt-in Claude Code OTel block — in-container spans vanished with no
+# error while bare-metal dispatch worked. Asserted on the built `docker run`
+# argv, which is where the allowlist decision is observable: the stubbed docker
+# hands the in-container command this shell's own environment, so an assertion
+# on `claude-env.txt` would pass with or without the `-e` flag and prove
+# nothing about the real container boundary.
+echo ""
+echo "Contained dispatch forwards TRACEPARENT / OTEL_* (#9215)..."
+echo '{"runtimes": {"containment": {"enabled": true}}}' > "$WS/.loom/config.json"
+TP="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+out="$(run_spawn \
+    TRACEPARENT="$TP" \
+    LOOM_TRACEPARENT="$TP" \
+    OTEL_TRACES_EXPORTER=otlp \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 || true)"
+docker_log="$(cat "$DOCKER_LOG")"
+assert_contains "-e TRACEPARENT " "$docker_log" "the standard trace parent is forwarded by name"
+assert_contains "-e OTEL_TRACES_EXPORTER " "$docker_log" "OTEL_* telemetry vars are forwarded by name"
+assert_contains "-e OTEL_EXPORTER_OTLP_ENDPOINT " "$docker_log" "the OTLP endpoint is forwarded by name"
+assert_contains "-e LOOM_TRACEPARENT " "$docker_log" "the namespaced trace parent still rides the LOOM_* prefix"
+
 echo '{"runtimes": {"containment": {"claudeCredentialProxy": true}}}' > "$WS/.loom/config.json"
 out="$(run_spawn || true)"
 assert_contains "# LOOM_DISPATCH_MODE mode=bare-metal" "$out" "containment off: the proxy flag alone does nothing"

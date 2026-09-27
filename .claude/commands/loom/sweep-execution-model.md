@@ -145,7 +145,7 @@ MODEL="$(./.loom/scripts/resolve-tier-model.sh <issue> <runtime>)"   # e.g. mech
 
 Hard bounds, all enforced here (apply identically to both `sweep.tierModels` and the `sweep.optimization` preset — the profile is just an alternate source for the same tier-2.5 resolution, not a separate mechanism with separate rules):
 
-> **Experiment-mode suppression (issue #3725).** When `sweep.modelExperiment` resolves to `experiment` (see "Model-cost experiment mode" below), the forced arm **overrides and SUPPRESSES this tier-2.5 resolution** for the Builder: the marker is still *read* (same grep) and used **only as the stratification key**, never as a model override (the experiment strata `complex` vs. the rest, so `mechanical` collapses with `routine` there). This is load-bearing — without it, a `complex`-marked issue on Arm B (sonnet-first) would silently jump models and confound the A/B. The tier map (and the `sweep.optimization` preset behind it) applies normally whenever the experiment is `off`/`observe`.
+> **Experiment-mode suppression (issue #3725).** When `sweep.modelExperiment` resolves to `experiment` (see "Model-cost experiment mode" below), the forced arm **overrides and SUPPRESSES this tier-2.5 resolution** for the Builder: the marker is still *read* (same grep) and used **only as the stratification key**, never as a model override (the experiment strata `complex` vs. the rest, so `mechanical` collapses with `routine` there). This is load-bearing — without it, a `complex`-marked issue on Arm B (sonnet-first) would silently jump models and confound the A/B. The tier map (and the `sweep.optimization` preset behind it) applies normally whenever the experiment is `off`/`observe` — or for an issue the #9122 budget cap samples **out** (no arm to suppress).
 
 - **Never resolves to `fable`.** `resolve-tier-model.sh` refuses a tier map or optimization preset that names (or resolves to) `fable` and falls through instead. Fable is reached only via the escalation ladder (objective Judge-rejection evidence) or an explicit operator param, never on a Curator's speculation or an operator's cost/speed profile.
 - **It is not a label** and creates no label — it lives only in the issue body.
@@ -369,14 +369,16 @@ The three states:
 |------|----------|
 | `off` | No instrumentation. Zero behavior change. No `.loom/stats/` file is created. |
 | `observe` | Passive measurement. No model forcing, no arm. One JSONL record appended per phase (`arm` null). Safe to run anywhere. |
-| `experiment` | Active A/B. Builder is forced to the assigned arm's model; records are tagged with the `arm`. **Canary-only** (see Guardrails). |
+| `experiment` | Active A/B, or N arms (#9122). Builder is forced to the assigned arm's model; records are tagged with the `arm`. **Canary-only** (see Guardrails). |
 
 **Two arms map onto #3718's inequality.** `resolve-mode` in `experiment` picks a per-issue arm via `./.loom/scripts/sweep-experiment.sh assign-arm --issue N --complexity <routine|complex>` → prints `<arm> <model>`:
 
-- **Arm A = opus-first** — Builder forced to `opus`; the normal escalation ladder still applies on Judge rejection. Resolve the printed `<model>` through `./.loom/scripts/resolve-model.sh` (or pass `--resolve` to `assign-arm`, which prints the already-resolved ID) before dispatch, so Arm A reaches **Opus 5** (`claude-opus-5`) on the wire rather than the stale gen-4 `opus` alias (issue #3982). Arm B's `sonnet` is unaffected (it passes through unchanged). **On in-session Task-tool dispatch** the pinned `claude-opus-5` is not passable and degrades to the `opus` alias via `resolve-model.sh --task-alias` — see "Pinned-ID degradation on Task-tool dispatch" (issue #4282); only the process-spawn/daemon path reaches Opus 5 on the wire.
+- **Arm A = opus-first** — Builder forced to `opus`; the normal escalation ladder still applies on Judge rejection. Resolve the printed `<model>` through `./.loom/scripts/resolve-model.sh` (or pass `--resolve` to `assign-arm`, which prints the already-resolved ID) before dispatch, so Arm A reaches **Opus 5** (`claude-opus-5`) on the wire rather than the stale gen-4 `opus` alias (issue #3982). Arm B's `sonnet` is unaffected (it passes through unchanged). On the Task-tool path the pinned ID degrades as usual — see "Pinned-ID degradation on Task-tool dispatch" (#4282).
 - **Arm B = sonnet-first + escalate** — Builder forced to `sonnet`; on Judge rejection the Doctor escalates via the existing `sweep.escalation` ladder (#3481), exactly as documented in "Model escalation on Judge rejection". Arm B *is* the candidate policy #3718 is evaluating.
 
-**Deterministic, resume-safe, stratified assignment.** The arm is a pure function of the issue number and the #3702 complexity stratum, so a killed-and-resumed sweep re-running the same issue **lands on the same arm**. The complexity marker is read once (the same grep at the tier-2.5 site) and serves two purposes: the **stratification key** (so both arms see a comparable difficulty mix) and — **only when the experiment is off/observe** — the tier-2.5 tier-map resolution. In `experiment` mode that resolution is suppressed (see the "Experiment-mode suppression" note under tier 2.5).
+**Deterministic, resume-safe, stratified assignment.** The arm is a pure function of the issue number and the #3702 complexity stratum, so a killed-and-resumed sweep re-running the same issue **lands on the same arm**. The complexity marker is read once (the same grep at the tier-2.5 site) and serves two purposes: the **stratification key** (so both arms see a comparable difficulty mix) and — **only when the experiment is off/observe** — the tier-2.5 tier-map resolution (in `experiment` mode that resolution is suppressed — see "Experiment-mode suppression" under tier 2.5).
+
+**N arms and a budget cap (#9122).** `sweep.modelExperimentArms` (2+ weighted **Claude-only** arms, not just A/B) and `sweep.modelExperimentBudgetFraction` / `LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION` (default `1.0` — fraction of issues getting *any* forced arm) are read by `assign-arm`/`banner` themselves; a bad value warns and falls back to A/B, never failing the sweep. **Your only handling:** `assign-arm` printing `none -` means sampled **out** — treat as `observe` (null `arm`, no forcing, **normal tier-2.5/tier-3 resolution**). Everything else: `.loom/docs/model-cost-experiment.md`.
 
 **Forced-arm precedence.** The forced arm slots into the Builder model-resolution chain **above tier 2.5 / tier 3** but **below tier 1 / tier 2 operator pins**: an explicit dispatch param (tier 1) or a `roleConfig.model` workspace pin (tier 2) still wins — a pinned canary is intentionally opted out of the experiment. The forced arm only ever replaces what tier 2.5 / tier 3 would have resolved for the Builder.
 
@@ -384,7 +386,7 @@ The three states:
 
 ```bash
 ./.loom/scripts/sweep-experiment.sh record --mode <mode> --issue N --phase <curator|builder|judge|doctor|merge> \
-  --role <role> --model <resolved-model> --arm <A|B|"" > --attempt <k> --complexity <routine|complex> \
+  --role <role> --model <resolved-model> --arm <arm-id|"" > --attempt <k> --complexity <routine|complex> \
   --verdict <pass|changes|""> --agent-id <agent-id> --stats-file .loom/stats/sweep-model-stats.jsonl
 ```
 
@@ -407,7 +409,7 @@ Each record carries the **HARD deterministic outcome-chain** (`arm`, `model`, `a
 
 The harvest parses each joined `agent-<id>.jsonl` transcript's `usage` blocks (input/output + `cache_read_input_tokens`/`cache_creation_input_tokens`) and prices them with the same **cache-aware** per-model table as `loom-daemon`'s `resource_usage.rs`. Transcripts are located through #3726's `loom.transcript-index/v1` archive index (`--archive-dir` = `LOOM_TRANSCRIPT_ARCHIVE`); harvest should run periodically (cron) over a multi-day canary so usage is extracted into the compact stats store before `~/.claude/projects` is pruned.
 
-> **Daemon detached-child path (honest finding, verified against on-disk transcripts).** The role-subagent transcripts of a daemon-dispatched `claude -p "/loom:sweep N"` child land under that child's own `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd-slug>/<child-session-uuid>/subagents/agent-<id>.jsonl` tree — the **durable** location, not the ephemeral `/tmp/.../tasks/` scratch — and each carries the full per-message `usage` (input/output + cache split) and `model`. Confirmed present on disk for real detached-child sessions. So they are archivable/harvestable via the same #3726 periodic sync. What the daemon reaper does **not** yet know is the child's session-uuid, so it cannot trigger a precise single-session archive on exit — the cron periodic sync is the backstop, exactly as for the completion hook (see "Session Transcript Archival").
+> **Daemon detached-child path.** A daemon-dispatched child's role-subagent transcripts *are* durable and harvestable via the same #3726 periodic sync, but the reaper cannot trigger a precise single-session archive on exit — the cron sync is the backstop. Where they land and why: `.loom/docs/model-cost-experiment.md`.
 
 ### Other constraints
 

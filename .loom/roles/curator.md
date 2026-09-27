@@ -1117,7 +1117,7 @@ A `RELATED_OPEN_WORK` hit is **not** grounds for closing or auto-rescoping on it
 
 ### Complexity routing marker (`<!-- loom:complexity=<tier> -->`, issues #3702, #4238, #4448)
 
-Emit a single machine-readable marker into the curated issue body so the sweep orchestrator routes the downstream Builder to the right model. Classify by **how expensive it is to be wrong**, not by how much work it looks like — the one question is *would a mistake be caught?*
+Emit a machine-readable marker into the curated issue body so the sweep orchestrator routes the Builder to the right model. Classify by **how expensive it is to be wrong**, not how much work it looks like — the question is *would a mistake be caught?*
 
 ```html
 <!-- loom:complexity=mechanical -->
@@ -1131,23 +1131,33 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 | `routine` | The approach is clear once you've read the relevant code, and a mistake would surface in tests or review. Most bug fixes and small features. **Default stratum** — take this one when genuinely torn between it and `mechanical`. |
 | `complex` | Deciding the approach takes judgement, and a mistake could pass tests and review unnoticed — architecture, cross-cutting change, subtle logic. Money, security, and destructive migrations are common cases, not the whole list. |
 
-- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Put it in your enhancement section (e.g. near the Problem Statement). **Always emit the marker explicitly, including `routine`** — do not rely on omission. (`resolve-tier-model.sh` still treats an absent marker as `routine` for backward compatibility with issues curated before this rule, but that fallback is not a substitute for emitting one — the validator below blocks on an absent marker for exactly this reason.)
+- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Put it in your enhancement section (e.g. near the Problem Statement). **Always emit the marker explicitly, including `routine`** — do not rely on omission. (`resolve-tier-model.sh` still defaults an absent marker to `routine` for pre-rule issues, but that fallback doesn't excuse omitting one — the validator below blocks on it.)
 - **What it does**: at Builder dispatch the sweep skill reads it as precedence **tier 2.5** (between tiers 2 and 3) and resolves the Builder's model from `sweep.tierModels[<runtime>][<tier>]` — `mechanical` routes cheaper, `complex` routes more capable. **Never name a model here; the tier is runtime-neutral.** See `sweep.md` → "Tier 2.5 — complexity marker".
-- **Hard bounds** (the router's authority is deliberately bounded): **never resolves to `fable`, and never a label.** The frontier model is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
-- **Cheap when the tier map is unconfigured.** With no `sweep.tierModels` in `.loom/config.json` and no `sweep.optimization` profile set (or set to `balanced`, the default), the marker is inert and dispatch falls through to the role default exactly as before — so adding markers is safe even before a workspace opts into cost/speed routing. A workspace opts in either by hand-authoring `sweep.tierModels`, or by setting `sweep.optimization: cost | speed` (a policy switch that materializes a preset over the same map — see `model-selection.md` "Optimization profile switch").
+- **Hard bounds**: **never resolves to `fable`, never a label** — the frontier model is reserved for the objective Judge-rejection escalation ladder or an explicit operator param; a `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
+- **Cheap when the tier map is unconfigured.** With no `sweep.tierModels` (or `sweep.optimization` unset/`balanced`), the marker is inert and dispatch falls through to the role default — adding markers is safe before a workspace opts into cost/speed routing (`sweep.tierModels`, or `sweep.optimization: cost | speed`; see `model-selection.md` "Optimization profile switch").
 - **Use sparingly / take the higher tier when torn.** Marking everything `complex` defeats the cheap-first default; marking real judgement calls `mechanical` risks a cheap model on expensive-to-be-wrong work. When genuinely torn, take the higher tier.
 - **`complex` + irrevocable output ⇒ date-stamp any volatile fact in the acceptance criteria.** When a `complex` issue's cost-of-being-wrong comes from an action that cannot be undone (a version/tag push, a package publish, an external API write), and its acceptance criteria embed a volatile fact (a count, a version number, a "no X is needed" claim), that fact **must** carry the "as of `<sha>`, `<date>`" stamp from "Date-stamp volatile facts" above — not a bare assertion. A Builder who trusts a stale bare count on a `complex`/irrevocable issue ships the wrong permanent artifact with no error signal to catch it (see example-org/tool-repo#203, the incident that motivated both this rule and the stamping convention).
 
 **Required before applying `loom:curated`**: run the validator below and confirm exit 0. This is not optional — do not apply `loom:curated` if it fails:
 
 ```bash
-./.loom/scripts/require-complexity-marker.sh <issue>   # exit 0 = has a valid tier; exit 1 = missing or out-of-vocabulary
-                                                       # exit 2 = could not fetch (retry/check quota, NOT a curation defect)
+./.loom/scripts/require-complexity-marker.sh <issue>   # 0 = BOTH markers valid; 1 = either missing/invalid
+                                                       # 2 = could not evaluate (NOT a curation defect)
 ```
 
-Exit 2 means the issue body could not be fetched (both GraphQL and REST failed — usually API quota exhaustion), not that the marker is absent. Retry once quota recovers; do not re-edit the body on an exit-2.
+Exit 2 is not an absent marker: fetch failed (usually quota; retry later) or `loom-daemon` is missing/below its `requires-daemon` floor (`loom update`; waiting won't help). Don't edit the body.
 
-**A related but distinct marker convention** exists for `loom:operator-mechanical` items: `<!-- loom:capability=<name> -->` declares which host/credential/admin capability the item needs (#6892). It follows the identical anchored-HTML-comment parsing discipline described above but is a **separate** convention — it does not affect model routing and applies only alongside `loom:operator-mechanical`. See `defaults/docs/label-state-machine.md` → "Capability-declaration convention" for the vocabulary and parser contract. No Curator action is required by this convention today (#6892 is documentation/convention-only, with no dispatch-logic consumer yet — see #6885/#6893).
+### Points estimate marker (`<!-- loom:points=<N> -->`, #9056)
+
+Alongside the tier, always emit a numeric point estimate — coarse, uncalibrated judgment of total sweep cost (tokens + wall-clock + iterations), not a formula:
+
+```html
+<!-- loom:points=<N> -->
+```
+
+`N` **MUST** be exactly one of `1`, `2`, `3`, `5`, `8`, `13` — same closed-vocabulary rule as `loom:complexity`; out-of-vocabulary is a curation defect, not style. Guidance only: `mechanical`→1-2, `routine`→3-5, `complex`→8-13 — deviate when scope warrants. `require-complexity-marker.sh` blocks `loom:curated` on this marker too.
+
+**A related but distinct marker convention** exists for `loom:operator-mechanical` items: `<!-- loom:capability=<name> -->` names the host/credential/admin capability needed (#6892) — same anchored-comment parsing, but a separate convention (no effect on model routing, only alongside `loom:operator-mechanical`). See `defaults/docs/label-state-machine.md` → "Capability-declaration convention" for vocabulary/parser contract; no Curator action required today (docs-only, see #6885/#6893).
 
 ## Where to Add Enhancements
 

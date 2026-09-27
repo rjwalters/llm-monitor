@@ -59,7 +59,9 @@ MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 # the reading that closes an unfinished issue.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs
+# The post-merge reset's decision is `loom-daemon merge-pr partial-reset`
+# (#8191 slice), so the same binary must carry that verb too.
+loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset"
 
 # Colors
 RED='\033[0;31m'
@@ -946,6 +948,45 @@ PR_JSON='{"body":"Part of #777"}'
 _reset_partial_increment_labels 2>/dev/null
 assert_eq "" "$(read_log)" \
   "Untracked closed #777 -> unchanged log-and-skip behavior"
+
+# T29 (#8191): the reset's decision moved to `loom-daemon merge-pr
+# partial-reset`. A daemon that cannot answer (missing, or predating the verb)
+# must degrade to a loud warning naming the manual swap -- never a guessed
+# mutation, and never a silent skip that leaves loom:building orphaned unseen.
+reset_log
+fake_no_reset="$STUB_DIR/fake-loom-daemon-no-partial-reset"
+cat > "$fake_no_reset" <<'FAKEDAEMON'
+#!/usr/bin/env bash
+echo "error: unrecognized subcommand 'partial-reset'" >&2
+exit 2
+FAKEDAEMON
+chmod +x "$fake_no_reset"
+saved_bin="${LOOM_DAEMON_BIN:-}"
+export LOOM_DAEMON_BIN="$fake_no_reset"
+PR_JSON='{"body":"Part of #123"}'
+run_capturing_stderr _reset_partial_increment_labels
+no_reset_err="$(read_stderr)"
+export LOOM_DAEMON_BIN="$saved_bin"
+assert_eq "" "$(read_log)" \
+  "#8191: daemon without 'merge-pr partial-reset' -> no label mutation is guessed"
+assert_contains "$no_reset_err" "Partial-increment reset for issue #123 did not run" \
+  "#8191: daemon without 'merge-pr partial-reset' -> the skipped reset is reported"
+assert_contains "$no_reset_err" "gh issue edit 123 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
+  "#8191: the report names the exact manual swap"
+
+# T30 (#8191): a failed reopen stops the pass -- the plan's later SWAP must not
+# run against an issue that is still closed. (The reopen wrapper is overridden
+# in a subshell; the gh call log is on disk, so the assertion still sees it.)
+reset_log
+PARTIAL_OPEN_BEFORE_MERGE="777"
+PARTIAL_CONFLICT_ISSUES="777"
+PR_JSON='{"body":"Verify, then close #777.\n\nContributes to #777"}'
+( forge_gh_reopen_issue_rl_safe() { return 1; }; _reset_partial_increment_labels ) 2>"$STUB_DIR/stderr.log" || true
+reopen_fail_err="$(read_stderr)"
+assert_not_contains "$(read_log)" "issue edit 777" \
+  "#8191: failed reopen of #777 -> no label swap follows it"
+assert_contains "$reopen_fail_err" "Could not reopen issue #777 after its premature auto-close" \
+  "#8191: failed reopen of #777 -> warns with the manual reopen command"
 
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""

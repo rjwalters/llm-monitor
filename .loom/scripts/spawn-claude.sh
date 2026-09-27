@@ -812,9 +812,14 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # the variables host-side token selection exports LATER
     # (CLAUDE_CODE_OAUTH_TOKEN, LOOM_TOKEN_NAME) and ANTHROPIC_BASE_URL are
     # added by name by `worker proxy-exec --docker-workspace` itself.
+    # TRACEPARENT and OTEL_* are forwarded too (#9215): neither matches a
+    # LOOM_/CLAUDE_ prefix, so before this a contained dispatch silently
+    # dropped the trace parent and the whole Claude Code OTel env — the
+    # in-container session emitted no spans at all, with no error, while the
+    # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | GH_TOKEN | GITHUB_TOKEN)
+            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | GH_TOKEN | GITHUB_TOKEN | TRACEPARENT | OTEL_*)
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac
