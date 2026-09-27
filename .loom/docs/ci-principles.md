@@ -34,6 +34,28 @@ the next person to add one will have an equally good argument.
    the same rule the guard and resync layers learned the hard way (#7745,
    #7761): `exit 0` has to mean "verified", never "skipped".
 
+7. **Split work across runners by moving it, never by filtering it.** When a
+   job is the long pole (#9065), divide it so every piece still runs exactly
+   once. Move whole steps into a sibling job, or use nextest's deterministic
+   `--partition count:k/N`, under which each test lands in exactly one leg and
+   the legs' "N tests run" lines sum to the unpartitioned total. Do not use a
+   filterset that picks "the tests that matter": that is path-filtering by
+   another name (rule 3). Hand a binary between jobs only when it measurably
+   wins. The debug daemon qualifies: its consumers dropped from 100-130s of
+   compiling to 9-24s. A consumer whose producer failed must turn red rather
+   than be skipped (`if: ${{ !cancelled() }}` plus a download that fails when
+   the artifact is missing), because a skipped required check counts as
+   passing (rule 6).
+
+8. **Group required gates by component, and judge each component on its own
+   inputs.** Many tiny required jobs compete for the concurrent-job cap, so
+   #9065 folded 19 of them into `Structural Checks`, `Daemon Checks` and the
+   macOS `Shell Syntax` leg. Each gate keeps a `# component: <name>` marker
+   and its own input spec. The freshness guard calls a composite stale when
+   *any* component is stale, never on the union of their inputs, so grouping
+   does not make merges go stale more often. Every step runs under
+   `!cancelled()`, so one red gate cannot hide another.
+
 ## What prompted this
 
 Three failures on 2026-09-15, all from cleverness that reviewed well.

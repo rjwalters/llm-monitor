@@ -144,6 +144,44 @@ canary, tracked in #8606). The *shape* is verified; a live receipt — a real Ki
 sweep whose completion carries `runtime: kimi` plus provider and model — is
 still owed.
 
+## Reading Pi's event stream (Issue #8594)
+
+Pi is read from its `--mode json` **stdout stream**, not its session store. The
+stream is already captured in the launch's own log (`.loom/logs/sweep-issue-<N>.log`
+for a sweep, `role-<role>.log` for a role tick), whereas a guarded Pi launch keeps
+its sessions in a per-launch native-state directory that the #8663 reaper removes,
+beside Pi's `auth.json`. The reader (`loom-daemon/src/pi_usage.rs`) opens only
+that launch log, through one guarded function a source-scanning test pins.
+
+Schema taken from the published `@earendil-works/pi-coding-agent` 0.85.1 package
+and its `pi-ai` dependency (no fleet host had a captured run to survey):
+
+- Count **only** assistant `message_end` events (`message.model`,
+  `message.usage`, `message.timestamp` in ms). `agent_end`, `turn_end` and
+  `entry_appended` repeat the same message; `message_update.usage` is cumulative.
+- `usage.input` is already net of `cacheRead`/`cacheWrite`; `reasoning` is a
+  subset of `output` and is never added; `cacheWrite1h`, when present, splits
+  `cacheWrite` into the 1h/5m buckets.
+- A `toolResult`'s nested `usage` and a compaction/branch-summary entry's `usage`
+  name no model, so they are not counted (an undercount, never a guess).
+
+Each dispatch is selected by the caller's window over each message's own
+timestamp; each row keeps the exact session `id` from the stream's `session`
+header. Verify or backfill with `loom-daemon pi-usage --directory <root> --issue
+<N> [--messages] [--json]` (or `--role <role>`).
+
+**`tap_usage` reads the same shape (#8934).** It used to look for the counters on
+the `message_end` event itself rather than at `message.usage`, so a real Pi run
+read as unmeasured; it now searches `message.usage` too (in addition to the flat
+`tokens`/`usage`/event-root scopes OpenCode uses), takes the cost estimate from
+`usage.cost.total` because Pi's `cost` is an object, and does **not** record a
+`reasoning` count read from there — it is already inside `output`, and
+`TapUsage::total_tokens` sums every counter it is given. One deliberate
+divergence: a `toolResult`'s nested `usage` **is** counted for tap accounting,
+because a tap is named by the enclosing `# LOOM_LAUNCH` record rather than by the
+message, so there is no model to guess and dropping it would be a knowable
+undercount.
+
 ## Backfill and verification: `loom-daemon opencode-usage`
 
 The same reader, pointed at any directory and window — for reconciling
@@ -194,12 +232,11 @@ the two triggers that should re-open it.
 ## Adding another runtime
 
 `UsageSource` in `loom-daemon/src/usage_source.rs` is the one place that maps a
-runtime to a store. Pi and Codex each have their own usage source and are not
-wired up: they fall through to the Claude reader, which finds nothing, so they
-get labels but no numbers. Adding one means a new `UsageSource` variant, a
-reader module beside `opencode_usage.rs` / `kimi_usage.rs`, and an arm in
-`sweep_tokens_by_model` (plus `role_tick_tokens_by_model`) — no change at any of
-the three call sites.
+runtime to a store: OpenCode, Kimi, Codex (`codex_usage.rs`) and Pi
+(`pi_usage.rs`) each have one; anything else falls through to the Claude reader.
+Adding one means a new `UsageSource` variant, a reader module beside the others,
+and an arm in `sweep_tokens_by_model` and `role_tick_tokens_by_model` — no change
+at any of the three call sites.
 
 **Branch on `UsageSource::is_native_store()`, never on one variant.** A caller
 that derives *more* than tokens from a Claude transcript — the role-tick

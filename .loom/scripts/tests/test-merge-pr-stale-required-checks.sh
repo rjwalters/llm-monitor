@@ -273,6 +273,51 @@ set -e
 assert_eq "0" "$BIN_RC" "real binary: fresh run -> exit 0"
 assert_contains "$BIN_OUT" "LOOM-STALE-CHECKS-CLEAN" "real binary: fresh run prints the CLEAN sentinel"
 
+# --- The input-scoped predicate over the same seam (#8919) ------------------
+#
+# `pr_files` + `base_moves` are OPTIONAL additions to the payload: the two cases
+# above carry neither and still assess by the #8248 time rule (that is the
+# backward-compatibility half of the contract). With them present the verdict is
+# keyed on the base the check ACTUALLY tested, so:
+#
+#   1. a base move into a ratchet baseline under a PR that changes a measured
+#      file is refused EVEN THOUGH the run's started_at postdates the base tip
+#      (an in-place re-run cannot launder it);
+#   2. a base move that touches nothing the check reads is CLEAN even though the
+#      run's started_at predates the base tip (the busy-main race of #8641).
+SCOPED_STALE='{"tip_sha":"abc123","base_tip":"2026-09-18T11:45:21Z","required":["File Size Ratchet"],
+"check_runs":[{"name":"File Size Ratchet","status":"completed","conclusion":"success","started_at":"2026-09-18T16:26:47Z"}],
+"pr_files":[{"filename":"loom-daemon/src/main_health_gate.rs","status":"modified"}],
+"base_moves":{"File Size Ratchet":{"tested_base":"803f0c7d","files":[{"filename":"scripts/file-size-baseline.txt","status":"modified"}]}}}'
+SCOPED_FRESH='{"tip_sha":"abc123","base_tip":"2026-09-18T11:45:21Z","required":["File Size Ratchet"],
+"check_runs":[{"name":"File Size Ratchet","status":"completed","conclusion":"success","started_at":"2026-09-17T22:54:20Z"}],
+"pr_files":[{"filename":"defaults/docs/some-doc.md","status":"modified"}],
+"base_moves":{"File Size Ratchet":{"tested_base":"803f0c7d","files":[{"filename":"dashboard/web/src/app.ts","status":"modified"}]}}}'
+
+set +e
+BIN_OUT="$(printf '%s' "$SCOPED_STALE" | "$REAL_DAEMON_BIN" merge-pr stale-checks --pr 8078 --repo rjwalters/loom --head-sha deadbeef --base-ref main --from-stdin 2>&1)"
+BIN_RC=$?
+set -e
+assert_eq "1" "$BIN_RC" "real binary: input-scoped stale -> exit 1 even though the run postdates the tip"
+assert_contains "$BIN_OUT" "803f0c7d" "the refusal names the base the check actually tested"
+assert_contains "$BIN_OUT" "scripts/file-size-baseline.txt" "the refusal names the base-move path that did it"
+assert_contains "$BIN_OUT" "in place will not clear it" "the refusal says an in-place re-run cannot fix it"
+
+set +e
+BIN_OUT="$(printf '%s' "$SCOPED_FRESH" | "$REAL_DAEMON_BIN" merge-pr stale-checks --pr 8078 --repo rjwalters/loom --head-sha deadbeef --base-ref main --from-stdin 2>/dev/null)"
+BIN_RC=$?
+set -e
+assert_eq "0" "$BIN_RC" "real binary: an unrelated base move is fresh even though the run predates the tip"
+assert_eq "LOOM-STALE-CHECKS-CLEAN" "$BIN_OUT" "stdout carries ONLY the sentinel (warnings go to stderr)"
+
+# The fallback is audible: an old payload (no evidence) still assesses by the
+# time rule, and says so on stderr rather than degrading silently.
+set +e
+FALLBACK_ERR="$(printf '%s' "$FRESH_PAYLOAD" | "$REAL_DAEMON_BIN" merge-pr stale-checks --pr 8078 --repo rjwalters/loom --head-sha deadbeef --base-ref main --from-stdin 2>&1 >/dev/null)"
+set -e
+assert_contains "$FALLBACK_ERR" "Warning:" "an old payload's time-rule fallback is announced on stderr"
+assert_contains "$FALLBACK_ERR" "#8919" "the fallback warning names the predicate it could not apply"
+
 # --- Placement: the guard must run before either merge path -----------------
 IFS= read -r first_match < <(grep -n '^_check_required_check_freshness$' "$MERGE_PR_SRC")
 guard_line="${first_match%%:*}"

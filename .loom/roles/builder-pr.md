@@ -588,7 +588,7 @@ Before creating a PR, verify your title:
 
 ## Commit Messages: Same Rules as PR Titles
 
-Commit messages follow the **exact same rules** as PR titles above. Since this repo uses squash merge, the PR title becomes the final commit on main — but individual commit messages still matter for worktree history and debugging.
+Commit messages follow the **exact same rules** as PR titles above. This repo merges with merge commits (#9105), so each commit message survives onto main verbatim — write each one as durable history.
 
 ### How to Write Commit Messages
 
@@ -760,7 +760,7 @@ Part of #123              <- declaration: parsed, the label reset fires on merge
 merge-pr.sh warns (non-blocking) on a whole-line backticked trailer, but that warning reaches
 only whoever runs the merge — get it right in the body.
 
-**Both the PR body and the commit message must carry the same reference.** This repo squash-merges, and GitHub harvests closing keywords from the squash commit message as well as the PR body — a stray `Closes #N` in the commit body will auto-close the family issue even when the PR body says `Part of #N`. When in doubt on a `loom:epic` issue, prefer `Part of #N`.
+**Both the PR body and the commit messages must carry the same reference.** GitHub harvests closing keywords from the PR body and the merge commit's subject (this repo merges with merge commits, #9105) — individual commit bodies are not parsed, but keep the reference consistent in them anyway. When in doubt on a `loom:epic` issue, prefer `Part of #N`.
 
 #### A stray closing keyword ANYWHERE in the body defeats `Part of #N` (#4569)
 
@@ -794,10 +794,10 @@ the cause — Loom's `feature/issue-N` convention does not create a Development-
   grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b' <<<"$PR_BODY"
   ```
 
-- **The same rule applies to every commit message on the branch** (#4595). The squash message
-  GitHub composes from your commits is parsed for closing keywords too, so a stray
-  `close #N` in a commit body closes the issue even when the PR body is spotless. Scan them
-  before pushing — and amend/reword (`git commit --amend`, `git rebase -i`) if one is there:
+- **The same rule applies to every commit message on the branch** (#4595 — consistency
+  now, not an auto-close hazard): GitHub parses only the PR body and the merge commit's
+  subject, so a stray `close #N` in a commit body no longer auto-closes the issue.
+  Scan before pushing — and amend/reword if one is there:
 
   ```bash
   # Must print nothing for the tracked issue N:

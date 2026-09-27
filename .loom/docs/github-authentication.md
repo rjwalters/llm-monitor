@@ -39,7 +39,7 @@ A fine-grained PAT scoped to the target repository needs these permissions:
 | Pull requests | Read & Write | Builder, Judge, Champion, Doctor | PR creation, reviews, merges |
 | Contents | Read & Write | Builder, Champion | Push branches, merge PRs, delete branches |
 | Checks | Read | Auditor, Judge | CI status verification |
-| Actions | Read & Write (recommended) | Champion (`merge-pr.sh --redate-stale-checks`) | Re-run stale required checks in place when the #8248 freshness guard blocks a merge. Without it the fallback pushes a no-op commit, which moves the head and costs the PR its Judge approval (#8914) |
+| Actions | Read (optional) | Auditor, Judge, CI telemetry | Read workflow runs and job logs. `merge-pr.sh` reads a job log to derive the base each required check actually tested (#8919); without it the freshness guard falls back to the #8248 timestamp rule and says so on stderr. It no longer *re-runs* anything: an in-place re-run replays the original test merge commit, so it does not keep a verdict valid (#8914, withdrawn by #8919) |
 | Metadata | Read | All roles | Implicit, always granted with any other permission |
 
 ## Creating a Fine-Grained PAT
@@ -205,9 +205,9 @@ hard-failing.
 1. Create a GitHub App (under whichever account/org owns the target repos)
    with **Contents: Read & write**, **Issues: Read & write**, **Pull
    requests: Read & write**, **Metadata: Read** permissions, plus
-   **Actions: Read & write** (recommended: lets `merge-pr.sh` re-run stale
-   required checks in place instead of pushing a no-op commit that clears the
-   Judge verdict, #8914). GitHub has no API for changing an App's
+   **Actions: Read** (optional: lets the #8248/#8919 freshness guard read the
+   base each required check actually tested, instead of falling back to the
+   timestamp rule). GitHub has no API for changing an App's
    permissions: add it in the App's settings, then accept the updated
    permission request on each installation.
 2. Generate a private key for the app (downloads a `.pem` file) and copy it to

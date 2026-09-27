@@ -113,16 +113,17 @@ git -C "$WORKTREE_ABS" diff --cached --name-only \
 ```
 
 **No unrelated lockfile / workspace-config hunks.** A dependency install can mutate
-files outside your scope. In particular, **pnpm's build-approval prompt persists
+files outside your scope: **pnpm's build-approval prompt persists
 `onlyBuiltDependencies` / `ignoredBuiltDependencies` into `pnpm-workspace.yaml`**
-(older pnpm: into `package.json`) the first time `pnpm install` builds a package with
-an install script — an out-of-scope hunk a careless commit will ship. Defend against it:
+(older pnpm: into `package.json`) the first time `pnpm install` builds a package
+with an install script. Defend against it:
 
-- Run installs **non-interactively** so the prompt never mutates config —
-  `CI=true pnpm install` (CI mode skips the build-approval prompt entirely). npm/yarn
-  installs can likewise touch `package-lock.json` / `yarn.lock`.
-- **After any install**, check for stray config/lockfile edits and revert unrelated hunks
-  before staging:
+- Run installs **non-interactively** — `CI=true pnpm install` skips that prompt.
+  **Never when `ls -ld node_modules` shows a symlink out of your worktree**:
+  `CI=true` then purges the MAIN clone's tree through it and no pnpm setting
+  stops it (#8944). Run the binary (`npx vitest`) instead. npm/yarn installs
+  can likewise touch `package-lock.json` / `yarn.lock`.
+- **After any install**, revert stray config/lockfile hunks before staging:
 
   ```bash
   git -C "$WORKTREE_ABS" status --short -- pnpm-workspace.yaml pnpm-lock.yaml package.json package-lock.json yarn.lock
@@ -130,8 +131,7 @@ an install script — an out-of-scope hunk a careless commit will ship. Defend a
   git -C "$WORKTREE_ABS" checkout -- pnpm-workspace.yaml   # (or the specific file)
   ```
 
-  A genuinely needed lockfile bump (you added/updated a dependency on purpose) is in
-  scope — keep it; revert only the incidental install-prompt churn.
+  A deliberate lockfile bump is in scope — keep it; revert only prompt churn.
 
 ### What To Do When You Notice Unrelated Problems
 
@@ -1289,7 +1289,7 @@ Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a
 **partial increment** of a larger tracked body of work that must stay open
 (`Part of #N` / `Contributes to #N`). The full decision rule — when to use the
 non-closing reference, and the requirement to carry the **same** reference in both
-the PR body and the squash commit message — is the canonical guidance in
+the PR body and the commit messages — is the canonical guidance in
 **builder-pr.md § "Partial increments (family/epic issues)"**. Do not restate it
 here; follow it there.
 

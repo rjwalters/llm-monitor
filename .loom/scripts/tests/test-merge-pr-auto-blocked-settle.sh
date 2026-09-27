@@ -38,6 +38,16 @@
 #   AC4  this file, covering the BLOCKED-at-queue-time path alongside the
 #        existing UNSTABLE coverage in test-merge-pr-unstable-fallback.sh
 #
+# ## #8896 additions
+#
+# The same functions, for the three follow-ups that fell out of reviewing
+# #8426: the settle-wait timeout is exit 5 (a distinguished re-queue, never the
+# generic failure exit 1 Champion reports as "a human will need to
+# investigate"); the --allow-unapproved override audit comment is posted at
+# most once per run even though the loom:pr guard runs twice on the --auto
+# path; and a post-wait re-read that returns no usable payload says so instead
+# of borrowing the genuine-"loom:pr is absent" wording.
+#
 # Usage:
 #   ./.loom/scripts/tests/test-merge-pr-auto-blocked-settle.sh
 
@@ -100,7 +110,7 @@ loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 
 # --- Extract the functions under test from the real merge-pr.sh -------------
 FUNCS_FILE="$(mktemp)"
-trap 'rm -f "$FUNCS_FILE" "${CHECK_RUNS_COUNTER:-}" 2>/dev/null || true' EXIT
+trap 'rm -f "$FUNCS_FILE" "${CHECK_RUNS_COUNTER:-}" "${COMMENT_CALLS:-}" 2>/dev/null || true' EXIT
 
 _extract_block() {
     awk -v start="$1" '
@@ -182,11 +192,32 @@ forge_get_required_status_check_contexts() {
 FRESH_PR_JSON="$PR_JSON"
 forge_get_pr_nocache() { printf '%s\n' "$FRESH_PR_JSON"; }
 forge_get_pr_comments() { printf '%s\n' ""; }
-forge_gh_comment_rl_safe() { echo "COMMENT: $3"; }
+
+# Comment stub with a call counter (a FILE, for the same subshell reason as
+# CHECK_RUNS_COUNTER) plus an opt-in "first post fails" mode, so #8896's
+# post-at-most-once rule can be pinned in both directions.
+COMMENT_CALLS="$(mktemp)"
+echo 0 > "$COMMENT_CALLS"
+COMMENT_FAIL_FIRST=false
+forge_gh_comment_rl_safe() {
+    local i; i="$(cat "$COMMENT_CALLS")"; echo "$(( i + 1 ))" > "$COMMENT_CALLS"
+    [[ "$COMMENT_FAIL_FIRST" == "true" && "$i" -eq 0 ]] && return 1
+    echo "COMMENT: $3"
+}
+comment_attempts() { cat "$COMMENT_CALLS"; }
+# Posts that actually LANDED — the stub only echoes the body when it succeeds.
+comments_landed() { grep -c 'Merge Proceeded Without' <<<"$1" || true; }
+
+# The two guards the --auto path runs against the SAME merge: once at queue
+# time, once from _revalidate_merge_guards after the settle-wait.
+_auto_path_loom_pr_guards() { _check_loom_pr_label; _revalidate_merge_guards; }
 
 # Reset per-scenario state.
 _reset() {
     echo 0 > "$CHECK_RUNS_COUNTER"
+    echo 0 > "$COMMENT_CALLS"
+    COMMENT_FAIL_FIRST=false
+    unset _LOOM_PR_OVERRIDE_COMMENTED
     REQUIRED_CONTEXTS=$'File Size Ratchet\nCLAUDE.md Line Budget'
     REQUIRED_LOOKUP_RC=0
     FRESH_PR_JSON="$PR_JSON"
@@ -227,12 +258,14 @@ _reset
 CHECK_RUNS_SCRIPT=("$(_runs 5 "$GATES_DONE,$SUITES_RUNNING")")
 LOOM_AUTO_MERGE_TIMEOUT=0
 run_fn _wait_for_checks_then_sync_merge
-assert_eq "1" "$LAST_RC" \
-  "#8410 AC2: suites still pending -> the wait refuses to proceed to a merge"
+assert_eq "5" "$LAST_RC" \
+  "#8410 AC2 / #8896: suites still pending at the deadline -> no merge, exit 5 (re-queue), NOT the generic failure exit 1"
 assert_contains "$LAST_OUT" "pending check(s) on PR #8220" \
   "#8410 AC2: the refusal names the pending checks, not a queued merge"
 assert_contains "$LAST_OUT" "for 3 pending check(s)" \
   "#8410 AC2: all three pending NON-REQUIRED suites are counted — the required set is irrelevant to the wait"
+assert_contains "$LAST_OUT" "not a failure" \
+  "#8896: the timeout says so in words too, so a log reader is not left inferring a merge failure"
 
 # Same head a poll later: the suites finish green, so the wait proceeds.
 _reset
@@ -277,6 +310,88 @@ CHECK_RUNS_SCRIPT=("$(_runs 4 "$GATES_DONE,$SUITES_SKIPPED")")
 run_fn _wait_for_checks_then_sync_merge
 assert_eq "0" "$LAST_RC" \
   "#8410 AC2: skipped check-runs neither block the merge nor count as pending"
+
+# ===========================================================================
+# #8896 — the settle-wait's two timeout paths exit 5, and only they do.
+#
+# Before #8896 both left through error() (exit 1), which Champion's "Merge
+# Failed" path could not tell from a real merge failure: a PR whose CI merely
+# outran LOOM_AUTO_MERGE_TIMEOUT got "a human will need to investigate".
+# ===========================================================================
+echo ""
+echo "#8896: a settle-wait timeout is exit 5 (re-queue), never exit 1..."
+
+# Timeout path 2: the check-runs API never became readable within the wait.
+# rc=1 (a generic transient failure, not the confirmed-404 streak that means
+# "this repo has no checks") keeps the poll going until the deadline.
+_reset
+LOOM_AUTO_MERGE_TIMEOUT=0
+_SAVED_GET_CHECK_RUNS="$(declare -f forge_get_check_runs)"
+forge_get_check_runs() { return 1; }
+run_fn _wait_for_checks_then_sync_merge
+eval "$_SAVED_GET_CHECK_RUNS"
+assert_eq "5" "$LAST_RC" \
+  "#8896: an unfetchable check-runs API at the deadline exits 5 too (same not-a-failure shape)"
+assert_contains "$LAST_OUT" "fetchable" \
+  "#8896: that refusal names the unreadable check-runs API, not a failed check"
+
+# The contrast that gives exit 5 its meaning: a genuinely failed REQUIRED check
+# is NOT a timeout and must stay exit 1 — evidence about this head, not timing.
+_reset
+REQUIRED_CONTEXTS=$'File Size Ratchet\nRust Unit Tests'
+CHECK_RUNS_SCRIPT=("$(_runs 5 "$GATES_DONE,$SUITES_FAILED")")
+LOOM_AUTO_MERGE_TIMEOUT=0
+run_fn _wait_for_checks_then_sync_merge
+assert_eq "1" "$LAST_RC" \
+  "#8896: a failed REQUIRED check keeps exit 1 even at the deadline — exit 5 is reserved for 'still waiting'"
+
+# ===========================================================================
+# #8896 — the --allow-unapproved override audit comment is posted AT MOST ONCE
+#         per merge-pr.sh run, not once per guard evaluation.
+# ===========================================================================
+echo ""
+echo "#8896: the loom:pr override audit comment is not duplicated by the post-wait re-check..."
+
+_reset
+ALLOW_UNAPPROVED=true
+PR_LABELS="loom:review-requested"
+FRESH_PR_JSON='{"number":8220,"head":{"sha":"490b79f1d"},"merged":false,"labels":[{"name":"loom:review-requested"}]}'
+run_fn _auto_path_loom_pr_guards
+assert_eq "0" "$LAST_RC" \
+  "#8896: --allow-unapproved with no loom:pr still proceeds through both evaluations"
+assert_eq "1" "$(comments_landed "$LAST_OUT")" \
+  "#8896: the 'Merge Proceeded Without loom:pr' comment is posted ONCE across the queue-time and post-wait checks"
+assert_eq "1" "$(comment_attempts)" \
+  "#8896: the post-wait re-check does not even attempt a second post"
+assert_eq "2" "$(grep -c 'loom:pr guard:' <<<"$LAST_OUT")" \
+  "#8896: both evaluations are still WARNed — only the durable forge comment is deduped, never the log record"
+
+# The flag is set on a LANDED post, not on an attempt: if the first post fails
+# (rate limit, transient 5xx) the post-wait re-check is still free to record
+# the override, so the dedupe can never silently lose the audit trail.
+_reset
+ALLOW_UNAPPROVED=true
+COMMENT_FAIL_FIRST=true
+PR_LABELS="loom:review-requested"
+FRESH_PR_JSON='{"number":8220,"head":{"sha":"490b79f1d"},"merged":false,"labels":[{"name":"loom:review-requested"}]}'
+run_fn _auto_path_loom_pr_guards
+assert_eq "0" "$LAST_RC" \
+  "#8896: a failed audit-comment post never blocks the merge (unchanged)"
+assert_eq "1" "$(comments_landed "$LAST_OUT")" \
+  "#8896: a failed first post leaves the post-wait re-check free to record the override — exactly one lands"
+assert_eq "2" "$(comment_attempts)" \
+  "#8896: two attempts in that case, because the first one did not land"
+
+# --dry-run still posts nothing at all, on either evaluation.
+_reset
+ALLOW_UNAPPROVED=true
+DRY_RUN=true
+PR_LABELS="loom:review-requested"
+FRESH_PR_JSON='{"number":8220,"head":{"sha":"490b79f1d"},"merged":false,"labels":[{"name":"loom:review-requested"}]}'
+run_fn _auto_path_loom_pr_guards
+DRY_RUN=false
+assert_eq "0" "$(comment_attempts)" \
+  "#8896: --dry-run posts no audit comment on either evaluation (dry-run contract preserved)"
 
 # ===========================================================================
 # AC1 — a loom:pr revoked after queue time blocks the merge.
@@ -358,14 +473,27 @@ assert_eq "3" "$LAST_RC" \
   "#8410 AC3: a moved head + a revoked label is still the exit-3 re-queue, not exit 1"
 
 # An unreadable fresh head (forge blip) must not be treated as "moved" — the
-# merge API's own precondition is the backstop there.
+# merge API's own precondition is the backstop there. It must not be reported as
+# a missing approval either (#8896): the re-read never happened, so the label
+# set is unknown, not empty. Still fails closed, just with an honest message.
 _reset
 FRESH_PR_JSON='{}'
 run_fn _revalidate_merge_guards
 assert_eq "1" "$LAST_RC" \
-  "an empty fresh read falls through to the label guard (no spurious exit 3)"
-assert_contains "$LAST_OUT" "does not carry the \`loom:pr\` label" \
-  "an empty fresh read is treated as 'no approval visible', which fails closed"
+  "an empty fresh read refuses the merge (fails closed) and is no spurious exit 3"
+assert_contains "$LAST_OUT" "could not re-read PR #8220" \
+  "#8896: the refusal names the failed re-read as the reason"
+assert_contains "$LAST_OUT" "NOT a missing" \
+  "#8896: and says explicitly that this is not a missing-loom:pr verdict"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'does not carry the `loom:pr` label' <<<"$LAST_OUT"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: #8896: an unreadable re-read must NOT reuse the genuine-absence wording"
+    echo "    In: '$LAST_OUT'"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: #8896: an unreadable re-read does NOT reuse the genuine-absence \`loom:pr\` wording"
+fi
 
 # --- Summary ---
 echo ""

@@ -105,7 +105,9 @@ fi
 
 if [[ "${1:-}" == "api" ]]; then
   path="${2:-}"
-  if [[ "$path" =~ ^repos/.+/commits/([^/]+)/check-runs$ ]]; then
+  # The endpoint carries a query string since #8895 (`?per_page=100`), so the
+  # SHA capture stops at `?` and a trailing query is accepted.
+  if [[ "$path" =~ ^repos/.+/commits/([^/?]+)/check-runs(\?.*)?$ ]]; then
     sha="${BASH_REMATCH[1]}"
     mode_file="$STUB_DIR_FROM_ENV/gh-check-runs-$sha.mode"
     mode="success"

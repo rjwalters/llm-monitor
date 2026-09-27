@@ -361,28 +361,20 @@ CAP_RC=0
 
 **Scenario**: PR body contains "Closes #123, Closes #456, Fixes #789".
 
-**Handling**:
-```bash
-# Extract all linked issues using GitHub's own parser (closingIssuesReferences).
-# Note: `Updates #N` is intentionally excluded — it does not close the issue
-# (see issue #3267). The forge_pr_close_targets helper handles this correctly.
-source "$(git rev-parse --show-toplevel)/.loom/scripts/lib/forge-helpers.sh"
-forge_detect
-LINKED_ISSUES=$(forge_pr_close_targets "$PR_NUMBER")
-
-# Verify each issue closed after merge
-for issue in $LINKED_ISSUES; do
-  STATE=$(gh issue view "$issue" --json state --jq '.state')
-  if [ "$STATE" != "CLOSED" ]; then
-    echo "Warning: Issue #$issue not auto-closed, closing manually"
-    gh issue close "$issue" --comment "Closed by PR #$PR_NUMBER (auto-merged by Champion)"
-  fi
-done
-```
+**Handling**: this is exactly `champion-pr-merge.md`'s own Step 4 ("Verify
+Issue Auto-Close") — extract `LINKED_ISSUES` via `forge_pr_close_targets`,
+then for each candidate run the `has-unnegated-closing-ref` cross-check
+**before** closing (#1057: `does not fix #N` reads as a closing keyword to
+GitHub's parser too, so an unguarded `gh issue close` here closes an issue
+the author explicitly said to leave open). Do not re-implement the loop here
+— follow Step 4 in `champion-pr-merge.md` so this edge case and Step 4 cannot
+drift apart into two different close policies.
 
 **Decision**: **Allow merge, verify all linked issues** - standard practice.
 
-**Rationale**: GitHub auto-closes multiple issues, but verify and manually close if needed. The helper uses GitHub's `closingIssuesReferences` so `Updates #N` (and similar non-closing references) are correctly excluded.
+**Rationale**: GitHub auto-closes multiple issues, but verify and manually
+close if needed — through the same negation-aware check Step 4 uses, not a
+second, unguarded copy of the close call.
 
 ---
 
@@ -670,7 +662,7 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 
 ## Complete Auto-Merge Workflow Script
 
-**The auto-merge workflow lives in a single source of truth: [`champion-pr-merge.md`](champion-pr-merge.md)** — the Verdict-State Janitor, the 6 safety criteria, the pre-merge comment, the squash merge, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation. The edge cases and decision matrix above are the reference for non-standard situations; they describe *behavior* and defer to `champion-pr-merge.md` for the *script* (why there are two files rather than one, and not a duplicate copy of the script: [`.loom/docs/champion-file-split-history.md`](../../../.loom/docs/champion-file-split-history.md)).
+**The auto-merge workflow lives in a single source of truth: [`champion-pr-merge.md`](champion-pr-merge.md)** — the Verdict-State Janitor, the 6 safety criteria, the pre-merge comment, the merge, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation. The edge cases and decision matrix above are the reference for non-standard situations; they describe *behavior* and defer to `champion-pr-merge.md` for the *script* (why there are two files rather than one, and not a duplicate copy of the script: [`.loom/docs/champion-file-split-history.md`](../../../.loom/docs/champion-file-split-history.md)).
 
 ---
 

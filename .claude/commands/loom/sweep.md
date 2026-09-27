@@ -48,7 +48,7 @@ Read the files the run actually reaches, and only those.
 | [`sweep-mode-c-lifecycle.md`](sweep-mode-c-lifecycle.md) | ~183 | **Mode C only.** C0 pre-flight → C1 per-PR routing → C2 merge → C3 advance, plus the Mode C summary format. |
 | [`sweep-wave-lifecycle.md`](sweep-wave-lifecycle.md) | ~662 | **Modes A and B only** (including the `all` sentinel). Baseline snapshot, checkpoint resume, steps 1-8b (pre-flight incl. Step 1a/1b lease handling, Curator, approval gate, Builder, stacking, Judge, Doctor, Merge, wave boundary). |
 | [`sweep-summary-output.md`](sweep-summary-output.md) | ~81 | Step 8b / C3 (#8110). Summary table format, the `merged`/`blocked`/`skipped`/`rate-limited`/`completed externally` outcome vocabulary, and the transcript-archival completion hook. |
-| [`sweep-run-hygiene.md`](sweep-run-hygiene.md) | ~158 | Stop conditions; the three advisory **pre-wave** checks (host sleep, main-branch freshness, outstanding quarantine stashes); the sweep-child working-set contract; peer-sweep / legacy-daemon / role-runner coexistence. |
+| [`sweep-run-hygiene.md`](sweep-run-hygiene.md) | ~199 | Stop conditions; the five advisory **pre-wave** checks (host sleep, main freshness, quarantine stashes, stale/undocumented `loom:blocked`, silent PR queues); the sweep-child working-set contract; peer-sweep / legacy-daemon / role-runner coexistence. |
 | [`sweep-reference.md`](sweep-reference.md) | ~171 | Look-up only: the Limitations (deferred vs. implemented) status table, and the daemon event-bus wire contract — **required whenever the in-process `loom-daemon` is running**, since the sweep child must publish phase events onto its bus. |
 
 `sweep-mode-c-lifecycle.md` and `sweep-wave-lifecycle.md` are **mutually
@@ -70,7 +70,7 @@ never both (mixed invocations are explicitly unsupported; see
    - `DECIDE = use_subagent` → continue below.
 3. **`sweep-execution-model.md`** — read before dispatching any subagent
    (dispatch invariants, model resolution, Doctor-cycle cap).
-4. **`sweep-run-hygiene.md`** — the three advisory pre-wave checks, run before
+4. **`sweep-run-hygiene.md`** — the five advisory pre-wave checks, run before
    the first wave (or before the first `mcp__loom__dispatch_sweep` call on the
    daemon path). Advisory only: never block on them.
 5. **`sweep-scheduling-signals.md`** — overlap partitioning + operator-gate

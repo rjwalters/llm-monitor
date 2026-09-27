@@ -132,6 +132,14 @@ assert_not_contains() {
 info()    { echo "INFO: $*"; }
 success() { echo "OK: $*"; }
 warning() { echo "WARN: $*" >&2; }
+# _mp_refs's fail-closed path calls error(), same as merge-pr.sh's own (echo to
+# stderr, exit 1) -- #8897's new BT4 case is the first in this suite to reach
+# it. Without a real `exit`, bash's command-substitution subshells do NOT
+# inherit `-e` by default (no `inherit_errexit`), so an undefined `error`
+# would silently no-op ("command not found") instead of aborting the subshell
+# the way production's error() does, masking the exact fail-open/fail-closed
+# distinction this suite exists to pin.
+error()   { echo "ERROR: $*" >&2; exit 1; }
 
 # --- Real forge-helpers.sh (for the #4856 rate-limit-safe mutation wrappers) ---
 # merge-pr.sh's mutating call sites no longer invoke `gh issue edit` / `gh issue
@@ -643,6 +651,45 @@ PR_JSON='{"body":"## Summary\n\nImplements the first slice.\n\nPart of #123"}'
 run_capturing_stderr _check_partial_increment_close_conflict
 assert_not_contains "$(read_stderr)" "Backticked partial-increment trailer (#5690)" \
   "Plain-text 'Part of #123' trailer: no warning (declaration parses, reset will fire)"
+
+# BT4 (#8897): a daemon that answers `merge-pr-refs closing-refs` /
+# `partial-increment-refs` but REJECTS `backticks-partial-increment-warnings`
+# (the daemon predates that mode, #8808) must not print _mp_refs's
+# hardcoded, fail-closed "Refusing..." wording -- that text is hardcoded to
+# the closing-reference case, so on THIS mode it names the wrong PR (#8191)
+# and cites a roll-hint version this host already satisfies, while the merge
+# proceeds regardless (the `local var=$(...)` exit-status swallow, unrelated
+# to this fix, that makes the call fail-open in practice already). The call
+# site must instead report a quiet, advisory skip.
+fake_daemon="$STUB_DIR/fake-loom-daemon-no-bt-mode"
+cat > "$fake_daemon" <<'FAKEDAEMON'
+#!/usr/bin/env bash
+# Simulates a loom-daemon predating #8808: answers merge-pr-refs for every
+# mode EXCEPT backticks-partial-increment-warnings, which it rejects the way
+# clap rejects an unknown subcommand (nonzero exit, no stdout).
+if [[ "$1" == "merge-pr-refs" && "$2" == "backticks-partial-increment-warnings" ]]; then
+  echo "error: unrecognized subcommand 'backticks-partial-increment-warnings'" >&2
+  exit 2
+fi
+exit 0
+FAKEDAEMON
+chmod +x "$fake_daemon"
+
+reset_log
+PR_JSON='{"body":"Implements a slice.\n\nPart of #123"}'
+saved_self_bin="${LOOM_DAEMON_SELF_BIN:-}"
+export LOOM_DAEMON_SELF_BIN="$fake_daemon"
+run_capturing_stderr _check_partial_increment_close_conflict
+no_bt_mode_err="$(read_stderr)"
+export LOOM_DAEMON_SELF_BIN="$saved_self_bin"
+assert_not_contains "$no_bt_mode_err" "Refusing" \
+  "#8897: daemon rejecting backticks-partial-increment-warnings -> no 'Refusing' wording printed"
+assert_not_contains "$no_bt_mode_err" "#8191" \
+  "#8897: daemon rejecting backticks-partial-increment-warnings -> does not blame the closing-ref analysis (#8191)"
+assert_contains "$no_bt_mode_err" "Skipped backticked-trailer advisory warning check" \
+  "#8897: daemon rejecting backticks-partial-increment-warnings -> quiet skip note printed instead"
+assert_eq "" "$(read_log)" \
+  "#8897: the skip is advisory only -- no forge mutation results from it"
 
 echo ""
 echo "Testing _check_partial_increment_close_conflict (pre-merge guard)..."

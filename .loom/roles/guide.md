@@ -717,12 +717,19 @@ By verifying issue closure, you keep the backlog clean and prevent confusion abo
 
 **Run every 15-30 minutes** to check if blocked issues can be unblocked when their dependencies resolve.
 
-### Problem: Stuck Blocked Issues
+### Problem: Stuck Blocked Issues (and PRs, #8925)
 
-When an issue is marked `loom:blocked` due to dependencies, it may stay blocked indefinitely even after the blocking issues are resolved. This creates:
-- ❌ Ready-to-implement issues stuck in blocked state
+When an issue OR pull request is marked `loom:blocked` due to a dependency, it
+may stay blocked indefinitely even after the dependency resolves. This
+creates:
+- ❌ Ready-to-implement issues (or ready-to-land PRs) stuck in blocked state
 - ❌ Manual intervention required to unblock
 - ❌ Delays in the development pipeline
+
+`gh issue list` never returns a pull request, so `check_and_unblock` runs a
+second enumeration, `check_and_unblock_prs` (below), rather than folding PRs
+into the issue query; a PR clears to a review-lane label, never to
+`loom:issue` (#8925).
 
 ### Check Blocked Issues
 
@@ -737,6 +744,14 @@ For each `loom:blocked` issue, check if all dependencies have resolved:
 # 2. Check if all referenced issues are closed
 # 3. If all resolved, unblock the issue
 ```
+
+**A dependency stated only in a comment cannot be read here (#8925's other
+defect)** — this routine reads the BODY only. A role applying `loom:blocked`
+must record the blocker in the body as a **park record**
+(`loom-daemon park-record render`; grammar: `.loom/docs/park-record.md`),
+not as prose in a comment — its rendered `Blocked by: #N`
+line already matches `parse_dependencies` below, so no parser change is
+needed once a role writes one.
 
 ### Dependency Parsing
 
@@ -926,8 +941,22 @@ check_and_unblock() {
       fi
     fi
   done
+
+  # Pull requests (#8925): a parked PR is a SEPARATE enumeration, not a filter
+  # on the loop above — see "Problem: Stuck Blocked Issues" for why
+  # `gh issue list` can never surface one.
+  check_and_unblock_prs
 }
 ```
+
+### Unblocking Pull Requests (#8925)
+
+A parked PR clears to a review-lane label, never `loom:issue` (a PR was never
+curated), and its superseding check reads the PR's OWN state, not a linked
+PR's. `check_and_unblock_prs`, `pr_has_superseding_block` and
+`previous_review_label` are defined in full, with a worked example, in
+`.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions`
+— read on demand, not inlined here.
 
 ### Example Unblocking Flow
 
@@ -968,6 +997,10 @@ gh issue comment 963 --body "🔓 **Unblocked**: Dependencies resolved (#962). R
 # loom:operator label check AND the merge-state check independently trigger
 # here) → stay blocked, do NOT strip loom:blocked or post an "Unblocked"
 # comment.
+
+# A PR-side worked example (#8925's own #8314 shape) is in park-record.md's
+# "The unblock sweep's PR-side functions" section, alongside the three
+# functions it exercises.
 ```
 
 ### PR Dependencies
@@ -994,6 +1027,10 @@ pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
   blocked**, regardless of its labels (`has_superseding_block`, #7267) — a PR
   in that state cannot currently land no matter what
 - If issue was blocked for non-dependency reasons → Check comments for context
+- **PR-side (#8925)**: `pr_has_superseding_block` true → keep blocked, even if
+  every declared blocker closed; a `loom:blocked` that is a policy hold, not a
+  dependency wait (an operator/quarantine call) → leave it, do not write a
+  park record for it
 
 ## Epic Progress Tracking
 

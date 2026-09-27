@@ -130,9 +130,16 @@ source "$FUNCS_FILE"
 #
 # Contract being stubbed:
 #   merge-pr stale-checks : 0 + CLEAN sentinel / 1 + refusal / 2 + reason
-#   merge-pr redate-checks: 0 + LOOM-REDATE-PUSHED or LOOM-RERUN-PENDING
-#                           / 5 + LOOM-RERUN-FRESH (#8914) / 1 failed
+#   merge-pr redate-checks: 0 + LOOM-REDATE-PUSHED / 1 failed
 #                           / 3 head moved / 4 escalated to loom:operator
+#
+# #8919 removed #8914's in-place re-run, so the REAL binary never answers 5
+# (LOOM-RERUN-FRESH) or prints LOOM-RERUN-PENDING any more: a workflow re-run
+# replays the ORIGINAL test merge commit, so it re-dates the checks without
+# re-testing the current base. `merge-pr.sh` is frozen by the file-size ratchet
+# and still carries the arms that read those answers, so the two stub modes
+# below stay — they pin merge-pr.sh's handling of an OLDER binary during a
+# mid-rollout version skew, not a behaviour the current binary can produce.
 # $1 selects the stale-checks answer, $2 the redate-checks answer. Each
 # invocation's argv is appended to $STUB_DIR/argv-<subcommand> so the suite
 # can assert which calls happened and with which operands.
@@ -213,20 +220,22 @@ assert_contains "$LAST_OUT" "LOOM-REDATE-PUSHED" "the remedy's own output is sur
 assert_contains "$LAST_OUT" "not merged" "exit 4 is explained as 're-dated, not merged'"
 assert_contains "$REDATE_ARGV" "ALLOW=1" "the script opts in to exit 5 via LOOM_REDATE_ALLOW_PROCEED=1 (an env var, so an older binary ignores it)"
 
-# T2b (#8914): the stale checks were re-run IN PLACE and are fresh now
-# (subcommand exit 5) -> the guard passes and the merge proceeds in this run.
-# No commit was pushed, so the head and loom:pr are intact.
+# T2b (version skew only): merge-pr.sh's exit-5 arm. The CURRENT binary never
+# returns 5 — #8919 removed the in-place re-run because a re-run replays the
+# original test merge commit and therefore proves nothing about the current base
+# — but merge-pr.sh is frozen and still reads it, so an OLDER binary under this
+# script must keep working. This pins that arm, NOT a live behaviour.
 STUB="$(make_stub stale fresh)"
 LOOM_DAEMON_BIN="$STUB" run_guard
-assert_eq "0" "$LAST_RC" "re-ran in place + fresh (exit 5) -> guard passes, merge proceeds"
-assert_contains "$LAST_OUT" "LOOM-RERUN-FRESH" "the in-place re-run is reported"
+assert_eq "0" "$LAST_RC" "legacy binary exit 5 -> merge-pr.sh's compatibility arm still passes it"
+assert_contains "$LAST_OUT" "LOOM-RERUN-FRESH" "the legacy binary's own output is surfaced"
 
-# T2c (#8914): re-run in place but still running when the wait ran out
-# (subcommand exit 0) -> exit 4, re-queue, same as a push.
+# T2c (version skew only): the same for an older binary's exit 0 +
+# LOOM-RERUN-PENDING -> exit 4, re-queue, same as a push.
 STUB="$(make_stub stale pending)"
 LOOM_DAEMON_BIN="$STUB" run_guard
-assert_eq "4" "$LAST_RC" "re-running in place, not yet fresh -> exit 4 (re-queue)"
-assert_contains "$LAST_OUT" "loom:pr kept" "exit 4 explains the in-place case keeps the verdict"
+assert_eq "4" "$LAST_RC" "legacy binary pending -> exit 4 (re-queue)"
+assert_contains "$LAST_OUT" "loom:pr kept" "exit 4's text still covers the legacy in-place wording"
 
 # T3: the bound was reached and the PR was escalated (subcommand exit 4) ->
 # the ORIGINAL #8248 refusal still blocks the merge. The guard is not weakened
@@ -321,13 +330,17 @@ REDATE_HELP="$("$REAL_DAEMON_BIN" merge-pr redate-checks --help 2>&1)"
 REDATE_HELP_RC=$?
 set -e
 assert_eq "0" "$REDATE_HELP_RC" "real binary: 'merge-pr redate-checks --help' exits 0"
+# --rerun-wait-secs / --allow-proceed are accepted-and-ignored since #8919 (see
+# the header note). They must stay ACCEPTED: merge-pr.sh is frozen and still
+# passes LOOM_REDATE_ALLOW_PROCEED=1, and a rejected flag would exit 2 and
+# silently disable the remedy entirely.
 for opt in --pr --repo --branch --expected-head-sha --rerun-wait-secs --allow-proceed; do
     assert_contains "$REDATE_HELP" "$opt" "real binary: subcommand accepts $opt"
 done
 
-# T14 (#8914): the REAL binary accepts the exact opt-in value this script sets.
+# T14: the REAL binary accepts the exact opt-in value this script sets.
 # clap's default bool parser rejects "1" (exit 2, "invalid value"), which would
-# silently disable BOTH remedies; a stub loom-daemon cannot catch that.
+# silently disable the remedy; a stub loom-daemon cannot catch that.
 FAIL_GH="$STUB_DIR/gh-fails"; printf '#!/usr/bin/env bash\nexit 1\n' > "$FAIL_GH"; chmod +x "$FAIL_GH"
 set +e
 OPTIN_OUT="$(LOOM_REDATE_ALLOW_PROCEED=1 LOOM_GH_BIN="$FAIL_GH" "$REAL_DAEMON_BIN" merge-pr redate-checks --pr 1 --repo o/r --branch b --expected-head-sha abc --rerun-wait-secs 0 2>&1)"
@@ -335,6 +348,15 @@ OPTIN_RC=$?
 set -e
 assert_eq "1" "$OPTIN_RC" "real binary + LOOM_REDATE_ALLOW_PROCEED=1 parses and reaches the remedy (a failing gh -> exit 1, not a clap exit 2)"
 assert_not_contains "$OPTIN_OUT" "invalid value" "the opt-in value merge-pr.sh sets is accepted"
+
+# T15 (#8919): the in-place re-run is GONE. Even with the opt-in set, the real
+# binary goes straight to the #8508 push path — it never re-runs a workflow and
+# never answers 5 (LOOM-RERUN-FRESH) or prints LOOM-RERUN-PENDING, because a
+# re-run replays the original test merge commit and so re-validates nothing.
+assert_not_contains "$OPTIN_OUT" "LOOM-RERUN-FRESH" "the real binary no longer reports an in-place re-run as fresh"
+assert_not_contains "$OPTIN_OUT" "LOOM-RERUN-PENDING" "the real binary no longer waits on an in-place re-run"
+assert_contains "$OPTIN_OUT" "#8508" "the real binary goes straight to the tree-identical re-date push"
+assert_contains "$OPTIN_OUT" "#8919" "the ignored-flag note names why the re-run is gone"
 
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]]

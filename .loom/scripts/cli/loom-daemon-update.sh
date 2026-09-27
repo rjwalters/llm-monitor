@@ -673,7 +673,7 @@ fetch_resolve_latest() {
         return 1
     fi
 
-    local tag
+    local tag assets sha_name ex_bin bin_name="loom-daemon-${FETCH_TARGET}"
     if ! tag=$(gh release view --json tagName -R "$FETCH_REPO_SLUG" --jq '.tagName' 2>/dev/null) || [[ -z "$tag" ]]; then
         FETCH_RESOLVE_REASON="'gh release view' found no latest release for $FETCH_REPO_SLUG (no Releases yet, an unreachable/rate-limited API, or an auth failure)"
         return 1
@@ -685,12 +685,18 @@ fetch_resolve_latest() {
         return 1
     fi
 
-    local assets bin_name sha_name
     assets="$(gh release view --json assets -R "$FETCH_REPO_SLUG" --jq '.assets[].name' 2>/dev/null || true)"
-    bin_name="loom-daemon-${FETCH_TARGET}"
     sha_name="${bin_name}.sha256"
     if ! grep -qxF "$bin_name" <<<"$assets" || ! grep -qxF "$sha_name" <<<"$assets"; then
-        FETCH_RESOLVE_REASON="release $tag has no artifact for target $FETCH_TARGET (checked for $bin_name + $sha_name)"
+        # #8654: name the release's age + asset count ("still uploading" vs
+        # "genuinely unbuilt", the daemon resolver's own #8515 wording) when
+        # the resolved loom-daemon can say so. Strictly optional: a missing,
+        # older (clap exit 2) or failing binary leaves the flat reason, and
+        # this only rewords -- the refusal still refuses either way.
+        # requires-daemon: release-explain optional   #8654 — probes and degrades to the flat reason
+        ex_bin="$(resolve_self_daemon_bin)"
+        FETCH_RESOLVE_REASON="$("$ex_bin" release-explain --repo "$FETCH_REPO_SLUG" --tag "$tag" --target "$FETCH_TARGET" --repo-root "$REPO_ROOT" 2>/dev/null)" && [[ -n "$FETCH_RESOLVE_REASON" ]] \
+            || FETCH_RESOLVE_REASON="release $tag has no artifact for target $FETCH_TARGET (checked for $bin_name + $sha_name)"
         return 1
     fi
 

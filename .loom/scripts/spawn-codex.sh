@@ -838,6 +838,12 @@ fi
 #   #4495's scope guards forbid it, and waiving trust would defeat the very
 #   boundary this preflight exists to prove.
 #
+#   A PRIVATE-CLONE session (issue #8787) is the one case where this host-side
+#   check would inspect the wrong bridge and the wrong workspace; there the
+#   identical obligation is proven inside the session instead. See the
+#   `verified-in-private-session` branch below for why that is a relocation
+#   rather than a bypass.
+#
 #   READ-ONLY roles keep the existing conservative sandbox fallback, but the
 #   audit line states explicitly that hook parity was unavailable. They are
 #   never reported as Builder-capable; capability truth lives in
@@ -862,15 +868,41 @@ case "$_hook_role" in
 esac
 
 _hook_role_is_mutable=false
-if [[ -n "$_hook_role" && " $LOOM_CODEX_MUTABLE_ROLES " == *" $_hook_role "* ]]; then
-    _hook_role_is_mutable=true
-fi
+[[ -n "$_hook_role" && " $LOOM_CODEX_MUTABLE_ROLES " == *" $_hook_role "* ]] && _hook_role_is_mutable=true || true
 
 _hook_provisioner="${_SCRIPT_DIR}/provision-codex-hooks.sh"
 _hook_status="unknown"
 _hook_reason=""
 
-if [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
+if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" && "$CODEX_SESSION_EXEC" == "true" ]]; then
+    # Private-clone session (issue #8787). The managed hook this launch runs
+    # under is NOT the one this check would look at: it is registered in the
+    # account profile for `/workspace/repo`, naming the image-owned bridge at
+    # /opt/loom/private-control/hooks/guard-codex-bridge.sh — a path that does
+    # not exist on this host at all, so verifying it HERE would evaluate the
+    # wrong bridge against the wrong workspace and refuse a session that is in
+    # fact enforcing.
+    #
+    # This is a RELOCATION of the check, not a waiver of it, and it is not a
+    # flag anyone can set to skip enforcement:
+    #
+    #   * `LOOM_PRIVATE_LEASE_FD` names an inherited file descriptor, not a
+    #     value. `loom-daemon session-exec host` re-opens it and proves it is a
+    #     genuine exclusive flock on the selected account's own lock inode
+    #     before it will do anything, and refuses a non-private launch outright
+    #     once a lease is inherited.
+    #   * The same daemon path rechecks the bound loom-private-control-v1
+    #     identity (issue #8839) on the exact container being launched, and
+    #     `loom-daemon private-workspace execute` re-admits the role IN the
+    #     container immediately before exec — refusing a mutable role unless
+    #     the managed registration names the sealed image-owned bridge, the
+    #     profile's control files are read-only mount points, and this profile
+    #     has established Codex hook trust. That is a strictly stronger form of
+    #     exactly the obligation checked below.
+    #
+    # `--dangerously-bypass-hook-trust` is passed nowhere, here or there.
+    _hook_status="verified-in-private-session"; _hook_reason="proven inside the account's private session, against the image-owned bridge for /workspace/repo (#8787)"
+elif [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
     _hook_status="unavailable"
     _hook_reason="provision-codex-hooks.sh is not installed next to this adapter"
 elif [[ -z "${CODEX_HOME:-}" ]]; then
@@ -893,7 +925,7 @@ fi
 
 log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
 
-if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" ]]; then
+if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
     log_error "Role '$_hook_role' mutates the repository, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
     [[ -n "$_hook_reason" ]] && log_error "  reason: $_hook_reason"
     log_error "Without it a Codex worker runs with NO managed-worktree confinement,"
@@ -906,7 +938,7 @@ if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" ]]; then
     exit 78  # EX_CONFIG
 fi
 
-if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" ]]; then
+if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
     log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
 fi
 

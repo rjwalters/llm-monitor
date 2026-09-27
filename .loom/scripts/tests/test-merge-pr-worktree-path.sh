@@ -36,6 +36,19 @@ TESTS_FAILED=0
 pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
 fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
 
+# An assertion that CANNOT survive the port to Rust, retired under the
+# three-part test in defaults/docs/verification-recipes.md §6. Printed, not
+# deleted: a reader must be able to see what was removed, why, and what proves
+# the property now. Counted as run so the totals stay honest.
+YELLOW='\033[0;33m'
+retired() { # <what> <property> <why-structural> <successor>
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${YELLOW}RETIRED${NC}: $1"
+    echo "      property:   $2"
+    echo "      structural: $3"
+    echo "      successor:  $4"
+}
+
 assert_grep() {
     local pattern="$1" file="$2" msg="$3"
     if grep -qE "$pattern" "$file"; then pass "$msg"; else fail "$msg (pattern: $pattern)"; fi
@@ -129,8 +142,13 @@ assert_grep "Preserving Judge/Doctor review worktree at" "$MERGE_PR" \
 # --- Test 2d: never-closing-issue worktree/branch cleanup (#6694) source surface ---
 assert_grep 'source "\$SCRIPT_DIR/lib/branch-landed.sh"' "$MERGE_PR" \
     "merge-pr.sh sources the shared branch-landed primitive (#7812)"
-assert_grep 'branch_landed "\$branch" "\${DEFAULT_BRANCH_NAME:-}" "\$expected_head_sha"' "$MERGE_PR" \
-    "_maybe_delete_local_branch delegates its safety check to the shared primitive (#6694/#7812)"
+retired \
+    "_maybe_delete_local_branch delegates its safety check to the shared primitive (#6694/#7812)" \
+    "the local-branch -d -> -D upgrade is gated on the shared branch-landed verdict (fed the merged PR's head SHA), never a private re-derivation" \
+    "#8191: the decision left the shell. _maybe_delete_local_branch now calls 'loom-daemon merge-pr delete-branch', whose only rule is worktree_cli::branch_delete, which calls worktree_cli::branch_landed::probe (the Rust twin of lib/branch-landed.sh that worktree.sh remove already uses) — the shell holds no branch_landed call to grep for" \
+    "the assertion immediately below (the shell threads \$expected_head_sha into the daemon), plus loom-daemon's branch_delete::tests::only_a_landed_verdict_may_escalate_to_force_delete and the behavioural cases in test-merge-pr-local-branch-cleanup.sh / test-merge-pr-primary-checkout-advice.sh that force-delete on a tip match"
+assert_grep 'merge-pr delete-branch .*--expected-head-sha "\$expected_head_sha"' "$MERGE_PR" \
+    "_maybe_delete_local_branch hands the merged head SHA to the shared rule (loom-daemon merge-pr delete-branch, #8191)"
 assert_grep 'branch_has_landed "\$PR_BRANCH" "\$DEFAULT_BRANCH_NAME" "\$PR_HEAD_SHA"' "$MERGE_PR" \
     "the worktree-preserve decision reuses the shared primitive at every call site (#6694/#7812)"
 assert_grep "holds nothing unmerged; removing it \\(#6694\\)" "$MERGE_PR" \

@@ -18,7 +18,7 @@
 #      `git ls-remote`. Both scenarios assert the spurious warning is absent.
 #
 # Strategy: build a real, offline git sandbox (bare "remote" + a clone), stack a
-# child on a parent, simulate the parent's squash-merge to the default branch,
+# child on a parent, simulate the parent's merge to the default branch,
 # delete the parent branch IN THE BARE REMOTE (leaving the clone's local
 # remote-tracking ref stale — the exact #3776 condition), then run the ACTUAL
 # defaults/scripts/reconcile-stack.sh with a stubbed `gh` on PATH. No network.

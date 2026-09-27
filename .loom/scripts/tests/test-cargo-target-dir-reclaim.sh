@@ -61,7 +61,11 @@ STANDALONE_SH="$REPO_ROOT/scripts/cargo-target-dir.sh"
 
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-remove"
+# `cargo-target-dir` too since #9153: Test 8 drives merge-pr.sh's post-merge
+# cleanup, whose resolve/reclaim pair is now that subcommand. A binary predating
+# it would make the reclaim a silent no-op and Test 8 would read as a logic
+# failure rather than an environment one.
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-remove" "cargo-target-dir"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -503,7 +507,12 @@ else
     # shellcheck source=../lib/branch-landed.sh
     source "$(dirname "$MERGE_PR")/lib/branch-landed.sh"
     eval "$(extract_fn _maybe_delete_local_branch "$MERGE_PR")"
-    eval "$(extract_fn _mp_report_target_dir_reclaim "$MERGE_PR")"
+    # No `_mp_report_target_dir_reclaim` to extract since #9153: merge-pr.sh's
+    # resolve + reclaim + render sequence is `loom-daemon cargo-target-dir
+    # resolve|reclaim`, so the extracted body below drives the RUST decision
+    # (`worktree_ops::cargo_target::plan_reclaim`) and replays its
+    # `LEVEL<TAB>message` record through the info/warning/success stubs above —
+    # the same binary the `worktree.sh remove` cases already exercise.
     eval "$(extract_fn _remove_loom_worktree "$MERGE_PR")"
 
     MP_REPO="$TMP/mp-repo"

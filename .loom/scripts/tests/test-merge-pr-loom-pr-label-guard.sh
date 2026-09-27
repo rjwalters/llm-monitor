@@ -30,8 +30,15 @@
 # (Rust, loom-daemon/src/merge_pr/loom_pr_guard.rs) — this suite now also
 # pins a real built binary (see require-daemon-bin.sh below), same as
 # test-merge-pr-verdict-label-guard.sh already does for its sibling guard.
-# _check_champion_hold_state_staleness is unaffected — its marker-extraction
-# logic stays plain shell.
+#
+# A later #8191 slice moved _check_champion_hold_state_staleness's
+# marker-extraction and staleness comparison to `loom-daemon merge-pr
+# hold-state` as well; only the forge_get_pr_comments() read stays in the
+# shell, so the stub below still drives both. T6-T8 pass unchanged against
+# that port, and T8a/T8b are new assertions for the two ways the retired
+# `grep | tail -1 | sed` pipeline lost the warning silently (an empty
+# `[0-9a-f]*` capture from a quoted template winning `tail -1`, and a bare
+# substring anywhere counting as recorded state).
 #
 # Usage:
 #   ./.loom/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
@@ -292,6 +299,43 @@ assert_eq "0" "$LAST_RC" "loom:pr present + no hold-state marker -> guard passes
 assert_not_contains "$LAST_OUT" "champion:hold-state marker recorded" "No hold-state marker -> no staleness warning"
 FAKE_PR_COMMENTS=""
 
+# T8a (#8191 slice): a later comment QUOTING champion-pr-merge.md's own
+# template must not erase a real hold. The retired shell's capture class was
+# `[0-9a-f]*`, which also matches the empty string, so the documentation line
+# `head=<sha>` was a match whose SHA was empty — and `tail -1` handed that
+# empty capture to the caller, silently disabling the staleness check for the
+# whole PR. One quoted example was enough. The port requires `[0-9a-f]+` and
+# takes the last match that actually carries a SHA.
+DRY_RUN=false; ALLOW_UNAPPROVED=false
+PR_LABELS=$'loom:pr'
+PR_HEAD_SHA="deadbeef"
+FAKE_PR_COMMENTS='<!-- champion:hold-state head=abc1234 -->
+Holding for human merge.
+For reference, the hold records <!-- champion:hold-state head=<sha> --> in its notice.'
+run_guard
+assert_eq "0" "$LAST_RC" "placeholder-quoting comment -> guard still passes (exit 0)"
+assert_contains "$LAST_OUT" "champion:hold-state marker recorded head=abc1234" "A quoted head=<sha> template does NOT erase the real recorded head (#8191)"
+FAKE_PR_COMMENTS=""
+
+# T8b (#8191 slice): a PROSE mention of the marker is not recorded state.
+# The retired shell matched the marker text anywhere it appeared, so a comment
+# merely describing the mechanism outranked the genuine hold notice — the same
+# hazard Champion's own reader answered with `startswith` on the sibling
+# `<!-- champion:merge-risk-hold -->` marker (#5371). The port counts a marker
+# only inside an HTML comment that opens and closes on one line, which is
+# exactly the shape champion-pr-merge.md writes.
+DRY_RUN=false; ALLOW_UNAPPROVED=false
+PR_LABELS=$'loom:pr'
+PR_HEAD_SHA="deadbeef"
+FAKE_PR_COMMENTS='<!-- champion:hold-state head=abc1234 -->
+Holding for human merge.
+Note: champion:hold-state head=ffff9999 is the shape of that marker.'
+run_guard
+assert_eq "0" "$LAST_RC" "prose mention of the marker -> guard still passes (exit 0)"
+assert_contains "$LAST_OUT" "champion:hold-state marker recorded head=abc1234" "A prose mention does NOT outrank the real recorded head (#8191)"
+assert_not_contains "$LAST_OUT" "ffff9999" "The prose-mentioned SHA is never reported as recorded state (#8191)"
+FAKE_PR_COMMENTS=""
+
 # T9: loom:pr absent + empty label array (edge case: a PR with NO labels at
 # all) -> still hard-blocks, and the "<none>" placeholder is used instead of
 # an empty string in the message.
@@ -463,6 +507,8 @@ assert_contains "$src" 'PR_LABELS=$(echo "$PR_JSON" | jq -r' \
   "merge-pr.sh extracts PR_LABELS from the already-fetched PR_JSON (no extra API call)"
 assert_contains "$src" "merge-pr loom-pr-guard" \
   "merge-pr.sh delegates the label/override/block decision to loom-daemon (#8191)"
+assert_contains "$src" "merge-pr hold-state" \
+  "merge-pr.sh delegates the champion:hold-state marker extraction to loom-daemon (#8191)"
 
 # Assert the guard is invoked BEFORE the auto-merge path (line ordering): the
 # _check_loom_pr_label invocation must precede `# Handle auto-merge mode`.

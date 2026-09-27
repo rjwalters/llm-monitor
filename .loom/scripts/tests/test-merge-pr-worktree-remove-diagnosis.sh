@@ -53,6 +53,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MERGE_PR="$SCRIPTS_DIR/merge-pr.sh"
 
+# #8191: _maybe_delete_local_branch (called directly and via
+# _remove_loom_worktree) now delegates to `loom-daemon merge-pr delete-branch`.
+# Pin the binary built from this tree so a stale installed daemon cannot answer
+# instead — it would warn-and-keep every branch and fail these cases for the
+# wrong reason.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'

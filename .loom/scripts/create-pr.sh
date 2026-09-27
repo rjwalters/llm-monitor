@@ -142,14 +142,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$TITLE" ]]; then
-  echo "create-pr.sh: --title is required" >&2
-  exit 2
-fi
+[[ -n "$TITLE" ]] || { echo "create-pr.sh: --title is required" >&2; exit 2; }
 
-if [[ -n "$BODY_FILE" ]] && [[ "$HAVE_BODY" == "true" ]]; then
-  echo "create-pr.sh: --body and --body-file are mutually exclusive" >&2
-  exit 2
+if [[ -n "$BODY_FILE" && "$HAVE_BODY" == "true" ]]; then
+  echo "create-pr.sh: --body and --body-file are mutually exclusive" >&2; exit 2
 fi
 
 if [[ -n "$BODY_FILE" ]]; then
@@ -280,6 +276,20 @@ redundant." >&2
       exit 1
     fi
   fi
+fi
+
+# --- Provenance record (#9027, harness-ops D33) ------------------------------
+#
+# Append ONE hidden `<!-- loom:provenance v1 ... -->` line to the body. Its
+# fields, format, and the D32 story choice (from the body's closing refs) are
+# `loom-daemon provenance pr-marker`'s; no format logic lives here. A body that
+# already carries a record at the start of a line (a re-run) is left alone --
+# prose quoting the marker mid-line does not count. With no daemon that knows
+# the subcommand the record is still written, every part the literal
+# `unknown` in its field's shape -- D33 forbids omitting it.
+if [[ $'\n'"$BODY" != *$'\n<!-- loom:provenance '* ]] && source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"; then
+  _unk='<!-- loom:provenance v1 build=unknown unknown unknown prompts=unknown unknown sweep=unknown story=unknown trace=unknown host=unknown base=unknown run=unknown -->'
+  BODY+=$'\n\n'"$("$(loom_resolve_self_daemon_bin 2>/dev/null)" provenance pr-marker --body-file - ${BASE_BRANCH:+--base-ref "origin/$BASE_BRANCH"} <<< "$BODY" 2>/dev/null || echo "$_unk")"
 fi
 
 # --- Create -----------------------------------------------------------------

@@ -105,8 +105,8 @@
 # cannot see from this one.
 # shellcheck disable=SC2034
 
-# Idempotent: worktree.sh, merge-pr.sh and cleanup-branches.sh each source this
-# directly, so one process can easily source it twice.
+# Idempotent: worktree.sh and merge-pr.sh each source this directly, so one
+# process can easily source it twice.
 if [[ -n "${_LOOM_BRANCH_LANDED_LOADED:-}" ]]; then
     return 0 2>/dev/null || true
 fi

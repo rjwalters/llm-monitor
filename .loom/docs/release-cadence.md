@@ -207,6 +207,9 @@ Tracked separately in
 - [`.loom/docs/daemon-reference.md`](daemon-reference.md) — daemon self-update
   wrapper scripts (`loom-daemon-start.sh` / `loom-daemon-update.sh`) and how
   they fit the update lifecycle.
+- [`.loom/docs/release-glibc-floor.md`](release-glibc-floor.md) — the decided
+  minimum glibc `build-daemon`'s Linux artifacts must run against, and why
+  the build host is pinned rather than left on `ubuntu-latest`.
 - Issue [#6010](https://github.com/rjwalters/loom/issues/6010) — the incident
   and acceptance criteria this doc satisfies.
 - Issue [#8515](https://github.com/rjwalters/loom/issues/8515) — the

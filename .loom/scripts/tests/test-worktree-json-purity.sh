@@ -33,11 +33,23 @@
 #
 # Pattern follows test-worktree-root-override.sh: throwaway bare origin + repo
 # in a mktemp dir, copy worktree.sh + lib/, run.
+#
+# Moved out of shell-suite-tests by #8195 slice 7: Test 3 ("auto-recovery
+# retry path") exercises `_handle_feature_branch_in_main_worktree`, now
+# `loom-daemon worktree-branch-conflict`. Success there requires the recovery
+# to actually run — unlike slice 4/5's best-effort links/cleanup — so this
+# suite pins the binary via loom_test_require_daemon_bin and FAILS rather than
+# skips without one; the no-binary fallback (recovery_code=1, reporting git's
+# raw error) is a correct degradation but not what this suite measures.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-branch-conflict"
 
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 
@@ -244,6 +256,61 @@ else
     pass "human mode: no JSON document emitted"
 fi
 rm -f "$OUT"
+cleanup_repo "$REPO"
+
+# --- Test 6: an un-ported daemon degrades to "not this error", never to a
+# ---         claimed recovery (#8195 slice 7)
+#
+# `_worktree_handle_branch_conflict` probes `worktree-branch-conflict --help`
+# before trusting the subcommand's exit code, because clap answers an UNKNOWN
+# subcommand with exit 2 — and 2 is an ANSWER in this contract ("I switched
+# your main worktree back to the default branch, retry the add"). Without the
+# probe, a daemon predating the port claims a recovery it never performed, on
+# every failing `git worktree add`, and worktree.sh prints "Retrying worktree
+# creation..." over git's own accurate error.
+#
+# This test drives that exact shape with a stub standing in for an un-ported
+# daemon: a binary that exits 2 for everything, which is precisely what an old
+# `loom-daemon` does here. Deleting the probe from worktree.sh makes it fail.
+echo ""
+echo "Test 6: a daemon without the worktree-branch-conflict subcommand does not fake a recovery"
+REPO=$(setup_repo unported)
+OUT=$(mktemp /tmp/loom-wtjson-out.XXXXXX)
+OLD_DAEMON=$(mktemp /tmp/loom-wtjson-olddaemon.XXXXXX)
+# Every other daemon call site worktree.sh reaches is already best-effort
+# (`|| true`) or refuses only on exit 1, so one stub can stand in for the whole
+# binary without perturbing them.
+cat > "$OLD_DAEMON" <<'STUB'
+#!/usr/bin/env bash
+# Stands in for a loom-daemon predating #8195 slice 7: clap's unknown-subcommand
+# exit code, for any subcommand.
+echo "error: unrecognized subcommand '$1'" >&2
+exit 2
+STUB
+chmod +x "$OLD_DAEMON"
+(
+    cd "$REPO" || exit 1
+    git checkout -q -b feature/issue-105
+    LOOM_DAEMON_SELF_BIN="$OLD_DAEMON" LOOM_DAEMON_BIN="$OLD_DAEMON" \
+        ./.loom/scripts/worktree.sh 105 >"$OUT" 2>&1
+) || true
+if grep -q "Retrying worktree creation" "$OUT"; then
+    fail "un-ported daemon: worktree.sh claimed a recovery that never happened (the probe is missing) — content: $(cat "$OUT")"
+else
+    pass "un-ported daemon: no phantom 'Retrying worktree creation...' claim"
+fi
+if grep -q "is already used by worktree at" "$OUT"; then
+    pass "un-ported daemon: git's own error text is reported instead"
+else
+    fail "un-ported daemon: git's raw error was swallowed — content: $(cat "$OUT")"
+fi
+# The main worktree must still be on the feature branch: nothing switched it.
+if [[ "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)" == "feature/issue-105" ]]; then
+    pass "un-ported daemon: main worktree left untouched"
+else
+    fail "un-ported daemon: main worktree was switched despite no guard being able to run"
+fi
+rm -f "$OUT" "$OLD_DAEMON"
 cleanup_repo "$REPO"
 
 # --- Summary ---

@@ -316,15 +316,15 @@ source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 # GitHub: PUT /repos/{nwo}/pulls/{n}/merge with merge_method=<MERGE_METHOD>
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with Do=<MERGE_METHOD>
 #
-# MERGE_METHOD (optional, #7754): one of "squash"/"merge"/"rebase". Defaults
-# to "squash" when omitted -- preserves this function's pre-#7754 behavior
-# for any caller that has not been updated to pass a detected method (e.g.
-# via forge_detect_merge_method). Callers that need to respect a target
+# MERGE_METHOD (optional, #7754): one of "merge"/"squash"/"rebase". Defaults
+# to "merge" (merge commit, #9105) when omitted, for any caller that has
+# not been updated to pass a detected method (e.g. via
+# forge_detect_merge_method). Callers that need to respect a target
 # repo's actual allowed strategies MUST pass this explicitly.
 #
 # EXPECTED_HEAD_SHA (optional, #5579): an optimistic-concurrency precondition —
 # the SHA the PR's head branch must currently match for the merge to proceed.
-# Without it, both forges will happily squash-merge whatever the CURRENT head
+# Without it, both forges will happily merge whatever the CURRENT head
 # is at the moment the request lands, even if it has commits the caller never
 # saw approved (silently stranding them — squash-merge makes this invisible to
 # an ancestry check afterward, since the new squash commit is not a descendant
@@ -346,7 +346,7 @@ source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 # message "head out of date".
 forge_merge_pr() {
   local nwo="$1" pr_number="$2"
-  local expected_head_sha="${3:-}" merge_method="${4:-squash}"
+  local expected_head_sha="${3:-}" merge_method="${4:-merge}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
@@ -532,14 +532,32 @@ forge_delete_branch() {
 # signal (return 1) so existing bounded-poll behavior is unchanged.
 FORGE_CHECK_RUNS_RC_NOT_FOUND=44
 
+# Distinguished exit code forge_get_check_runs returns when the read came back
+# SHORT: the forge's own `total_count` says N check-runs exist for this commit
+# and fewer than N rows were actually retrieved (#8895). This is a fail-closed
+# signal, not a fetch failure — the rollup on hand is a strict SUBSET of the
+# commit's checks, and every consumer uses it to answer "is anything still
+# pending / is a required check failing", a question a subset can only answer
+# wrongly. Callers that poll (merge-pr.sh's `_wait_for_checks_then_sync_merge`)
+# treat any nonzero rc as "not settled yet", so returning this instead of the
+# partial JSON keeps a truncated read from ever being read as settlement.
+FORGE_CHECK_RUNS_RC_TRUNCATED=45
+
 # Get CI check runs for a commit.
 # Usage: forge_get_check_runs NWO COMMIT_SHA
-# GitHub: GET /repos/{nwo}/commits/{sha}/check-runs
+# GitHub: GET /repos/{nwo}/commits/{sha}/check-runs (fully paginated)
 # Gitea: GET /repos/{owner}/{repo}/commits/{sha}/statuses (mapped to check-run shape)
 #
 # Return codes: 0 success (JSON on stdout); $FORGE_CHECK_RUNS_RC_NOT_FOUND
-# (44) on a confirmed HTTP 404 (GitHub only — see below); 1 for any other
-# failure.
+# (44) on a confirmed HTTP 404 (GitHub only — see below);
+# $FORGE_CHECK_RUNS_RC_TRUNCATED (45) on a short read (GitHub only); 1 for any
+# other failure.
+#
+# KNOWN GAP (Gitea): the Gitea branch below makes ONE unpaginated request and
+# derives `total_count` from the rows it got, so a page-capped read there is
+# undetectable by the fail-closed check the GitHub branch gets. Tracked
+# separately — the live mechanism this guards (`merge-pr.sh --auto`) runs
+# against GitHub.
 forge_get_check_runs() {
   local nwo="$1"
   local commit="$2"
@@ -575,20 +593,22 @@ forge_get_check_runs() {
     # response's HTTP status (which `gh api` reports only on stderr, as
     # "... (HTTP <code>)") can be inspected without disturbing the JSON
     # payload on success (#6389).
+    #
+    # `per_page=100` + `--paginate` (#8895): GitHub's default page size for
+    # this endpoint is 30, and one head in this repo already produces 39
+    # check-runs — so an unpaginated read silently hid 9 of them from
+    # merge-pr.sh --auto's settle-wait, both from its pending count and from
+    # its failed-required classification. Since #8410 that settle-wait is the
+    # ONLY check-settling mechanism, so the hidden rows were a live
+    # merge-on-unsettled-CI gap. `--paginate` follows the Link header, so the
+    # rows retrieved no longer depend on how many checks a repo happens to
+    # have; the count check further down fails closed if they ever do again.
     local out_file err_file rc=0
-    out_file=$(mktemp)
-    err_file=$(mktemp)
-    gh api "repos/$nwo/commits/$commit/check-runs" \
+    out_file=$(mktemp); err_file=$(mktemp)
+    gh api "repos/$nwo/commits/$commit/check-runs?per_page=100" --paginate \
       --header "Accept: application/vnd.github+json" \
-      --jq '{
-        total_count: .total_count,
-        check_runs: [.check_runs[] | {
-          name: .name,
-          status: .status,
-          conclusion: .conclusion,
-          html_url: .html_url
-        }]
-      }' >"$out_file" 2>"$err_file" || rc=$?
+      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url}]}' \
+      >"$out_file" 2>"$err_file" || rc=$?
 
     if [[ $rc -ne 0 ]]; then
       if grep -q "HTTP 404" "$err_file" 2>/dev/null; then
@@ -598,8 +618,25 @@ forge_get_check_runs() {
       rm -f "$out_file" "$err_file"
       return 1
     fi
-    cat "$out_file"
+
+    # `--jq` runs per page, so a multi-page read leaves ONE reshaped object per
+    # page on stdout — fold them into a single rollup (total_count is repeated
+    # identically on every page; `max` is the conservative pick for the
+    # short-read check below). An empty stdout from a `gh` that exited 0 is not
+    # an authoritative "this commit has no checks": treat it as a transient
+    # failure, the same way a nonzero exit is treated.
+    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
     rm -f "$out_file" "$err_file"
+    [[ -n "$merged" ]] || return 1
+
+    # Fail closed on a short read (#8895): the forge told us how many
+    # check-runs exist for this commit and we hold fewer. Refuse to answer
+    # rather than answer from a subset — see FORGE_CHECK_RUNS_RC_TRUNCATED.
+    if [[ "$(jq -r '(.check_runs | length) < (.total_count // 0)' <<<"$merged")" == "true" ]]; then
+      echo "forge_get_check_runs: truncated read for $commit — got $(jq -r '"\(.check_runs | length) of \(.total_count)"' <<<"$merged") check-runs; failing closed" >&2
+      return "$FORGE_CHECK_RUNS_RC_TRUNCATED"
+    fi
+    printf '%s\n' "$merged"
   fi
 }
 
@@ -786,6 +823,10 @@ forge_get_pr_body() {
 #   closing keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/
 #   resolved). It also follows GitHub's own rule that "Updates #N", "See #N",
 #   and "References #N" do NOT close the issue.
+#   Neither branch is negation-aware: "does not fix #N" reads exactly like
+#   "fixes #N" (#1057). A caller about to ACT on a candidate re-checks it with
+#   `loom-daemon merge-pr-refs has-unnegated-closing-ref --issue N` (text on
+#   stdin), as champion-pr-merge.md Step 4 does before `gh issue close`.
 #
 # Gitea: The Gitea API does not expose an equivalent of closingIssuesReferences,
 #   so this falls back to a word-boundary regex over the PR body. The regex

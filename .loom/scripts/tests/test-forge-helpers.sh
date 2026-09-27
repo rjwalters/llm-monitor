@@ -538,7 +538,9 @@ chmod +x "$GH_MM_STUB_DIR/gh"
 gh_mm_result=$(PATH="$GH_MM_STUB_DIR:$PATH" forge_detect_merge_method "owner/repo" "$GH_MM_STUB_DIR/gh")
 assert_eq "rebase" "$gh_mm_result" "forge_detect_merge_method (GitHub) selects 'rebase' when only allow_rebase_merge is true"
 
-# --- GitHub: probe failure fails open to "squash" (pre-#7754 behavior) ---
+# --- GitHub: probe failure fails open to "merge" (#9105 inverted the
+# #7754 fail-open: a repo that truly disallows merge commits must fail the
+# merge loudly at the forge, not silently squash history) ---
 cat > "$GH_MM_STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 exit 1
@@ -546,7 +548,7 @@ STUB
 chmod +x "$GH_MM_STUB_DIR/gh"
 
 gh_mm_result=$(PATH="$GH_MM_STUB_DIR:$PATH" forge_detect_merge_method "owner/repo" "$GH_MM_STUB_DIR/gh")
-assert_eq "squash" "$gh_mm_result" "forge_detect_merge_method (GitHub) fails open to 'squash' on a probe failure"
+assert_eq "merge" "$gh_mm_result" "forge_detect_merge_method (GitHub) fails open to 'merge' on a probe failure (#9105)"
 
 rm -rf "$GH_MM_STUB_DIR"
 
@@ -577,9 +579,9 @@ fi
 : > "$GH_MERGE_ARGS_FILE"
 GH_MERGE_ARGS_FILE="$GH_MERGE_ARGS_FILE" PATH="$GH_MERGE_STUB_DIR:$PATH" \
   forge_merge_pr "owner/repo" "42" >/dev/null
-if grep -q -- "-f merge_method=squash" "$GH_MERGE_ARGS_FILE"; then
+if grep -q -- "-f merge_method=merge" "$GH_MERGE_ARGS_FILE"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_merge_pr (GitHub) still defaults to squash when no method is supplied (backward compatible)"
+    echo -e "  ${GREEN}PASS${NC}: forge_merge_pr (GitHub) defaults to merge when no method is supplied (#9105: merge commits are the default)"
 else
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: forge_merge_pr (GitHub) default-method behavior regressed (argv: $(cat "$GH_MERGE_ARGS_FILE"))"

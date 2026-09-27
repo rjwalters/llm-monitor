@@ -249,7 +249,11 @@ _wait_body="$(awk '
     f && $0 == "}" { exit }
 ' "$MERGE_PR_SRC")"
 assert_contains "$_wait_body" "Timed out after" \
-    "the delegated wait still error()s out on the LOOM_AUTO_MERGE_TIMEOUT ceiling"
+    "the delegated wait still stops short of the merge on the LOOM_AUTO_MERGE_TIMEOUT ceiling"
+# #8896: that stop is exit 5 (re-queue), not error()'s exit 1 — still terminal
+# for this run, so #8048's "no child stranded behind a merged parent" half holds.
+assert_contains "$_wait_body" "exit 5" \
+    "the timeout ceiling exits 5 (distinguished re-queue), not the generic failure exit 1 (#8896)"
 assert_contains "$_wait_body" "LOOM_AUTO_MERGE_POLL_INTERVAL" \
     "the delegated wait is a bounded poll, not an unbounded block"
 

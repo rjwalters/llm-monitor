@@ -1955,7 +1955,7 @@ by `candidate_cmp`, with what the tick did with it:
 
 - **running**: `dispatched`, `in_flight`
 - **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
-  `deferred_saturation`, `deferred_out_of_slice`
+  `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap`
 - **blocked** (held by something specific to the issue or repo): `parked` (with
   the label), `open_pr` (with the PR number), `dispatch_backoff`,
   `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
@@ -2670,6 +2670,24 @@ Log line on action: `claim_reconciliation: cleared stale loom:pr from PR #N in
 <root> (verdict recorded for <old>, head is now <new>) — re-queued as
 loom:review-requested (#5686)`.
 
+#### Base conflicts on review-queue PRs (`loom:merge-conflict`, #8922)
+
+The per-tree companions above were only ever *stripped* here, never applied: a
+`loom:review-requested` PR whose **base** moved into a conflict carried no
+signal, so a Judge could claim a tree that cannot land. `claim_reconciliation::
+review_conflict::reconcile_review_conflicts` runs right after
+`reconcile_pr_verdicts` on the same tick and reads GitHub's `mergeable` for
+open `loom:review-requested` and `loom:merge-conflict` PRs.
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_REVIEW_CONFLICT_RECONCILE` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_STALE_CLAIM_RECONCILE`. Defaults **ON**. |
+| `CONFLICTING` + `loom:review-requested` | Comment, then Judge's own DIRTY transition: `loom:review-requested` → `loom:changes-requested` + `loom:merge-conflict` (routes to Doctor; Judge's review-requested find-work query no longer sees it). The comment carries `<!-- loom:base-conflict flagged -->` **and** a `verdict=changes-requested` verdict-sha marker for the head, so the stale-verdict pass reads it `Fresh` and re-queues it itself once a rebase moves the head. |
+| `MERGEABLE` + `loom:merge-conflict` (no head move) | Returned to `loom:review-requested` — **only** if the newest state-changing comment is this pass's flag. A Judge's own DIRTY fallback or any later verdict is never undone here. |
+| `mergeable=UNKNOWN` | No information (GitHub computes it lazily) — no label change in either direction; re-read next tick. |
+| `loom:blocked` / `loom:operator` / `loom:operator-only` | Never touched. |
+| `loom:reviewing` / `loom:treating` | Left to the agent in flight. |
+
 ### Startup capacity seed: adopting live survivors (#6262)
 
 The passes above answer "is this *dead* claim reclaimable?". The mirror-image
@@ -2750,8 +2768,9 @@ implemented via `SweepRegistry::children_of` + `block_children_of`. Auto-detach
 (rebasing an orphaned child onto the default branch) is **out of scope for v1**.
 
 **Reconciliation is triggered automatically on parent merge (v2 item 1,
-#3747).** Because the repo squash-merges, after the parent squash-merges the
-child branch still carries the parent's pre-squash commits. `merge-pr.sh` now
+#3747).** After the parent merges to the default branch (as a merge commit,
+#9105), the child branch still carries the parent's original commits in its
+history. `merge-pr.sh` now
 fires reconciliation automatically at its post-merge choke point (alongside the
 partial-increment label reset, before branch deletion): it discovers open child
 PRs via a **live forge query** (`gh pr list --base feature/issue-<parent>` — not
@@ -2984,15 +3003,16 @@ dynamic_cap = min(disk headroom, ram headroom, configured maxConcurrent)
 ```
 
 from live inputs, so disk/RAM/backlog changes are honored without a daemon
-restart. **`configured maxConcurrent` is the one term in that `min(...)` this
-does *not* apply to (#6203):** `autonomous.workFinder.maxConcurrent` /
-`LOOM_WORK_FINDER_MAX_CONCURRENT` is resolved once at daemon bring-up and
-threaded into the loop as a frozen value — only the `disk headroom` / `ram
-headroom` terms around it are re-read live each tick. Editing the config key
-takes effect only after a daemon restart; see the `autonomous.workFinder.maxConcurrent`
-row in the config reference table (below, under "Config surface") for the
-full mechanism and the startup log line that names the resolved value and its
-source (env / config / default).
+restart. Since #9060 that includes **`configured maxConcurrent`**: the loop
+re-reads `autonomous.workFinder.maxConcurrent` from the primary workspace's
+effective config every tick, so an edit (committed `.loom/config.json`, or
+host-local `.loom-local/local.json`) takes effect on the next tick with no
+restart and no effect on in-flight sweeps. **The `LOOM_WORK_FINDER_MAX_CONCURRENT`
+env override is the exception**: it lives in the daemon's process environment,
+fixed at launch, so while it is set it shadows config until a restart (the
+daemon logs `maxConcurrent=N is IGNORED` when a config edit is shadowed). See
+the `autonomous.workFinder.maxConcurrent` row in the config reference table
+(below, under "Config surface").
 
 > **This cap bounds SWEEP dispatch only (#6102).** Role-runner agents
 > (Curator / Judge / Doctor / Champion / Guide / …) are spawned by the role
@@ -3035,6 +3055,57 @@ Retired as cap inputs (informational-only now — see `capacity::token_axis_limi
 | **healthy-token count** (retired from the cap, #5270) | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344) | drives spawn-time account **selection** (prefer fresher/healthier accounts, skip exhausted/blocked ones, #3902) and is reported on `status`/`calibrate` for observability — no longer bounds `dynamic_cap` |
 
 **Per-token concurrency** (`LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, #3947) was retired from the cap by #5270 and then removed entirely by #5743 — it fed only a disclaimed `healthy × per-token` status/calibrate figure with no admission effect, which caused mis-diagnosis on the fleet more than once. The knob, its env var, and the status line are gone; a config file that still sets `autonomous.perTokenConcurrency` parses fine (unknown keys are ignored, not an error) but the key does nothing.
+
+#### Per-repo dispatch cap + track affinity (#9090)
+
+`min(disk, ram, maxConcurrent)` is **one global budget**, filled in one
+globally-sorted order ([per-workspace priority tiers](#per-workspace-priority-tiers-3946)),
+so nothing stops the whole budget landing in a single repo: N sweeps in one repo
+rebase against each other's merges while sibling repos sit idle behind them.
+`autonomous.workFinder.maxConcurrentPerRepo` bounds one repo's share of it.
+
+| | |
+|---|---|
+| Config | `autonomous.workFinder.maxConcurrentPerRepo` |
+| Env | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` |
+| Default | **absent = uncapped** — opt-in, so an upgrade changes nothing |
+| Precedence | env > config > uncapped, **re-read every tick** (hot-applies, on the same #9060 path as `maxConcurrent`) |
+| Zero | treated as *absent*, never as a cap of `0` (which would deadlock every repo) |
+
+Two mechanisms, one knob (setting it enables both):
+
+1. **The cap is an admission bound.** A candidate whose own repo already holds
+   `maxConcurrentPerRepo` slots is **deferred** — counted as
+   `TickReport::deferred_repo_cap`, shown as the `deferred_repo_cap` queue
+   disposition and the `repo_cap` dispatch-decision reason — and the tick
+   continues to the next candidate in order, which by construction is another
+   repo's work. Deferral is never a drop: the issue stays ready and is
+   re-evaluated next tick. The per-repo counter is seeded from each dispatcher's
+   own occupancy — the same per-repo numbers the global seed already sums — so
+   it costs no extra forge reads, and a repo that is *already* at its cap admits
+   nothing new this tick.
+2. **Track affinity is an ordering preference.** A repo that already has a live
+   sweep sorts ahead of a cold repo (a *stable* partition of the already-sorted
+   list, so `candidate_cmp` is untouched and still decides order within each
+   group), so a repo's own backlog drains in sequence instead of
+   one-issue-per-repo round-robin. Affinity is strictly **subordinate** to the
+   cap: it decides order, the cap decides admission. A floated hot repo still
+   cannot exceed its cap.
+
+**Work conservation is structural.** A cap deferral consumes no slot and the
+tick moves straight on, so the slot is available to another repo — including the
+cold, lower-priority repo affinity had floated to the back — *in the same tick*.
+The one case where a free global slot is deliberately left unused is when every
+remaining candidate's repo is at its own cap; that is the cap doing its job, the
+same shape as `occupancy >= maxConcurrent` idling a tick.
+
+**Cross-repo interleaving while a repo waits on CI needs no mechanism** and has
+none: the #4123 open-PR dispatch guard already makes an
+issue whose linked PR is in flight a non-candidate (`open_pr`), so the tick's
+next dispatch goes to another repo, and re-engagement when the PR merges is
+automatic. It composes with [repo sharding (#6243)](dispatcher-repo-sharding.md)
+in a fixed order: the sharding slice partition runs first, affinity reorders
+within its result, and the cap gates admission last.
 
 #### Why there is no CPU term in admission (#4512)
 
@@ -3342,7 +3413,7 @@ concurrent), admitted entirely outside `min(disk, ram, maxConcurrent)`.
 | Config | `autonomous.roleRunner.maxConcurrent` |
 | Env | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` |
 | Default | the count of interval-cadence default roles (`role_runner::default_max_concurrent`) — **7** today |
-| Precedence | env > config > default, re-read every tick (a config edit hot-applies, unlike `maxConcurrent`) |
+| Precedence | env > config > default, re-read every tick (a config edit hot-applies, as `workFinder.maxConcurrent` does since #9060) |
 | Scope | **process-wide across every managed workspace**, because the resource it protects (host CPU/RAM) is shared by all of them |
 
 Design notes:
@@ -3624,11 +3695,11 @@ therefore ramps up over several ticks instead of bursting in one — each
 subsequent tick re-samples CPU/disk/token headroom fresh, so a ramp that turns
 out to be too aggressive self-corrects within one interval (default 60s)
 rather than in one uncontrolled burst. Resolved with the standard precedence
-**env > config > default**, single-root, at daemon startup — the same
-startup-capture pattern as `maxConcurrent`: the ramp
-cap's whole purpose is to smooth admission *within* the live per-tick
-re-computation of `max_concurrent`, so the knob itself does not need to be
-live; retuning it takes effect on the next daemon restart.
+**env > config > default**, single-root, at daemon startup — a
+startup-capture pattern `maxConcurrent` no longer shares (it hot-applies
+since #9060). The ramp cap's whole purpose is to smooth admission *within*
+the live per-tick re-computation of `max_concurrent`, so the knob itself does
+not need to be live; retuning it takes effect on the next daemon restart.
 
 #### `dispatch_sweep` headroom advisory (#4234)
 
@@ -4126,6 +4197,15 @@ concurrency ceiling 5" and share it with the team:
       "minAgeHours": 24,
       "archiveDir": "~/.loom/transcript-archives",
       "sinks": ["local"]
+    },
+    "ciTelemetry": {
+      "enabled": true,
+      "org": "2amlogic",
+      "intervalSecs": 120,
+      "excludedRepos": [],
+      "logCaptureEnabled": false,
+      "logCaptureMaxBytes": 5242880,
+      "logCaptureExcludedRepos": []
     }
   }
 }
@@ -4156,8 +4236,9 @@ knobs not yet audited here.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Restart required** — `resolve_max_concurrent_with_config` runs once during bring-up and the resulting `configured_max` is threaded into the loop as a frozen value; the per-tick `dynamic_cap` recomputes only its `disk`/`ram` headroom terms around that fixed operator ceiling, so retuning this key in config alone changes nothing until the daemon restarts (#5963). The `work_finder: enabled (multi-workspace, …)` startup log line names the resolved value and which layer supplied it — `source=env`/`config`/`default` (#6203) — so an operator can confirm a config edit will actually take effect on the next restart without waiting for a tick. See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
-| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup, the same startup-capture pattern as `maxConcurrent`. **Restart required** to pick up a change (#5963) |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
+| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
+| `autonomous.workFinder.maxConcurrentPerRepo` | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` | *(absent = uncapped)* | How many of the shared `maxConcurrent` budget's slots ONE repo may hold (#9090). **Absent is uncapped, not a number**: this is opt-in, so an upgrade throttles nothing. Setting it also turns on **track affinity** (a repo with a live sweep sorts ahead of a cold repo — ordering only, always subordinate to the cap). A candidate whose repo is at the cap is *deferred*, never dropped (`deferred_repo_cap` / the `repo_cap` decision reason), and the slot goes to another repo's candidate in the same tick. Zero/invalid → absent (a literal cap of `0` would deadlock every repo). A value above `maxConcurrent` is harmless. **Hot-applies (#9090)** — re-read every multi-workspace tick on the same path as `maxConcurrent`, transition logged once. See [Per-repo dispatch cap + track affinity](#per-repo-dispatch-cap--track-affinity-9090) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
@@ -4249,6 +4330,14 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.archiveDir` | `LOOM_TRANSCRIPT_ARCHIVE_DIR` | `~/.loom/transcript-archives` | Where the scheduled pass writes its `.tar.zst` + `.manifest.json` pairs (same default as the CLI's `--archive-dir`). **Restart required** |
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
+| `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
+| `autonomous.ciTelemetry.enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` | Periodic GitHub Actions run/job capture (#8824, phase 2 #8825). Read-only observer: it can never change a dispatch, claim, or merge decision. **Restart required** — `spawn_task` resolves the whole block once, before the poller task is spawned; it is never re-read inside the poll loop. See [`ci-observability.md`](ci-observability.md) |
+| `autonomous.ciTelemetry`.`org` | `LOOM_CI_TELEMETRY_ORG` | `2amlogic` | The org whose repos are auto-discovered and polled. Empty → default. **Restart required** — same one-time `spawn_task` resolution as `enabled` |
+| `autonomous.ciTelemetry.intervalSecs` | `LOOM_CI_TELEMETRY_INTERVAL_SECS` | `120` | Poll cadence. Zero/invalid → default. **Restart required** — the resolved `Duration` is baked into the `tokio::time::interval` ticker at spawn time |
+| `autonomous.ciTelemetry.excludedRepos` | *(config only)* | `[]` | **Log-capture-only** exclusions (phase 2, #8825); each entry needs `repo` **and** a non-empty `reason` — a refused entry logs a `warn!` naming why and excludes nothing. Run/job records and duration metrics are never excludable (#8827's standing policy). **Restart required** — read once by `spawn_task` |
+| `autonomous.ciTelemetry.logCaptureEnabled` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED` | `false` | Phase 2 (#8825) gate. **Restart required** — resolved once by `spawn_task` before the poll loop starts |
+| `autonomous.ciTelemetry.logCaptureMaxBytes` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES` | `5242880` (5 MiB) | Per-job cap on captured log text. Zero/invalid → default. **Restart required** |
+| `autonomous.ciTelemetry.logCaptureExcludedRepos` | *(config only)* | `[]` | Repos excluded from **log capture only** — their `ci.run`/`ci.job` records and duration metrics are still captured unconditionally, same admission rule (`repo` + non-empty `reason`) as `excludedRepos`. Distinct key from `excludedRepos` deliberately: excluding a repo there would also drop its metrics, which the ci-observability policy forbids. **Restart required** |
 
 ### Idle exit for remote hosts (#4467)
 
@@ -5517,19 +5606,103 @@ No `fleet.captain` declared at all leaves today's behavior fully unchanged —
 the config parse degrades gracefully (`None`) on the absent key, same as every
 other soft-fail read in `loom-daemon/src/config_resolver.rs`.
 
-**Deliberately out of scope for #8848 itself** (tracked as follow-ups, not
-half-done here): (a) **#8901** — migrating a real first singleton job onto
-this gate, and giving shell-driven arms a durable cross-process registry so
-they appear in `armed_singleton_jobs` (until then a `fleet-captain` CLI
-invocation deliberately records nothing, since its process exits immediately;
-so the "singleton armed on a non-captain host" dashboard flag can only fire
-for in-daemon jobs); and (b) **#8902** — the lease: an alert when the
-declared captain has not reported `host.health` for N hours. Note that (b) is
-an *alert*, not failover — the captain stays assigned, never elected, because
-a singleton that runs twice is the exact duplicate-alert bug this mechanism
-exists to prevent, while one that is late is merely late. #8848
-shipped the config schema, the gate library, the `fleet-captain` CLI, the
-`host.health` fields, and the dashboard flags as the base mechanism.
+#8848 shipped the config schema, the gate library, the `fleet-captain` CLI,
+the `host.health` fields, and the dashboard flags as the base mechanism.
+**Deliberately left for #8902**: the lease — an alert when the declared
+captain has not reported `host.health` for N hours. That is an *alert*, not
+failover — the captain stays assigned, never elected, because a singleton
+that runs twice is the exact duplicate-alert bug this mechanism exists to
+prevent, while one that is late is merely late.
+
+#### First real singleton job + durable shell-arm registry (#8901)
+
+#8848 shipped the mechanism with no real consumer and no durable
+cross-process arm reporting; #8901 closed both gaps.
+
+**First real job**: [`crate::ci_telemetry`]'s daemon-integrated poller
+(`autonomous.ciTelemetry.enabled`) now re-evaluates
+`fleet_captain::arm_singleton_job("ci-telemetry-poll", …)` every tick and
+skips the cycle when refused — a genuine "forge-wide queue check" (one GitHub
+Actions org, exactly one poller) in this module's own example vocabulary.
+**Any host that enables `ciTelemetry`, single-host setups included, must now
+also declare `fleet.captain`, or the poller runs nowhere.** The original note
+here said "multi-host fleet", which was wrong: `NoCaptainDeclared` refuses on
+every host (#9014). The refusal is not silent: each refused tick is recorded
+in `.loom/state/ci-telemetry/status.json`, so `ci-telemetry status` reads
+`refused` with the reason; a no-captain refusal also appears in
+`host.health.captainless_singleton_jobs` and as a non-green `ci_telemetry`
+section in `loom-daemon health`. See
+`defaults/docs/ci-observability.md`'s "Multiple hosts" note for the full
+migration rationale (this replaced an earlier "runs on every host, dedup by
+stable record identity" posture — that dedup stays as a second line of
+defense, not the primary mechanism).
+
+**Durable shell-arm registry**: a `loom-daemon fleet-captain <job>`
+invocation is its own short-lived process, so it cannot use the
+process-lifetime registry `arm_singleton_job` maintains for in-daemon jobs —
+recording there would be written and lost in the same breath (`cli/fleet_captain_cmd.rs`'s
+`evaluating_does_not_touch_the_armed_registry` test still pins that `evaluate()`,
+the pure gate check, never touches either registry). Instead, `FleetCaptainArgs::run`
+calls `fleet_captain::record_shell_arm` on the **armed** path (and, since
+#9014, `forget_shell_arm` on a **refused** one, so a captain handoff clears
+the old captain's record at its next check instead of leaving a false
+"armed on a non-captain host" flag for up to the TTL), writing
+`<root>/.loom/state/fleet-captain/armed.json` (never git-tracked — same
+per-host-runtime-state class as `.loom/state/ci-telemetry/`): job name →
+`last_armed_at`. Updates to that file hold an `flock` on the sibling
+`armed.lock` (#9014), so concurrent checks on one host cannot drop an entry. `sample_host_health` merges this file (via
+`fleet_captain::armed_singleton_job_names_for_host`) with the in-process
+registry into one `armed_singleton_jobs` list, so a shell-driven arm now
+reaches `host.health` — and the dashboard's "singleton armed on a
+non-captain host" flag (which only ever reads that field) fires for a
+shell-driven arm exactly the same way it already did for an in-daemon one,
+with no dashboard code change needed.
+
+**Staleness policy — chosen deliberately, not guessed**: a durable arm record
+left forever would go stale the moment its wrapper is uninstalled or the host
+is retired, permanently pinning a "singleton armed on a non-captain host"
+false alarm on every peer host — strictly worse than the honest empty list
+this registry replaces. Three options were on the table (a per-job declared
+cadence, a fixed conservative TTL, an explicit disarm-on-teardown verb); the
+chosen answer is **a fixed, configurable TTL as the safety net, with an
+explicit disarm verb layered on top as an optional precision option**:
+
+- `fleet.captainArmTtlSecs` (default 21600 = 6 hours,
+  `loom_daemon::config_resolver::DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS`, env
+  override `LOOM_FLEET_CAPTAIN_ARM_TTL_SECS`) bounds how long a shell-driven
+  arm is reported after its most recent successful check-in. Every
+  successful `run()` refreshes `last_armed_at` (upsert by job name — re-arming
+  overwrites, never duplicates), so a live wrapper ticking well inside the
+  TTL never flickers stale between its own runs, and an uninstalled one ages
+  out within one TTL window with zero operator action. This alone already
+  guarantees no entry can be stuck "armed" forever, which is the property the
+  issue asked for explicitly.
+- `loom-daemon fleet-captain <job-name> --disarm` removes the durable entry
+  immediately and unconditionally (idempotent; does not evaluate the gate at
+  all) — for a well-behaved wrapper that wants to clear its own entry at
+  teardown rather than wait out the TTL. Purely additive precision: a wrapper
+  that never calls it is still bounded by the TTL above.
+- The rejected option — a per-job declared cadence — was more precise in
+  principle but requires a cadence registry that does not exist today, and a
+  wrapper's real timer definition already lives outside this repo
+  (systemd/launchd/cron); duplicating it here would be a second source of
+  truth free to drift from the first. Left as a possible future refinement,
+  not attempted here.
+
+**Config example**:
+
+```json
+{
+  "fleet": {
+    "captain": "loom-worker-1",
+    "captainArmTtlSecs": 21600
+  }
+}
+```
+
+Full module-level rationale (including why `evaluate()` stays pure while
+`run()` writes): `loom-daemon/src/fleet_captain.rs`'s "Two arm registries" /
+"Staleness policy" doc sections.
 
 ### Role-runner host roster (#6704, phases A and B)
 
@@ -6452,6 +6625,80 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 | `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
 
 See `loom-daemon/src/scratch_reclaim.rs`.
+
+#### Guarded native-harness launch state reclaim (#8650, dedup + path fix #8693)
+
+**What was leaking.** Every guarded native harness launch (pi / opencode /
+kimi) gets a fresh UUID-named state directory under
+`~/.local/state/loom/native-tools/<workspace-hash>/<launch-uuid>` (or under
+`$LOOM_NATIVE_TOOLS_DIR`), and nothing removes one on its own: `State` has no
+`Drop`, and the launch chain `exec()`s all the way into the harness binary — no
+parent process survives to clean up after a session. That directory's reclaim
+is `native_tools::provision::reap`'s job (#8663) — pid-liveness-aware, and
+already running at the start of the next launch for the same workspace, plus
+`loom-daemon clean`. This pass adds the missing periodic case: an idle
+workspace that stops launching new sessions never triggers either of those, so
+`worktreeReaper`'s 15-minute host tick also calls `reap::reap_base` directly.
+**This tick is the only extra logic for that directory shape** — an earlier
+revision of this pass reimplemented its own age-only sweep of the same
+directories, which raced `reap`'s liveness-aware one and could delete a live,
+idle session's state that `reap` deliberately keeps (#8693 review). One
+directory shape, one reaper.
+
+On top of that, a `bun --compile` harness (OpenCode) extracts its ~5.5 MB
+embedded native addon into the OS temp directory on every launch under a fresh
+`.<hash>-0000000N.{so,node}` name. One worker accumulated **7.6 GB across
+1,382 files in 40 hours** of scheduled role-runner ticks this way, contributing
+to a live ENOSPC outage. `State::configure` pins `TMPDIR` so the extract lands
+somewhere attributable instead — but **not** inside the launch's own state
+directory. `<state-base>/<64-hex-sha256>/<uuid>/tmp` runs to roughly 148 bytes
+on a typical host, past the 108-byte (Linux) / 104-byte (macOS)
+`sockaddr_un.sun_path` limit once a socket file name is appended — which broke
+anything the harness ran that bound a Unix socket under the inherited `TMPDIR`
+(`cargo test`, Python multiprocessing, Node IPC; #8693 review). `TMPDIR` is
+pinned instead at a fixed short root, `pinned_tmp_base()` (`/tmp/loom-nt` on
+Unix) joined with the launch's own uuid — constant-length regardless of
+`$HOME`.
+
+**Reclaiming the pinned `TMPDIR` companion needs no age or liveness policy of
+its own.** A pinned-`TMPDIR` entry can only exist for a launch whose session
+directory was created first, so once that session directory is gone (`reap`'s
+own liveness check having already decided so), the companion is unconditionally
+orphaned and is removed on the next tick — no separate `maxAgeHours` gate, and
+so no "`maxAgeHours: 0` deletes a live session's temp files" footgun to guard
+against either.
+
+**Cadence.** A host-level sibling pass on the 15-minute `worktree_reaper` tick,
+alongside the docker-image and tmpfs passes, with a **host-wide** (not
+per-repo) 30-minute cooldown — both directories this pass reclaims live outside
+any one repo, so a multi-repo host must not re-walk them once per repo.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "nativeStateReclaim": {
+        "enabled": true,
+        "minIntervalSecs": 1800
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_NATIVE_STATE_RECLAIM` | `autonomous.worktreeReaper.nativeStateReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_NATIVE_STATE_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.nativeStateReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+
+`LOOM_NATIVE_TOOLS_DIR` (also honored by `native_tools::provision::state`)
+relocates the session-state base this pass sweeps with `reap::reap_base`; a
+host that sets it only in a launch's own environment — not the daemon's — gets
+the default base swept here instead, since the reclaim tick runs in the
+daemon's process. `LOOM_NATIVE_PINNED_TMPDIR_BASE` is a test-only override for
+the pinned-`TMPDIR` root; production hosts use the fixed default.
+
+See `loom-daemon/src/native_state_reclaim.rs`.
 
 #### `pr-<N>` worktrees are reaped too (#5939)
 
@@ -8960,6 +9207,59 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   **then-exit teardown**, an **untargeted** operator `restart --drain`, and any
   tick whose resolved artifact is unresolved, already installed, or older
   (#8513's stale-repo shape).
+- **…and a roll whose wait condition is unsatisfiable is abandoned rather than
+  re-armed forever (#8998).** #6007's budget bounds **one drain**. It does not
+  bound the *sequence* — arm → refuse → retain → abandon → arm again — and each
+  new release restarted the budget from zero (a #8514 supersede restarted it
+  mid-pause, too). On 2026-09-25 two fleet dispatchers spent **21 hours** in that
+  cycle (72 and 65 consecutive "a drain-and-restart roll is already armed …
+  skipping this tick" ticks) and never once rolled; the blocker was a
+  genuinely-working 9h32m analog-simulation sweep (`sky130-sar-adc#431`), so
+  "wait for in-flight to reach zero" was structurally unachievable on that host.
+  Because `draining: true` suppresses **role spawns** as well as sweep dispatch,
+  one host produced zero role ticks for 4h20m.
+  `auto_update` now counts drain deadline expiries **across roll lifetimes** and
+  tracks the lowest in-flight count seen at any of them. Once
+  `rollStallDeadlines` (default 3) deadlines have expired with that floor never
+  improving, the roll is **abandoned** — through the same `--abort-drain`
+  primitive a supersede uses, so dispatch (and role spawns) resume and #6007's
+  bookkeeping is fully reset — and **no new roll is armed** until in-flight is
+  observed at zero. **Be precise about what clears it**, because "self-clearing"
+  is easy to over-read: the declaration is dropped only by an auto-update tick
+  that *samples* `in_flight == 0`, i.e. on the `autoUpdate.intervalSecs` cadence
+  (default 900s) and **with dispatch running**. That is strictly harder to hit
+  than the drain's own quiescence watch, which is continuous *and* observes a
+  paused dispatcher where in-flight can only fall: once dispatch resumes, a
+  cap-12 dispatcher refills the in-flight set as soon as the long sweep ends, so
+  a 900s sample can miss every lull and the host can stay un-updated
+  indefinitely. There is no time-based retry — the trade this makes is
+  *unbounded paused dispatch* for *unbounded staleness on a permanently-busy
+  host*, which is the better of the two (dispatch and role spawns come back, and
+  the reason is named), but it is not "it fixes itself shortly". A bounded
+  cooldown retry is tracked separately in #9010. The finding is logged at WARN,
+  published as `auto_update_note`, recorded as `drain_note`, and emitted on the
+  bus as `daemon.drain.roll_unsatisfiable`; it names the deadline count, the
+  in-flight floor, how long the **stalled episode** has run (which spans ticks
+  with nothing armed — it is not the live roll's armed duration), and the three
+  operator actions (`loom-daemon list` to find the sweep, `loom-daemon cancel
+  --sweep <id>`, or `restart --drain --force-after-timeout` to force through).
+  **The fail-safe is untouched: no sweep is ever cancelled**, and the pre-update
+  binary keeps running — the change trades a silent indefinite livelock for one
+  loud, actionable state, not for a cancelled sweep. Deliberately narrow in the
+  same way #8514 is: an episode only advances for a **relaunch** roll this daemon
+  armed and **labelled with an artifact target**, so a `fleet drain` teardown and
+  an operator's untargeted `restart --drain` are never abandoned by the loop.
+  That holds **while a declaration is standing, too** — the ownership test runs
+  ahead of the sticky flag in `RollStallTracker::observe`, and the abandonment in
+  `run_tick` re-tests it before calling `abort()`, so a drain armed *after* the
+  declaration latches is left alone rather than cancelled on the next tick. Both
+  halves are needed: `fleet drain` detects a remote refusal by observing
+  `drain.draining == false`, so aborting an operator's teardown would leave the
+  host running and be read as a refusal nobody is told about. What this does
+  **not** do is let such a host update:
+  #8998's other two directions (age-excluding a long sweep from the drain
+  condition; dropping the full-drain requirement for artifact rolls) are the
+  work that would, and both change safety-relevant semantics.
 - **Worst-case pause, per path — and why the two paths keep sharing one budget
   (#8514).** The budget constants (`DRAIN_PENDING_BUDGET_MULTIPLIER` = 4,
   `MAX_DRAIN_PENDING_BUDGET_SECS` = 4h, `MAX_DRAIN_RETRY_WINDOW_SECS` = 2h, all in
@@ -9007,6 +9307,20 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   `roll PENDING since T — dispatch paused Dm of a 2h0m budget, N in flight, …`.
   That is what makes a host idling behind a roll visible from one poll — and, by
   diffing `paused_secs` across polls, whether the pause is still advancing.
+- **Cumulative paused time per host per day (#8652).** `status --json`'s
+  `drain.paused_by_day` is `{ "YYYY-MM-DD": secs }` — dispatch-paused seconds per
+  **UTC** day, including the elapsed portion of a pause in progress; the text
+  status prints `Roll pauses (UTC): today …, last 7d …, last N recorded day(s) …`
+  when it is non-empty. It is read from a small ledger persisted at
+  `~/.loom/drain-paused-ledger.json` (or `$LOOM_AUTO_UPDATE_STATE_DIR`, next to
+  the artifact-roll record) — not an in-memory counter or the event bus, both of
+  which the successful roll's own restart would wipe. A pause is split across
+  UTC midnight, closed *before* the supervisor exits for the relaunch, and one
+  left open by a killed daemon is reconciled on the next start (capped at the
+  4h budget). It counts every drain-flag pause (a `fleet drain` teardown
+  included). 30 days are retained, pruned on write. Ledger I/O is
+  observational only: a write failure is logged, a corrupt file starts a fresh
+  ledger with a WARN, and the #6007 fail-safe never reads it.
 - **Supervised stop/start vs. a full wait-for-zero drain (#5340).** These are two
   different tools for two different situations, not a strict "drain is always
   safer" hierarchy:
@@ -9453,10 +9767,11 @@ below.
 
 **Opt-in, default OFF** (it has side effects on the running process). Enable via
 `autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence, settle
-window, and stampede-gate deadline with `intervalSecs` (default 900) /
-`settleSecs` (default 600) / `deferDeadlineSecs` (default 21600). All four knobs
-resolve **env > config > default** through `config_resolver`, so the
-`.loom-project/` tier is honored like every other `autonomous.*` block.
+window, stampede-gate deadline, and unsatisfiable-drain threshold with
+`intervalSecs` (default 900) / `settleSecs` (default 600) / `deferDeadlineSecs`
+(default 21600) / `rollStallDeadlines` (default 3). All five knobs resolve
+**env > config > default** through `config_resolver`, so the `.loom-project/`
+tier is honored like every other `autonomous.*` block.
 
 **Exactly one loop per daemon process** — not a `spawn_multi_*` per-workspace
 fan-out. Its subject is the daemon process itself (one binary, one source
@@ -9767,6 +10082,28 @@ The exporter only ever originates outbound HTTP POSTs; it never parses a
 response body for anything beyond a batch-accepted/rejected status, and
 nothing received over this channel ever mutates daemon state — steering
 (dispatch/cancel/pause) stays with MCP, per the epic's explicit scope.
+
+### Export liveness is first-hop only (#9015)
+
+`loom-daemon status`'s `Observability:` line, `.observability_export` /
+`.observability_exports.<name>` in `status --json`, and the (anomaly-only)
+`observability` section of `loom-daemon health` all measure **one hop**: did the
+configured `observability.endpoint` acknowledge the batch this daemon POSTed?
+Nothing past that endpoint is observable from here, so `state: "healthy"` must
+never be read as "the data is in the backend". Every record therefore carries
+`scope: "first_hop"`, the human line reads `OK (first hop only)`, and
+`endpoint_loopback: true` marks an endpoint that resolves to this machine
+(`127.0.0.0/8`, `::1`, `localhost`) — i.e. a local edge collector that forwards
+onward, where the acked hop proves least of all. Both fields are derived from
+`endpoint`, never configured, and the renderers re-derive them so a payload from
+a pre-#9015 daemon still reports the caveat.
+
+**With an edge collector, pair this with an external end-to-end check** — a
+backend read-back canary, or the collector's own
+`otelcol_exporter_send_failed_*` counters on its `:8888` telemetry endpoint. A
+daemon reported `healthy` for 30h+ while a local collector accepted every POST
+and dropped it; the full incident, the state table and the recommended checks
+are in [`observability.md` §3b](observability.md#3b-confirming-telemetry-is-actually-flowing).
 
 ## Fleet dashboard (`loom-daemon serve`)
 

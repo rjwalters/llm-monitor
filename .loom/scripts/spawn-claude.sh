@@ -551,6 +551,18 @@ if [[ -f "$_sleep_inhibit_config_lib" ]]; then
     fi
 fi
 
+# --- Per-worktree cargo target dir (issue #8458) ---
+#
+# Nothing to do here. The per-worktree `CARGO_TARGET_DIR` a claim-owning sweep
+# runs under is injected by `loom-daemon spawn-worker` itself
+# (`worker_spawn::run`, beside the `CARGO_INCREMENTAL=0` it already sets for the
+# same #8453 reasons), so it is already in this process's environment — and in
+# the environment of every `cargo test` an agent runs as a subprocess of it,
+# which is where #8453's false verdicts came from. That seam is the one every
+# dispatch surface converges on, so one Rust site covers all of them and this
+# script needs no wiring at all; the containerized block below re-exports
+# whatever it finds across the docker boundary, unchanged.
+
 # --- Containerized dispatch mode (issue #7429, epic #6896 Phase 3) ---
 #
 # Config-selectable, initially OFF: `.loom/config.json` ->

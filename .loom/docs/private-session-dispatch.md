@@ -8,10 +8,20 @@ supervised `session-exec` chain. Preparation runs outside scheduler/registry
 locks and before issue claims. A busy account or unavailable session is reported
 without launching a model or keeping a temporary issue reservation.
 
-This transport does not promote Codex capabilities. The shipped manifest still
-rejects mutable lifecycle roles pending #8787 and the live canary in #4496.
-Read-only roles admitted by the current manifest can use private sessions.
-Claude and legacy host-mounted Codex sessions retain their existing transport.
+This transport does not promote Codex capabilities, and the shipped manifest
+still declares `worktreeIsolation: "partial"` / `hooks: "partial"`. Since #8787,
+a **verified** private clone can nonetheless satisfy the one requirement
+`worktreeIsolation` for a single Builder / Doctor / sweep-lifecycle launch, on
+measured evidence rather than on configuration — see
+[guardrail-parity-codex.md](guardrail-parity-codex.md) § "Verified private-clone
+containment" for the proof, the obligation-to-mechanism table, the supported
+image/CLI/protocol combinations, the remaining limitations and rollback. #4496
+remains the live production go/no-go and no fleet default changes.
+Read-only roles admitted by the current manifest can use private sessions
+exactly as before. Claude and legacy host-mounted Codex sessions retain their
+existing transport **and their existing admission**: containment is asked about
+only when a rejection's sole unmet requirement is `worktreeIsolation` on Codex,
+and it is proven per launch, never cached.
 Private selections reject `LOOM_CODEX_SESSION_EXEC=0` and
 `LOOM_SPAWN_NO_EXPORT` before preparation or claim. Direct adapter entry applies
 the same guard before any Codex probe, including inherited leases and symlinked
@@ -52,6 +62,43 @@ cloned project from reintroducing a host-control MCP endpoint. The audited confi
 layers follow the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-basic)
 and [advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
+## Mutable-role admission (issue #8787)
+
+Admission happens **before** account selection on every path, so a launch that
+containment could satisfy is admitted in two steps, inside one decision:
+
+1. Static admission runs unchanged. Only a rejection whose runtime is Codex and
+   whose **sole** unmet capability is `worktreeIsolation` is eligible to ask.
+2. A `containment::Preparer` then prepares exactly one private selection —
+   the same `dispatch::Selection` the launch will use, holding the same
+   exclusive account lease; there is no second account-selection pass — and
+   re-derives the proof from it. A candidate the ordered runtime-preference walk
+   subsequently passes over releases that selection (and its lease) before the
+   walk continues, and a contained admission that reaches the launch site
+   **without** its selection is refused rather than re-prepared.
+
+An explicit operator pin still disables fall-through: containment may satisfy
+the pinned runtime's own requirement, but a refusal never reroutes the launch to
+a different runtime. The same two-step shape is applied by
+`sweep_registry::private_dispatch` (unlocked sweep preparation), the role
+runner's tick, and `worker_spawn`'s direct adapter entry, and is repeated
+independently by `private-workspace execute` inside the container before the
+model is exec'd.
+
+`spawn-codex.sh`'s mutable-role hook preflight is **relocated, not skipped**,
+for a private-clone launch: the managed registration it would check lives in the
+account profile and names an image-owned bridge path that does not exist on the
+host, so verifying it there would evaluate the wrong bridge. The audit line says
+`hooks=verified-in-private-session`, and the identical obligation — registration
+present, naming the sealed bridge, receipt pinning it, profile trusted — is
+proven in-container instead. `--dangerously-bypass-hook-trust` is passed nowhere.
+
+`loom-daemon accounts session status NAME --json` reports the containment
+provenance for the current job under `admission` (mode, satisfied requirements,
+the manifest's own native values, account name, short container and control
+identities, protocol, base revision). It is retired with the lease it belongs to
+and carries no credential, no profile path and no raw operator configuration.
+
 ## Durable state and recovery
 
 Before launch, the host writes `.loom/private-jobs/issue-N.json` (or a hashed role
@@ -81,6 +128,15 @@ production adapters/helpers and the complete Linux daemon. Its synthetic model
 and forge CLIs do not contact a model service or production account. It verifies
 admitted scheduled guide dispatch, mutable sweep refusal before claim, and an
 issue-scoped synthetic worker's branch/push/PR/checkpoint/log/cancellation path.
+Its `containment` module additionally drives #8787's admission through the
+production preference resolver and the real adapter chain: bare-host,
+unmanaged-clone, untrusted-profile and replaced-container sessions are each
+refused with their own obligation, and a verified session runs a mutable role
+whose issue-branch commit and push land while the protected remote ref, the host
+checkout, the host sibling directory and the peer account's profile and volume
+are all unchanged. The synthetic hook-trust decision there stands in for the
+operator's one-time TUI step; the real TUI, the real CLI and the real hook
+engine are measured by `docker/session/test-image.sh` §12.
 That transport fixture is not evidence of production mutable-role admission.
 The existing `session_exec_docker` suite remains the process-lifetime regression
 gate for cancellation, killed/stalled owners and missing/hung cleanup.

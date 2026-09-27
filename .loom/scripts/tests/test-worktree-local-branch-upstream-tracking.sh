@@ -37,12 +37,27 @@
 # Pattern follows test-worktree-remote-branch-tracking.sh: throwaway bare
 # origin + repo in a mktemp dir, copy worktree.sh + lib/, run, assert on
 # `git branch -vv` / `@{u}` output.
+#
+# SINCE #8195 SLICE 9 (epic #7810) this correction is `loom-daemon
+# worktree-upstream --arm local-branch`, sharing one implementation with the
+# registered-worktree fast path that #6257 had to re-implement by hand (see
+# test-worktree-existing-dir-drift-check.sh). Every assertion below is
+# unchanged from the shell implementation — that is what makes them the
+# equivalence evidence for retiring it — so the binary is pinned via
+# loom_test_require_daemon_bin and this suite FAILS rather than skips when
+# there is none. Without a binary the correction does not happen at all (a
+# correct, documented degradation: the pre-#6095 behaviour), which would leave
+# Tests 1 and 2 asserting on something nothing ran.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
+
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-upstream"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

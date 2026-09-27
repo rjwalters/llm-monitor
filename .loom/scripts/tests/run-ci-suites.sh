@@ -378,6 +378,39 @@ while IFS= read -r _suite; do
     suites+=("$_suite")
 done < <(sed -E 's/#.*$//' "$WIRED_MANIFEST" | awk 'NF { print $1 }')
 
+# LOOM_CI_SHARD=k/N (#9065): run only manifest entries whose 0-based index
+# is k-1 mod N, so N runners split the set deterministically and every suite
+# runs in exactly one of them. A malformed value is an error, never "run
+# everything" or "run nothing". No leading zeros: bash >= 4 reads `08` as a
+# bad octal literal in $(( )), which selected zero suites and exited 0.
+if [[ -n "${LOOM_CI_SHARD:-}" ]]; then
+    if ! [[ "$LOOM_CI_SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] \
+        || [[ "${BASH_REMATCH[1]}" -gt "${BASH_REMATCH[2]}" ]]; then
+        echo "::error::LOOM_CI_SHARD must be k/N with 1 <= k <= N, got '$LOOM_CI_SHARD'" >&2
+        exit 2
+    fi
+    _shard_k="${BASH_REMATCH[1]}"
+    _shard_n="${BASH_REMATCH[2]}"
+    _all=("${suites[@]}")
+    suites=()
+    for _i in "${!_all[@]}"; do
+        if [[ $(( _i % _shard_n )) -eq $(( _shard_k - 1 )) ]]; then
+            suites+=("${_all[$_i]}")
+        fi
+    done
+    printf 'Shard %s: %d of %d wired suites\n' "$LOOM_CI_SHARD" "${#suites[@]}" "${#_all[@]}"
+    # An empty shard (N larger than the manifest) would report green on
+    # nothing (ci-principles.md rule 6).
+    if [[ "${#suites[@]}" -eq 0 ]]; then
+        echo "::error::LOOM_CI_SHARD=$LOOM_CI_SHARD selects no suites; lower N" >&2
+        exit 2
+    fi
+    # Consumed here, and ONLY here: the runner's own self-tests invoke this
+    # script on fixture manifests, and an inherited shard would silently drop
+    # fixture suites they expect to run.
+    unset LOOM_CI_SHARD
+fi
+
 passed=0
 failed=0
 skipped=0
@@ -511,25 +544,39 @@ for suite in "${suites[@]}"; do
         continue
     fi
     run_suite "$suite" &
+    # Freeing a slot: `wait -n` (whichever job finishes FIRST) where bash can
+    # do it reliably, else wait on the OLDEST pid.
+    #
     # `wait -n` is bash 4.3+. Stock macOS ships 3.2, where it fails with
     # "wait: -n: invalid option" -- and this script is `set -uo pipefail`
     # WITHOUT `-e`, so it did not abort: `running` decremented anyway and the
-    # parallelism bound silently stopped bounding (#7802 Class 1).
+    # parallelism bound silently stopped bounding (#7802 Class 1). The
+    # oldest-pid fallback needs no new machinery and preserves the bound
+    # exactly on 3.2.
     #
-    # Waiting on the OLDEST pid instead of any pid needs no new machinery and
-    # preserves the bound exactly, which is the contract that matters here. A
-    # slow oldest job can hold a slot a little longer than `wait -n` would; that
-    # is a scheduling nuance, not a correctness one, and it is a far better
-    # trade than hand-rolling job-polling in shell.
-    _RUN_PIDS+=($!)
+    # It is NOT the default, though (#9065): on a 4-core runner one slow oldest
+    # suite held its slot while the other three finished and sat idle. Measured
+    # on run 36241950484: 650s of suite time took 372s of wall time, an
+    # effective parallelism of ~1.75 out of 4, on the critical path of every
+    # PR. 5.1 rather than 4.3 because earlier `wait -n` did not reliably
+    # return for a child that exited before the call; CI (ubuntu-latest) has
+    # 5.2.
     running=$((running + 1))
-    if [[ "$running" -ge "$PARALLELISM" ]]; then
-        wait "${_RUN_PIDS[0]}" 2>/dev/null || true
-        # Quoted: SC2206. Safe under `set -u` on bash 3.2 because an array
-        # SLICE of an empty/exhausted array expands to nothing rather than
-        # tripping the unbound-variable error that bare "${arr[@]}" does there.
-        _RUN_PIDS=("${_RUN_PIDS[@]:1}")
-        running=$((running - 1))
+    if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+        if [[ "$running" -ge "$PARALLELISM" ]]; then
+            wait -n 2>/dev/null || true
+            running=$((running - 1))
+        fi
+    else
+        _RUN_PIDS+=($!)
+        if [[ "$running" -ge "$PARALLELISM" ]]; then
+            wait "${_RUN_PIDS[0]}" 2>/dev/null || true
+            # Quoted: SC2206. Safe under `set -u` on bash 3.2 because an array
+            # SLICE of an empty/exhausted array expands to nothing rather than
+            # tripping the unbound-variable error that bare "${arr[@]}" does there.
+            _RUN_PIDS=("${_RUN_PIDS[@]:1}")
+            running=$((running - 1))
+        fi
     fi
 done
 wait

@@ -26,6 +26,13 @@
 #      `.gitignore` (`node_modules/`) repro from #5474, where a clean
 #      `git status --porcelain` depends entirely on the exclude entry (the
 #      .gitignore rule does not match the symlink at all).
+#   8. A pnpm workspace gets NEITHER node_modules symlink (#8944), because pnpm
+#      purges THROUGH such a link into the main workspace and `CI=true` ANDs
+#      away every confirmation it offers. Asserted the way the hazard actually
+#      lands: pnpm's own `removeContentsOfDir` is replayed against the
+#      worktree, with a positive control proving the replay has teeth, and the
+#      MAIN workspace's tree must survive it. `worktree.linkNodeModules: true`
+#      restores the old behaviour.
 #
 # Pattern follows test-worktree-sentinel.sh / test-worktree-concurrency.sh:
 # throw-away bare origin + clone in a mktemp dir, copy worktree.sh + lib/,
@@ -413,6 +420,91 @@ if [[ "$ROOT_NM_COUNT" == "1" && "$MCP_COUNT" == "1" ]]; then
 else
     fail "root node_modules/.mcp.json exclude entries duplicated (node_modules=$ROOT_NM_COUNT, mcp.json=$MCP_COUNT)"
 fi
+cleanup_repo "$REPO"
+
+# --- Test 8: a pnpm workspace is not aliased, and the main tree survives ---
+#
+# The replay below is pnpm 11.20.0's `removeContentsOfDir(dir)`: `readdir(dir)`
+# followed by a recursive delete of each entry. Through a symlink those paths
+# resolve into the MAIN workspace, which is how #8944 destroys the primary
+# clone's node_modules from inside a worktree. `find -H` follows the symlink
+# named on the command line and nothing else — exactly readdir's behaviour.
+# Replaying the shape rather than invoking pnpm keeps the suite hermetic (no
+# registry, no pnpm on PATH) while testing the property that actually matters.
+purge_modules_dir() {
+    local dir="$1"
+    [[ -e "$dir" ]] || return 0
+    find -H "$dir" -mindepth 1 -delete 2>/dev/null || true
+}
+
+echo ""
+echo "Test 8: pnpm workspace — no node_modules alias, main tree survives a purge (#8944)"
+REPO=$(setup_repo)
+(
+    cd "$REPO"
+    # A pnpm workspace by its most conclusive marker.
+    echo "lockfileVersion: '9.0'" > pnpm-lock.yaml
+    mkdir -p node_modules apps/web/node_modules apps/web/src/wasm
+    echo '{"name":"root","packageManager":"pnpm@11.20.0"}' > package.json
+    echo '{"name":"web"}' > apps/web/package.json
+    echo '{"mcpServers":{}}' > .mcp.json
+    # Canaries: what a purge through the alias would destroy.
+    echo "root dep" > node_modules/CANARY.txt
+    echo "web dep" > apps/web/node_modules/CANARY.txt
+    echo "generated" > apps/web/src/wasm/index.js
+    cat > .loom/config.json <<'JSON'
+{ "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
+JSON
+    git add apps/web/package.json package.json
+    git commit -q -m "pnpm workspace"
+    git push -q origin main
+
+    ./.loom/scripts/worktree.sh 8944 >/tmp/wt-pnpm.$$ 2>&1 || {
+        echo "worktree.sh failed (see /tmp/wt-pnpm.$$)"; cat /tmp/wt-pnpm.$$
+    }
+)
+WT="$REPO/.loom/worktrees/issue-8944"
+assert_not_symlink "$WT/node_modules" "pnpm workspace: root node_modules NOT symlinked"
+assert_not_symlink "$WT/apps/web/node_modules" "pnpm workspace: nested node_modules NOT symlinked"
+# Narrow blast radius: only the package manager's own directory is withheld.
+assert_symlink "$WT/apps/web/src/wasm" "pnpm workspace: worktree.linkPaths entry still symlinked"
+assert_symlink "$WT/.mcp.json" ".mcp.json still symlinked on a pnpm workspace"
+
+# POSITIVE CONTROL first, or the survival assertion below proves nothing: an
+# alias of the same shape worktree.sh used to create must be reached through.
+# If this ever stops destroying the canary the replay has lost its teeth and
+# the real assertion has silently become vacuous.
+ln -s "$REPO/node_modules" "$WT/decoy_modules"
+purge_modules_dir "$WT/decoy_modules"
+if [[ -f "$REPO/node_modules/CANARY.txt" ]]; then
+    fail "positive control: the purge replay did NOT delete through a node_modules alias"
+else
+    pass "positive control: the purge replay does delete through a node_modules alias"
+fi
+echo "root dep" > "$REPO/node_modules/CANARY.txt"
+
+# The acceptance criterion: replay the same purge against the paths a Builder
+# would actually run it on, and require the MAIN workspace to be intact.
+purge_modules_dir "$WT/node_modules"
+purge_modules_dir "$WT/apps/web/node_modules"
+if [[ -f "$REPO/node_modules/CANARY.txt" && -f "$REPO/apps/web/node_modules/CANARY.txt" ]]; then
+    pass "main workspace node_modules survives a pnpm-shaped purge run in the worktree"
+else
+    fail "main workspace node_modules destroyed through the worktree (root: [$(ls -A "$REPO/node_modules" 2>&1)], nested: [$(ls -A "$REPO/apps/web/node_modules" 2>&1)])"
+fi
+
+# The escape hatch is real: a repo that knows what it is doing can opt back in.
+(
+    cd "$REPO"
+    cat > .loom/config.json <<'JSON'
+{ "worktree": { "linkNodeModules": true, "linkPaths": ["apps/web/src/wasm"] } }
+JSON
+    ./.loom/scripts/worktree.sh 8945 >/tmp/wt-pnpm-optin.$$ 2>&1 || {
+        echo "worktree.sh failed (see /tmp/wt-pnpm-optin.$$)"; cat /tmp/wt-pnpm-optin.$$
+    }
+)
+assert_symlink "$REPO/.loom/worktrees/issue-8945/node_modules" \
+    "worktree.linkNodeModules=true restores the root symlink on a pnpm workspace"
 cleanup_repo "$REPO"
 
 # --- Summary ---

@@ -2,9 +2,9 @@
 # Loom Stacked-PR Reconciliation (issue #3729, stacked-PR v1)
 #
 # Turns the manual git surgery an operator performs after a stacked parent PR
-# squash-merges into one command. The operator (or merge-pr.sh's post-merge
-# pass) runs this AFTER the parent branch has squash-merged to the default
-# branch.
+# merges into one command. The operator (or merge-pr.sh's post-merge pass)
+# runs this AFTER the parent branch has merged to the default branch (as a
+# merge commit, Loom's default since #9105).
 #
 # Usage:
 #   ./.loom/scripts/reconcile-stack.sh <child-pr> <parent-branch> [options]
@@ -17,9 +17,9 @@
 #   git push --force-with-lease
 #   gh pr edit <child-pr> --base <default-branch>
 #
-# The repo squash-merges (setup-repository-settings.sh: squash only), so after
-# the parent squash-merges to the default branch as ONE commit, the child
-# branch still carries the parent's ORIGINAL pre-squash commits. A naive base
+# The repo merges with merge commits (setup-repository-settings.sh default,
+# Loom-wide since #9105), so after the parent merges to the default branch the
+# child branch still carries the parent's ORIGINAL commits. A naive base
 # retarget (child base -> default) then re-shows the parent's entire diff. The
 # `git rebase --onto` replays ONLY the child's own commits onto the default
 # branch, stripping the parent's now-squashed commits, before retargeting.

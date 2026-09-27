@@ -378,6 +378,11 @@ if [[ "$1" == "forge" && "$2" == "pr" && "$3" == "list" ]]; then
     echo "loom-daemon forge: gitea is not handled natively; falling back to the caller's shell path" >&2
     exit 3
 fi
+if [[ "$1" == "worktree-lock" && "$2" == "check-issue" ]]; then
+    # No claim lock in this fixture -- exit 0 (free), same as a real daemon
+    # with no .loom/locks/issue-<N>/owner.json (#8553).
+    exit 0
+fi
 echo "fake loom-daemon: unsupported invocation: $*" >&2
 exit 1
 EOF

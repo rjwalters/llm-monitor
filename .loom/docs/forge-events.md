@@ -27,7 +27,10 @@ loom-daemon forge_events (per host, opt-in)
         ▼
 in-process EventBus topic `forge.event`   (summary payload only)
         │
-        └── Phase 2 consumers (#8766) — none yet in Phase 1
+        └── Phase 2 early-tick consumers (#8766), each opt-in and default off
+                ├── work-finder tick    (forgeEvents.events.workFinderTick)
+                ├── queue-head wake     (forgeEvents.events.queueHeadWake)
+                └── in-flight PR watch  (forgeEvents.events.inFlightPrWatch)
 ```
 
 **The feed never replaces polling.** It is additive prompt pressure: every
@@ -49,6 +52,10 @@ the same as every other daemon subsystem.
 | `eventKeyFile` | `LOOM_FORGE_EVENTS_EVENT_KEY_FILE` | `$HOME/.loom/forge-events/key` | File holding the per-host bearer key. |
 | `pollIntervalSecs` | `LOOM_FORGE_EVENTS_POLL_INTERVAL_SECS` | `10` | Cadence when healthy. |
 | `pageSize` | `LOOM_FORGE_EVENTS_PAGE_SIZE` | `100` | Events requested per poll. |
+| `events.workFinderTick` | `LOOM_FORGE_EVENTS_WORK_FINDER_TICK` | `false` | Let a claimable-shaped page tick the work-finder loop early (§4.1). |
+| `events.queueHeadWake` | `LOOM_FORGE_EVENTS_QUEUE_HEAD_WAKE` | `false` | Let a queue-relevant page tick the claim-reconciliation pass early (§4.1). |
+| `events.inFlightPrWatch` | `LOOM_FORGE_EVENTS_IN_FLIGHT_PR_WATCH` | `false` | Let a PR-lifecycle page tick the watch monitor early (§4.1). |
+| `events.minSpacingSecs` | `LOOM_FORGE_EVENTS_WAKE_MIN_SPACING_SECS` | `30` | Minimum distance between any tick and a following **early** tick. The rate bound, shared by every consumer. |
 
 ```json
 {
@@ -57,7 +64,12 @@ the same as every other daemon subsystem.
     "endpoint": "https://events.your-operator-domain.tld",
     "hostId": "mac-studio",
     "pollIntervalSecs": 10,
-    "pageSize": 100
+    "pageSize": 100,
+    "events": {
+      "workFinderTick": false,
+      "queueHeadWake": false,
+      "inFlightPrWatch": false
+    }
   }
 }
 ```
@@ -130,10 +142,57 @@ Routing hints only: no repo, no issue or PR number, no title, no actor. A
 subscriber that wants forge state has to go ask the forge — which is ADR-0014
 invariant 1 made structural rather than merely intended.
 
-**In Phase 1 there is no subscriber.** The topic is published and nothing
-consumes it, so a host with the feed on behaves identically to one with it off
-apart from the journal it writes and the status it reports. The consumers are
-Phase 2 (#8766).
+**Publication is unconditional; subscription is not.** With every
+`forgeEvents.events.*` flag at its default (off), nothing subscribes: the topic
+is published into an empty bus and a host with the feed on behaves identically
+to one with it off, apart from the journal it writes and the status it reports.
+
+### 4.1 Early-tick consumers (`forgeEvents.events.*`, #8766)
+
+A consumer turns a qualifying prompt into an **early tick of a loop that
+already exists** — and nothing else. The loop body is untouched: it re-lists
+and re-decides through exactly the forge reads its own timer would have driven.
+No consumer reads a field of the payload into a decision, because the payload
+carries no forge state to read.
+
+| Consumer | Flag | Wakes on | Loop it ticks early |
+|---|---|---|---|
+| Work-finder tick | `events.workFinderTick` | `issues`, `issue_comment` | the multi-workspace work-finder dispatch loop — the one that lists claimable issues, re-derives the ready queue and dispatches its head |
+| Queue-head wake | `events.queueHeadWake` | `issue_comment`, `pull_request` | the periodic **claim-reconciliation** pass — a `loom:building` claim whose sweep is gone is what *holds* the queue head, and this is the loop that releases it |
+| In-flight PR watch | `events.inFlightPrWatch` | `pull_request`, `check_run`, `check_suite` | the durable **watch monitor** — the daemon's only standing "has this in-flight issue/PR reached terminal state yet" poller |
+
+#8766 named the second and third loops as if each were its own module
+(`dispatch_queue` / `merge_status`); neither exists under those names. The
+*ready queue* is re-derived inside every work-finder tick rather than by a
+separate loop, so the thing that actually gates the head moving is claim
+reconciliation; and the watch monitor is the daemon's only merge-status
+poller. Those are the loops wired.
+
+Four properties bound every consumer, and each is asserted by a test rather
+than documented on trust:
+
+- **Default off.** A disarmed consumer holds *no* bus subscription — no bridge
+  task, no receiver — so "flag off" is structurally identical to a
+  pre-Phase-2 daemon, not merely quiet.
+- **Degradation is the existing cadence.** A feed that is off, `host_mismatch`,
+  `auth_failed`, or in `backoff` publishes nothing, so the loop ticks exactly
+  as it does today. The failure mode is latency-only by construction.
+- **Bursts coalesce.** The wake is a single `Notify` permit, which saturates at
+  one: 500 pages arriving while the loop is mid-tick cost it **one** extra
+  tick, not 500.
+- **No new rate-limit envelope.** `events.minSpacingSecs` (default 30s) is the
+  minimum distance between a loop's previous tick and an early one, so the
+  early-tick path can raise a loop's forge-request rate by at most
+  `interval / minSpacingSecs` — 2x at the work finder's 60s default, using the
+  same endpoints and the same #4429 breaker as its ordinary tick.
+
+Coalescing and the spacing floor are **per loop**, not global: an armed
+work-finder and an armed queue-head consumer each owe themselves at most one
+extra tick from the same burst, and a loop whose types the page does not carry
+owes itself none.
+
+A page that qualifies for no armed consumer is simply journaled; that is the
+common case, and it is why the payload carries event-type names at all.
 
 ## 5. Reading the status
 
