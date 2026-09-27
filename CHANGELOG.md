@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Anthropic-only columns hide when unused** (#227). With no Anthropic account
   in the table, Premium % and Extra disappear and the popover narrows to fit.
 
+### Fixed
+
+- **A Codex home re-registered after an upgrade was reported as drift.** Older
+  `auth.json` files stored the ChatGPT *user* id (`user-…`) as
+  `tokens.account_id`, and current ones store the *workspace* id. Those never
+  match, so a row keyed on the old id read as a different login. Ids of
+  different kinds are no longer compared, and the email decides instead. This
+  applies to `codex list`, the popover badge, and the tier-2 poll guard, which
+  had been refusing to poll.
+
 ## [2.1.0] - 2026-09-26
 
 ### Summary

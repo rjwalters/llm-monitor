@@ -2794,7 +2794,25 @@ class OAuthPoller: ObservableObject {
     /// than an email. Both sides are the ChatGPT `account_id`, so a mismatch is
     /// as conclusive as the email one.
     private func codexHomeConflicts(with credential: OAuthCredential, reportedAccountId: String?) -> Bool {
-        Self.identitiesConflict(reportedAccountId, credential.accountId)
+        guard let stored = credential.accountId,
+              Self.accountIdsComparable(stored: stored, reported: reportedAccountId) else { return false }
+        return Self.identitiesConflict(reportedAccountId, stored)
+    }
+
+    /// Whether a stored account id and one a home reports are the **same kind
+    /// of id**, and so may be compared at all. Two kinds exist: older
+    /// `auth.json` files carried the ChatGPT *user* id (`user-…`) as
+    /// `tokens.account_id`, current ones carry the *workspace* account id (a
+    /// UUID). One person's row keyed on the first can never equal a current
+    /// login's second, so comparing them manufactures a drift that is not
+    /// there: robb-pro's r.j.walters row after the 2.1.0 upgrade. When the kinds
+    /// differ (or the stored id was minted locally) the ids prove nothing, and
+    /// the email decides instead.
+    nonisolated static func accountIdsComparable(stored: String, reported: String?) -> Bool {
+        guard let reported = reported?.trimmingCharacters(in: .whitespacesAndNewlines), !reported.isEmpty,
+              !isLocallyMintedAccountId(stored) else { return false }
+        func isLegacyUserId(_ id: String) -> Bool { id.lowercased().hasPrefix("user-") }
+        return isLegacyUserId(stored) == isLegacyUserId(reported)
     }
 
     /// Two identity strings that are both known and disagree. Pure function of
@@ -2880,7 +2898,8 @@ class OAuthPoller: ObservableObject {
         homeAccountId: String?,
         homeEmail: String?
     ) -> CodexHomeDrift {
-        let comparableStoredId = isLocallyMintedAccountId(registeredAccountId) ? nil : registeredAccountId
+        let comparableStoredId = accountIdsComparable(stored: registeredAccountId, reported: homeAccountId)
+            ? registeredAccountId : nil
         switch compareIdentities(reported: homeAccountId, stored: comparableStoredId) {
         case .conflict(let reported):
             return .drifted(reportedAccountId: reported)

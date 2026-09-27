@@ -2324,6 +2324,30 @@ enum SelfTest {
             Drift.stable,
             "a stale email on the row is not drift while the stable account id still agrees"
         )
+        // A legacy `user-…` row id and a current workspace id are different
+        // kinds of id: never compared, so the email decides (robb-pro, 2.1.0).
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-mhkatluAF9", registeredEmail: "rj@example.com",
+                                       homeAccountId: "54fbe3c7-1111-4222-8333-444455556666", homeEmail: "rj@example.com"),
+            Drift.stable,
+            "a legacy user id vs a workspace id with the same email is not drift"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-mhkatluAF9", registeredEmail: "rj@example.com",
+                                       homeAccountId: "54fbe3c7-1111-4222-8333-444455556666", homeEmail: "other@example.com"),
+            Drift.drifted(reportedAccountId: nil),
+            "with ids of different kinds, a different email is still drift (reported without naming it)"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "11111111-2222-4333-8444-555566667777", registeredEmail: nil,
+                                       homeAccountId: "54fbe3c7-1111-4222-8333-444455556666", homeEmail: nil),
+            Drift.drifted(reportedAccountId: "54fbe3c7-1111-4222-8333-444455556666"),
+            "two workspace ids that differ are still compared and still drift"
+        )
+        expect(!OAuthPoller.accountIdsComparable(stored: "user-aaa", reported: "54fbe3c7-1111-4222-8333-444455556666")
+               && OAuthPoller.accountIdsComparable(stored: "user-aaa", reported: "user-bbb")
+               && !OAuthPoller.accountIdsComparable(stored: "openai-6f1c2f7e-0000-4a00-8000-000000000000", reported: "user-bbb"),
+               "id comparability: same kind only; locally minted ids never compare")
     }
 
     /// The popover's drift badge and `codex list`'s `drift` column must never
