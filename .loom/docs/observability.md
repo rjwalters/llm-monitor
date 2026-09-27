@@ -457,6 +457,45 @@ and review requested → merged. It reads ETag-cached stage listings every 5
 minutes plus at most 8 per-item reads per sample, never per tick. Details are
 in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
+covers candidates that reached a `dispatch()` attempt — a candidate filtered
+out earlier (`workspace_halted`, `parked`, `deferred_saturation`,
+`host_class_refused`, a backoff, a cooldown, …) had no per-issue SigNoz record
+at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
+span on a disposition transition (including first sight), on a periodic
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
+once as a terminal `left_queue` record when it leaves a repo whose listing
+succeeded. Sampled from the collector's periodic pass (the same cadence as
+`queue.snapshot`), never the tick loop, so a disposition lasting less than one
+collector interval can be missed; a 10-minute-or-longer lookback still always
+contains the current state of every queued issue. Cardinality is bounded: at
+most 256 rows become spans per sample (`loom.queue.disposition_rows_dropped{reason="truncated"}`
+counts the rest), and a row whose repo root never resolved to a forge slug is
+dropped and counted as `reason="unresolved"` rather than exported with a local
+path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
+in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
+host. Full attribute table in
+[`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
+
+Mapping an operator's plain-English question onto the `QueueDisposition`
+vocabulary (`loom.queue.disposition`'s wire values):
+
+| Operator term | Disposition(s) |
+|---|---|
+| "admission brake" | `deferred_saturation` (decisions reason `saturation`, tick result `saturation_held`) |
+| "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
+| "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), `deferred_repo_cap` (per-repo cap), or `deferred_out_of_slice` (repo sharding) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
+
+For a `workspace_halted` row, join to the parent `loom.dispatch.tick` span
+(`loom.dispatch.result="halted_main_red"`) through `parentSpanID` — the row
+itself does not say which of red-main / gate / token pool / drain / breaker
+caused the halt (out of scope for #9222; file separately if wanted).
+
+A runnable copy of the "why hasn't `owner/repo#N` started" query is query 5 of
+`defaults/observability/signoz/queue-dwell.sql` — that file's other four
+queries are the `loom.queue.*` **metrics** above; query 5 is the only one that
+reads spans instead, over `signoz_traces.signoz_index_v3`.
+
 **Tokens, providers and pools (#8908, #8931).** Each account mark the daemon
 writes (Codex terminal feedback, API-key pool bad marks, the Claude
 insta-crash exhaustion mark) emits one `loom.pool.account_marks{provider,reason}`

@@ -1045,7 +1045,57 @@ tick is one `loom.dispatch.admission` child span (#8907), with the tick's trace
 id and the tick span as its parent. Its attributes are `loom.issue`,
 `loom.dispatch.admission_result` (`dispatched`, `in_flight`, `refused`,
 `error`) and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason it
-was counted under). Its status is `error` only for `error`.
+was counted under), plus `loom.repo`/`loom.repo.visibility` (Issue #9222) when
+the admitting workspace's forge slug has already been resolved by the
+collector — omitted, never a local path, on a cache miss. Its status is
+`error` only for `error`.
+
+#### `loom.dispatch.disposition` (Issue #9222): per-issue "why is it waiting"
+
+Every ready-queue row the work finder ranked on its most recent tick
+(`WorkFinderTickSummary::queue`, #8852) gets its own `loom.dispatch.disposition`
+span whenever its disposition changes (including first sight), on a periodic
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s), or once as a
+terminal record when it leaves a successfully-listed repo's queue. Unlike
+`loom.dispatch.admission`, this covers every candidate the tick evaluated —
+including one filtered out before `dispatch()` was ever attempted
+(`workspace_halted`, `parked`, `deferred_saturation`, `host_class_refused`,
+…) — so a per-issue "why" is answerable for the entire `QueueDisposition`
+vocabulary, not just the subset that reached an admission attempt.
+
+Sampled from the collector's periodic pass (the same cadence as
+`queue.snapshot` / the forge stage-dwell sampler), never from the tick loop
+itself, so a disposition that lasts less than one collector interval can be
+missed — only the last-tick state per interval is exported. Parented to the
+tick's own `loom.dispatch.tick` span when the sampled summary is that exact
+tick; otherwise a root of its own. Attributes:
+
+| Attribute | Value |
+|---|---|
+| `loom.repo` | forge `owner/repo`. Rows whose root never resolved to a slug are dropped and counted, never exported as a local path |
+| `loom.repo.visibility` | `public` / `private` |
+| `loom.issue` | the issue number |
+| `loom.queue.disposition` | the `QueueDisposition` wire name (`deferred_saturation`, `parked`, `workspace_halted`, `host_class_refused`, …) |
+| `loom.queue.state` | `running` / `ready` / `blocked` |
+| `loom.queue.rank` | 1-based dispatch-order rank; absent on a `left_queue` span (the row is no longer ranked) |
+| `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
+| `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
+| `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the closed `PARK_LABELS ∪ SKIP_LABELS` vocabulary — a repo-configured extra skip label or a hard-exclusion rule name outside that set is never exported |
+| `loom.pr_number` | only for `open_pr`, parsed from the row's structured detail |
+
+Free-form dispatch-error text is never exported. Rows past 256 per sample, or
+whose repo root never resolved, are dropped and counted on
+`loom.queue.disposition_rows_dropped{reason}` (`unresolved` / `truncated`), a
+delta counter. The single-workspace work-finder loop records no per-issue
+queue rows at all (`workspace #N` placeholders never resolve to a slug), so it
+has nothing to export here — the same limitation `queue.snapshot` and the
+forge stage-dwell sampler already document.
+
+**Mapping an operator's plain-English question to a disposition**: see
+[`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)'s
+table (`admission_brake` → `deferred_saturation`, `dependency_blocked` →
+`parked`/`labelled_blocked`, `lower_tier` → `deferred_capacity` /
+`deferred_ramp_cap` / `deferred_repo_cap` / `deferred_out_of_slice`).
 
 Tokens, providers and pools (Issues #8908, #8931):
 
