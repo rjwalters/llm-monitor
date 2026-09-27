@@ -64,6 +64,22 @@ enum SummaryColumns {
     static let dot: CGFloat = 40
     static let chart: CGFloat = 46
     static let horizontalPadding: CGFloat = 12
+
+    /// Whether a provider-specific column is shown at all (#227): only when at
+    /// least one provider among the visible accounts declares the slot
+    /// applicable. An all-Codex/z.ai table then carries no dead columns. The
+    /// one rule the header, every row, and the popover width all read.
+    static func shows(_ slot: ProviderColumnSlot, among providers: Set<AccountProvider>) -> Bool {
+        providers.contains { $0.columnEntry(for: slot).isApplicable }
+    }
+
+    /// Popover width for the columns actually shown: the full table width
+    /// (`PopoverHeightManager.popoverWidth`) minus any hidden slot.
+    static func tableWidth(among providers: Set<AccountProvider>) -> CGFloat {
+        PopoverHeightManager.popoverWidth
+            - (shows(.premium, among: providers) ? 0 : fable)
+            - (shows(.extra, among: providers) ? 0 : extra)
+    }
 }
 
 // MARK: - Even-burn mark vocabulary
@@ -504,10 +520,22 @@ struct UsagePopoverView: View {
 
     /// Sort comparator for two rows under the current column/direction.
     /// Rows without data sort to the bottom regardless of direction.
+    /// The sort actually applied: a column hidden by #227 cannot be the sort
+    /// key the user sees selected, so it falls back to the default.
+    private var effectiveSortBy: SummarySort {
+        switch sortBy {
+        case .fablePercent where !SummaryColumns.shows(.premium, among: visibleProviders),
+             .extraUsage where !SummaryColumns.shows(.extra, among: visibleProviders):
+            return .headroom
+        default:
+            return sortBy
+        }
+    }
+
     private func compareRows(_ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?)) -> Bool {
         // Account name sorts naturally: digit runs compare by value, so
         // agent-10 follows agent-9 instead of landing next to agent-1.
-        if case .account = sortBy {
+        if case .account = effectiveSortBy {
             let cmp = NaturalSort.compare(a.0.displayName, b.0.displayName)
             if cmp == .orderedSame { return stableTiebreak(a.0, b.0) }
             return sortDir == .asc
@@ -515,14 +543,14 @@ struct UsagePopoverView: View {
                 : (cmp == .orderedDescending)
         }
 
-        let (av, bv) = sortValues(a, b, for: sortBy)
+        let (av, bv) = sortValues(a, b, for: effectiveSortBy)
         switch (av, bv) {
         case (nil, nil): return stableTiebreak(a.0, b.0)
         case (nil, _):   return false          // nil rows go last
         case (_, nil):   return true
         case let (.some(x), .some(y)):
             if x != y { return sortDir == .asc ? (x < y) : (x > y) }
-            if case .headroom = sortBy, let ordered = recoveryTiebreak(a.1, b.1) { return ordered }
+            if case .headroom = effectiveSortBy, let ordered = recoveryTiebreak(a.1, b.1) { return ordered }
             return stableTiebreak(a.0, b.0)
         }
     }
@@ -609,7 +637,7 @@ struct UsagePopoverView: View {
                     .buttonStyle(.plain)
                     .pointerCursorOnHover(onExit: { showGitHubLink = false })
                 } else {
-                    Text("Claude Usage")
+                    Text("LLM Usage")
                         .font(.headline)
                         .foregroundColor(.primary)
                         .onHover { hovering in
@@ -660,6 +688,7 @@ struct UsagePopoverView: View {
                                 usage: item.usage,
                                 store: store,
                                 oauthPoller: oauthPoller,
+                                visibleProviders: visibleProviders,
                                 onRemove: {
                                     accountToRemove = item.account
                                     showRemoveConfirmation = true
@@ -715,9 +744,10 @@ struct UsagePopoverView: View {
             .padding(.horizontal)
             .padding(.vertical, 10)
         }
-        .frame(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
+        .frame(width: heightManager.currentWidth, height: heightManager.currentHeight)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
+            heightManager.setVisibleProviders(visibleProviders)
             heightManager.update(rowCount: effectiveRowCount)
             clipboardHasAccounts = Self.clipboardContainsAccounts()
         }
@@ -726,6 +756,10 @@ struct UsagePopoverView: View {
         }
         .onChange(of: effectiveRowCount) { _, newCount in
             heightManager.update(rowCount: newCount)
+        }
+        .onChange(of: visibleProviders) { _, providers in
+            heightManager.setVisibleProviders(providers)
+            heightManager.update(rowCount: effectiveRowCount)
         }
         .alert("Remove Account?", isPresented: $showRemoveConfirmation) {
             Button("Cancel", role: .cancel) { }
@@ -919,21 +953,25 @@ struct SummaryHeaderRow: View {
                            width: SummaryColumns.percent, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir,
                            tooltip: Self.percentColumnTooltip("Weekly %"))
-            SortableHeader(title: premiumHeading.title, column: .fablePercent,
+            if SummaryColumns.shows(.premium, among: visibleProviders) {
+                SortableHeader(title: premiumHeading.title, column: .fablePercent,
                            width: SummaryColumns.fable, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir,
                            tooltip: premiumHeading.tooltip)
+            }
             SortableHeader(title: "Wk Reset", column: .weeklyReset,
                            width: SummaryColumns.reset, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir)
-            SortableHeader(title: extraHeading.title, column: .extraUsage,
+            if SummaryColumns.shows(.extra, among: visibleProviders) {
+                SortableHeader(title: extraHeading.title, column: .extraUsage,
                            width: SummaryColumns.extra, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir,
                            tooltip: extraHeading.tooltip)
+            }
             SortableHeader(title: "Fresh", column: .fresh,
                            width: SummaryColumns.dot, alignment: .center,
                            sortBy: $sortBy, sortDir: $sortDir)
-            SortableHeader(title: "Token", column: .token,
+            SortableHeader(title: "Auth", column: .token,
                            width: SummaryColumns.dot, alignment: .center,
                            sortBy: $sortBy, sortDir: $sortDir)
             Text("History")
@@ -1003,6 +1041,9 @@ struct SummaryRow: View {
     let usage: UsageRecord?
     let store: UsageStore
     let oauthPoller: OAuthPoller
+    /// Providers visible in the table — decides whether this row draws the
+    /// provider-specific cells at all (`SummaryColumns.shows`, #227).
+    var visibleProviders: Set<AccountProvider> = Set(AccountProvider.allCases)
     var onRemove: (() -> Void)? = nil
     @Environment(\.colorScheme) var colorScheme
     @State private var isEditingName = false
@@ -1045,7 +1086,26 @@ struct SummaryRow: View {
     /// status word; a drifted row gets the identity + remediation detail
     /// `OAuthPoller.driftDetailMessage` composed at poll time, so the popover
     /// never has to re-derive or restate what `codex list` already says.
+    /// What kind of credential this row authenticates with, in the words the
+    /// Auth column's tooltip leads with — each provider's credential is a
+    /// different thing, so a bare "valid" says nothing on its own.
+    private var credentialKind: String {
+        switch account.provider {
+        case .anthropic: return "Claude OAuth token"
+        case .zai: return "z.ai API key"
+        case .openai:
+            if let home = account.codexHome, OAuthPoller.isLoomCodexProfile(home) {
+                return "Loom Codex profile (read-only snapshot)"
+            }
+            return account.codexHome == nil ? "Codex (default home)" : "Codex home"
+        }
+    }
+
     private var tokenStatusHelp: String {
+        "\(credentialKind): \(tokenStatusDetail)"
+    }
+
+    private var tokenStatusDetail: String {
         if isAbsent {
             return "No credential on this host — this identity has never been provisioned here. Run `llm-monitor codex provision <label>`."
         }
@@ -1254,8 +1314,10 @@ struct SummaryRow: View {
             percentCell(displayUsage?.rateLimit.weekly)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
-            fableCell
-                .frame(width: SummaryColumns.fable, alignment: .trailing)
+            if SummaryColumns.shows(.premium, among: visibleProviders) {
+                fableCell
+                    .frame(width: SummaryColumns.fable, alignment: .trailing)
+            }
 
             Text(resetLabel(displayUsage?.rateLimit.weekly?.resetAt))
                 .font(.caption)
@@ -1263,8 +1325,10 @@ struct SummaryRow: View {
                 .lineLimit(1)
                 .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-            extraCell
-                .frame(width: SummaryColumns.extra, alignment: .trailing)
+            if SummaryColumns.shows(.extra, among: visibleProviders) {
+                extraCell
+                    .frame(width: SummaryColumns.extra, alignment: .trailing)
+            }
 
             Circle()
                 .fill(freshnessDotColor)
@@ -1304,7 +1368,7 @@ struct SummaryRow: View {
             // refreshed automatically and re-imported with `codex import`.
             if account.provider == .anthropic {
                 Button(action: openRollToken) {
-                    Label("Roll Token…", systemImage: "arrow.triangle.2.circlepath")
+                    Label("Roll Claude Token…", systemImage: "arrow.triangle.2.circlepath")
                 }
             }
             Divider()
@@ -1485,7 +1549,8 @@ struct SetupGuideView: View {
                 Text("No Usage Data")
                     .font(.headline)
 
-                Text("Add accounts using tokens from 'claude setup-token'")
+                Text("Add a Claude, z.ai, or OpenAI Codex account. Tokens in ~/.claude-oauth, "
+                     + "keys in ~/.zai, and Loom Codex profiles are picked up automatically.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -1507,16 +1572,6 @@ struct SetupGuideView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
 
-                Button(action: {
-                    if let url = URL(string: "https://claude.ai/settings/usage") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }) {
-                    Label("Open Usage Page", systemImage: "safari")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
             }
             .padding(.horizontal)
 
@@ -1536,7 +1591,15 @@ struct AddAccountView: View {
     /// Called after a successful add/import so the host can refresh polled state.
     var onImported: (() -> Void)? = nil
 
+    /// Which provider the add form is for (#226). Each has its own credential
+    /// shape and instructions, so the form never shows one provider's words
+    /// for another.
+    @State private var provider: AccountProvider = .anthropic
     @State private var tokenText = ""
+    @State private var zaiKeyText = ""
+    @State private var zaiLabelText = ""
+    @State private var zaiEmailText = ""
+    @State private var codexHomeText = ""
     @State private var statusMessage: String?
     @State private var isAdding = false
     @State private var envImportResults: [EnvImportResult] = []
@@ -1547,35 +1610,20 @@ struct AddAccountView: View {
             Text("Add Account")
                 .font(.headline)
 
-            // Instructions
-            VStack(alignment: .leading, spacing: 2) {
-                Text("1. Run: claude setup-token")
-                    .font(.caption)
-                Text("2. Paste the token below")
-                    .font(.caption)
+            Picker("Provider", selection: $provider) {
+                Text("Claude").tag(AccountProvider.anthropic)
+                Text("z.ai").tag(AccountProvider.zai)
+                Text("Codex").tag(AccountProvider.openai)
             }
-            .foregroundColor(.secondary)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: provider) { _, _ in statusMessage = nil }
 
-            Divider()
-
-            // Token entry
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Token")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField("sk-ant-oat01-...", text: $tokenText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.caption, design: .monospaced))
-                    .onSubmit { addToken() }
+            switch provider {
+            case .anthropic: claudeForm
+            case .zai: zaiForm
+            case .openai: codexForm
             }
-
-            Button(action: addToken) {
-                Label(isAdding ? "Adding..." : "Add Account", systemImage: "plus.circle")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
-            .disabled(isAdding || tokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Divider()
 
@@ -1600,32 +1648,6 @@ struct AddAccountView: View {
                     .controlSize(.small)
                     .disabled(isAdding || envPathText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-            }
-
-            Divider()
-
-            // OpenAI / Codex — imported from Codex CLI's own credential store
-            // rather than pasted, because a ChatGPT OAuth credential is a
-            // three-part (access + refresh + expiry) object, not a single
-            // long-lived string.
-            VStack(alignment: .leading, spacing: 6) {
-                Text("OpenAI (Codex)")
-                    .font(.caption.bold())
-                    .foregroundColor(.secondary)
-                Text("Imports the credential `codex login` stored at \(CodexAuth.defaultAuthPath)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-
-                Button(action: importCodex) {
-                    Label(isAdding ? "Importing…" : "Import Codex Account",
-                          systemImage: "person.badge.key")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(isAdding)
             }
 
             // Import results
@@ -1672,6 +1694,133 @@ struct AddAccountView: View {
         .frame(width: 320)
     }
 
+    // MARK: Provider forms (#226)
+
+    private func note(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var claudeForm: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("1. Run `claude setup-token` and sign in as the account")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("2. Paste the token it prints")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            SecureField("sk-ant-oat01-…", text: $tokenText)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.caption, design: .monospaced))
+                .onSubmit { addToken() }
+            addButton(isEmpty: tokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, action: addToken)
+            note("Tokens in ~/.claude-oauth or the Loom pool (~/.loom/tokens) are picked up automatically; "
+                 + "a rolled token replaces the old one without losing history.")
+        }
+    }
+
+    private var zaiForm: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                TextField("Label (e.g. agent3)", text: $zaiLabelText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                TextField("Email (optional)", text: $zaiEmailText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+            SecureField("GLM Coding Plan API key", text: $zaiKeyText)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.caption, design: .monospaced))
+                .onSubmit { addZai() }
+            addButton(isEmpty: zaiKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || zaiLabelText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      action: addZai)
+            note("Keys in ~/.zai/coding-plan-<label>.env are imported automatically at launch.")
+        }
+    }
+
+    private var codexForm: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            note("Loom Codex profiles (~/.loom/codex-profiles) appear automatically and are read only "
+                 + "from their usage snapshots. Nothing to add here.")
+            note("To track another Codex login, register its CODEX_HOME. LLM Monitor never copies or "
+                 + "stores the OpenAI credential; it asks codex itself.")
+            TextField("~/.codex-<label>", text: $codexHomeText)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.caption, design: .monospaced))
+                .onSubmit { registerCodexHome() }
+            Button(action: registerCodexHome) {
+                Label(isAdding ? "Registering…" : "Register CODEX_HOME", systemImage: "folder.badge.person.crop")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(isAdding || codexHomeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private func addButton(isEmpty: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(isAdding ? "Adding..." : "Add Account", systemImage: "plus.circle")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.regular)
+        .disabled(isAdding || isEmpty)
+    }
+
+    private func addZai() {
+        let key = zaiKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = zaiLabelText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = zaiEmailText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, !label.isEmpty else { return }
+        isAdding = true
+        statusMessage = nil
+        store.ensureDatabase()
+        Task {
+            let (accountId, error) = await oauthPoller.addZaiAccount(
+                apiKey: key, email: email.isEmpty ? nil : email, label: label)
+            await MainActor.run {
+                isAdding = false
+                if accountId != nil {
+                    statusMessage = "Added z.ai account \(label)"
+                    zaiKeyText = ""
+                    store.loadFromDatabase()
+                    onImported?()
+                } else {
+                    statusMessage = error ?? "Failed to add z.ai account"
+                }
+            }
+        }
+    }
+
+    private func registerCodexHome() {
+        let raw = codexHomeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+        isAdding = true
+        statusMessage = nil
+        store.ensureDatabase()
+        Task {
+            let result = await oauthPoller.registerCodexHome(OAuthPoller.normalizeCodexHome(raw))
+            await MainActor.run {
+                isAdding = false
+                if result.accountId != nil {
+                    // A registered home may still carry a non-fatal warning
+                    // (e.g. usage not readable yet); show it rather than "Added".
+                    statusMessage = result.error.map { "Registered — \($0)" } ?? "Registered Codex account"
+                    codexHomeText = ""
+                    store.loadFromDatabase()
+                    onImported?()
+                } else {
+                    statusMessage = result.error ?? "Failed to register CODEX_HOME"
+                }
+            }
+        }
+    }
+
     private func addToken() {
         let token = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { return }
@@ -1692,33 +1841,6 @@ struct AddAccountView: View {
                     onImported?()
                 } else {
                     statusMessage = error ?? "Failed to add account"
-                }
-            }
-        }
-    }
-
-    private func importCodex() {
-        isAdding = true
-        statusMessage = nil
-        store.ensureDatabase()
-
-        Task {
-            let (accountId, error) = await oauthPoller.importCodexCredential()
-            await MainActor.run {
-                isAdding = false
-                if let accountId = accountId {
-                    // #194: an imported token is cleared on the next launch, so
-                    // an account with no home of its own that this host cannot
-                    // resolve ambiguously is a silent dead end. Say so here —
-                    // the same warning `codex import` prints, from the same
-                    // rule — rather than letting the row quietly stop updating.
-                    statusMessage = oauthPoller.importWillStrand(accountId: accountId)
-                        ? "Added OpenAI account — \(OAuthPoller.importWillStrandWarning)"
-                        : "Added OpenAI account"
-                    store.loadFromDatabase()
-                    onImported?()
-                } else {
-                    statusMessage = error ?? "Failed to import Codex credential"
                 }
             }
         }

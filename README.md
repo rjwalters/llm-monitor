@@ -37,9 +37,11 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 - **Per-row history charts.** Click the chart icon to open a usage-history
   window for that account; the popover stays open so you can open several
   side-by-side and compare.
-- **Multi-account.** Add accounts one-by-one via a token from
-  `claude setup-token`, or bulk-import from a `.env` file with
-  `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs.
+- **Multi-account.** Add accounts one at a time from **Add Account**, which has
+  a Claude / z.ai / Codex picker, or bulk-import a `.env` file of
+  `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs. Many accounts need no adding at all:
+  tokens in `~/.claude-oauth` or the Loom pool, keys in `~/.zai`, and Loom Codex
+  profiles are picked up automatically.
 - **Multi-provider.** Anthropic and OpenAI/ChatGPT (Codex) accounts sit side by
   side in the same table, each row tagged with a pixel-art provider badge. See
   [Adding an OpenAI (Codex) Account](#adding-an-openai-codex-account).
@@ -99,8 +101,13 @@ needed. If you ever need to revoke and replace one (e.g., after a leak), see
 ### 4. Add the Account
 
 1. Click the menu-bar widget.
-2. Click **+ Add Account** in the footer.
-3. Paste the token, click **Add Account**.
+2. Click **+ Add Account** in the footer and pick the provider:
+   - **Claude:** paste the `claude setup-token` token.
+   - **z.ai:** enter a label (and optionally an email) and paste the GLM Coding Plan
+     key.
+   - **Codex:** nothing to paste. Loom profiles appear automatically; otherwise
+     register a logged-in `CODEX_HOME`.
+3. Click **Add Account** (or **Register CODEX_HOME**).
 
 Your usage data shows up in the menu bar immediately.
 
@@ -395,7 +402,7 @@ The original path still works, for hosts without a usable `codex` binary:
 
 ```bash
 codex login
-llm-monitor codex import    # or: Add Account → "Import Codex Account"
+llm-monitor codex import
 ```
 
 The importer reads `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise
@@ -428,14 +435,14 @@ What differs from an Anthropic row once it's added:
   "unknown", not 0% — the headroom score and sorting use whichever windows
   actually exist.
 - **Premium % / Extra are always `—`.** Those columns track Anthropic
-  premium tiers; the Fable probe is skipped for OpenAI accounts entirely. (The
-  premium column is titled "Fable %" only when every account in the table
-  is Anthropic; with any OpenAI row present it shows the neutral
-  "Premium %".)
+  premium tiers; the Fable probe is skipped for OpenAI accounts entirely. The
+  premium column is titled "Fable %" only when every account in the table is
+  Anthropic, and "Premium %" in a mixed table. With **no** Anthropic account in
+  the table, both columns are hidden and the popover narrows to fit.
 - **This app stores no OpenAI credential, and renews nothing.** Usage is read
   via `codex app-server` (tier 1) or a one-time `auth.json` bearer read (tier
   2); either way the Codex CLI owns the credential and its own renewal
-  entirely, and this app touches neither. The Token dot reports the outcome:
+  entirely, and this app touches neither. The Auth dot reports the outcome:
   green (a tier read succeeded), **red** (every tier failed — most often the
   home isn't logged in; hover for the reason, then run `codex login` or
   register the right home with `llm-monitor codex add --home <path>`). A
@@ -1232,8 +1239,9 @@ rm ~/Library/LaunchAgents/com.llm-monitor.plist
 
 ### Menu bar shows "LLM --"
 
-No data yet. Click the widget → **+ Add Account** → paste a token from
-`claude setup-token`.
+No data yet. Click the widget → **+ Add Account**, pick the provider, and add a
+credential. Or put tokens in `~/.claude-oauth` or keys in `~/.zai`; they're picked
+up automatically.
 
 ### A new account doesn't appear after import
 

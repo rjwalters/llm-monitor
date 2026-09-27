@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The UI no longer assumes Claude** (#225). The popover is titled "LLM
+  Usage". The empty state and chart window describe how every provider's history
+  builds up instead of pointing at claude.ai. Roll Token reads "Roll Claude
+  Token…". The Token column is now **Auth**, and its tooltip names the credential
+  kind: Claude OAuth token, z.ai API key, Codex home, or read-only Loom Codex
+  profile.
+- **Add Account has a provider picker** (#226): Claude (paste a
+  `setup-token` token), z.ai (label + key), and Codex, which explains that Loom
+  profiles are automatic and otherwise registers a `CODEX_HOME`. The old
+  "Import Codex Account" button, which copied a bearer that the next launch
+  cleared, is gone from the popover. Token and key fields are masked.
+- **Anthropic-only columns hide when unused** (#227). With no Anthropic account
+  in the table, Premium % and Extra disappear and the popover narrows to fit.
+
 ## [2.1.0] - 2026-09-26
 
 ### Summary
