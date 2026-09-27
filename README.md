@@ -1442,7 +1442,7 @@ llm-monitor/
 ├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)
 ├── docs/window.png, docs/plot_window.png  # README screenshots
 ├── .github/workflows/build.yml  # CI: build + selftest on macOS and Linux
-├── .github/dependabot.yml       # Weekly grouped GitHub Actions bumps (the only third-party surface)
+├── renovate.json5               # Dependency updates (14-day quarantine, GitHub Actions — the only third-party surface)
 ├── build/                       # Build output (gitignored): LLMMonitor.app + .zip
 ├── CHANGELOG.md                 # Release history
 ├── CLAUDE.md                    # Development notes (build/install sequence, invariants)
