@@ -20,7 +20,12 @@ extension CGFloat {
 /// other UI-state classes (`UsageStore`, `OAuthPoller`).
 @MainActor
 class PopoverHeightManager: ObservableObject {
-    static let popoverWidth: CGFloat = 818
+    /// Exactly the sum of `SummaryColumns`' widths plus its horizontal padding
+    /// on both sides, so the summary table neither clips nor floats in empty
+    /// space. Recompute it whenever a column width there changes — the two
+    /// Session %/Weekly % columns grew by 16pt each in #220 to carry the
+    /// even-burn mark beside the raw percentage, taking 818 to 850.
+    static let popoverWidth: CGFloat = 850
     static let minHeight: CGFloat = 200
     static let maxHeight: CGFloat = 800
 

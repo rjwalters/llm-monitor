@@ -178,6 +178,61 @@ struct RateLimitWindow: Equatable {
     /// the usage figure is at the cap.
     var isExhausted: Bool { status == "rejected" || usedPercent >= 100 }
 
+    /// Where an **evenly paced** consumer would be in this window right now, as
+    /// a 0–100 percentage on the same scale as `usedPercent` (#220, the figure
+    /// glideslope draws as its ◆ mark — see
+    /// `docs/spikes/2026-09-27-glideslope-evaluation.md` § 1):
+    ///
+    /// ```
+    /// 100 * (1 - (resetAt - now) / durationSeconds)
+    /// ```
+    ///
+    /// This is the one figure that makes windows of *different lengths*
+    /// comparable: 60% used at hour 1 of a 5-hour window and 60% used at day
+    /// 3.5 of a 7-day window are the same raw percent but opposite situations,
+    /// and raw percent (or `PercentSeverity`'s bands over it) cannot tell them
+    /// apart. Against the mark the first is far ahead of budget and the second
+    /// is exactly on it.
+    ///
+    /// **Returns nil, never 0, whenever the position is unknown** — no
+    /// `resetAt`, no (or non-positive) `durationSeconds`, or a reset that has
+    /// already passed. An unknown position is not an "on pace" one, so every
+    /// caller must render it as absent (the "omitted, never zeroed" rule this
+    /// codebase applies to `ranking.json` and `quota_calibration_daily`
+    /// alike). A passed reset is deliberately unknown rather than 100: the
+    /// window has rolled over and this reading predates the rollover, so its
+    /// phase says nothing about the current window.
+    ///
+    /// Clamped to [0, 100] at both ends so clock skew (a reset further out than
+    /// one whole window) can never produce a negative position, and a reset
+    /// arriving within the current instant can never produce one above the cap.
+    ///
+    /// Pure, and in the portable core, so the popover, the chart, and
+    /// `SelfTest` all read the identical rule on macOS and Linux alike.
+    func evenBurnPercent(at now: Date = Date()) -> Double? {
+        guard let resetAt = resetAt,
+              let duration = durationSeconds,
+              duration > 0 else { return nil }
+        let remaining = resetAt.timeIntervalSince(now)
+        guard remaining > 0 else { return nil }
+        return max(0, min(100, 100 * (1 - remaining / duration)))
+    }
+
+    /// How far *behind* an even burn this window's consumption is, in
+    /// percentage points: `evenBurnPercent - usedPercent`.
+    ///
+    /// Positive means banking — capacity is accumulating that will expire
+    /// unused at the reset. Negative means ahead of budget — this window is
+    /// being spent faster than the clock, and will cap before it rolls over if
+    /// the rate holds.
+    ///
+    /// Nil exactly when `evenBurnPercent(at:)` is nil, for the same reason: an
+    /// unknown position yields an unknown deviation, never a comfortable 0.
+    func slack(at now: Date = Date()) -> Double? {
+        guard let pace = evenBurnPercent(at: now) else { return nil }
+        return pace - usedPercent
+    }
+
     /// Reset instant as an ISO 8601 string, for DB storage.
     var resetAtISO: String? {
         resetAt.map { ISO8601DateFormatter().string(from: $0) }
