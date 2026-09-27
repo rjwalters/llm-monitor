@@ -21,6 +21,7 @@ Conventions:
 | Spike | Question | Outcome |
 |-------|----------|---------|
 | [2026-07-30-codex-usage-probe.md](2026-07-30-codex-usage-probe.md) | Can a cheap authenticated probe read ChatGPT/Codex subscription usage and rate-limit windows? | **Yes**, but not the way the spike concluded — see the 2026-08-15 supersession. `codex app-server` is the supported surface; `GET wham/usage` is the fallback. |
+| [2026-09-27-glideslope-evaluation.md](2026-09-27-glideslope-evaluation.md) | Should llm-monitor adopt anything from Stage-11-Agentics/glideslope? | **One idea**: the elapsed-time-normalized "even burn" mark (#220). The comparison also surfaced a missing reset bound on time-to-limit (#221). Credentials already converged; pool and cost figures answer different questions; the menu bar is a differentiator. |
 
 ### Reading the Codex probe write-up
 
