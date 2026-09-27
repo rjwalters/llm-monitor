@@ -510,6 +510,10 @@ else
                 grab && /^}/ { exit }
             ' "$MERGE_PR"
         }
+        # #8191 slice: the porcelain lookups below shell out through
+        # _mp_worktree, so it is extracted with them — without it they die with
+        # "_mp_worktree: command not found" under `set -e`.
+        eval "$(extract_fn _mp_worktree)"
         # The two helpers the body calls for diagnostics are extracted too, not
         # stubbed: a `command not found` from either would be swallowed by the
         # `|| true` around them and quietly change which branch runs.

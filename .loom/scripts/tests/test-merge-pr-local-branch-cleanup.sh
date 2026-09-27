@@ -84,9 +84,17 @@ MERGE_PR="$SCRIPTS_DIR/merge-pr.sh"
 # exists — the same harness this epic's other ported merge-pr suites use.
 # Without this, a stale binary would make the guard warn-and-no-op on every
 # case below instead of exercising the real decision.
+#
+# #8191 slice: the porcelain lookups this suite extracts (_primary_worktree_path
+# / _is_primary_worktree_path / _find_worktree_by_branch) now delegate to
+# `loom-daemon merge-pr worktree-*`, so the LEAF verbs are checked too — a binary
+# with only the `merge-pr` group predates this slice, which every daemon since
+# #8124 does, and would make every lookup fail.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr" \
+    "merge-pr worktree-primary" "merge-pr worktree-branch-for" \
+    "merge-pr worktree-find-by-branch"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -181,6 +189,10 @@ error()   { echo "ERROR: $*" >&2; return 1; }
 # auto-cleanup branch actually runs in this harness (an undefined helper
 # silently no-ops instead of erroring, which would otherwise mask the new
 # behavior rather than exercise it).
+# #8191 slice: the porcelain lookups below shell out through _mp_worktree, so it
+# is extracted with them — without it they die with "_mp_worktree: command not
+# found" under `set -e`.
+eval "$(extract_fn _mp_worktree "$MERGE_PR")"
 eval "$(extract_fn _primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _is_primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _find_worktree_by_branch "$MERGE_PR")"

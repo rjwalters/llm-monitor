@@ -59,13 +59,22 @@ WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 LIB_SH="$SCRIPTS_DIR/lib/cargo-target-dir.sh"
 STANDALONE_SH="$REPO_ROOT/scripts/cargo-target-dir.sh"
 
+# #8191 slice: the porcelain lookups this suite extracts from merge-pr.sh
+# (_primary_worktree_path / _worktree_branch_for) now delegate to `loom-daemon
+# merge-pr worktree-*`, so the LEAF verbs are pinned alongside `worktree-remove`
+# — a binary predating this slice makes every lookup fail, and the #3710
+# primary-worktree guard then refuses to clean up anything at all, which would
+# read here as a logic failure across the whole suite rather than as one
+# environment problem.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
 # `cargo-target-dir` too since #9153: Test 8 drives merge-pr.sh's post-merge
 # cleanup, whose resolve/reclaim pair is now that subcommand. A binary predating
 # it would make the reclaim a silent no-op and Test 8 would read as a logic
 # failure rather than an environment one.
-loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-remove" "cargo-target-dir"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-remove" "cargo-target-dir" \
+    "merge-pr worktree-primary" "merge-pr worktree-branch-for" \
+    "merge-pr worktree-find-by-branch"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -497,6 +506,10 @@ else
 
     # shellcheck source=../lib/cargo-target-dir.sh
     source "$LIB_SH"
+    # #8191 slice: the porcelain lookups below shell out through _mp_worktree,
+    # so it is extracted with them — without it they die with
+    # "_mp_worktree: command not found" under `set -e`.
+    eval "$(extract_fn _mp_worktree "$MERGE_PR")"
     eval "$(extract_fn _primary_worktree_path "$MERGE_PR")"
     eval "$(extract_fn _worktree_branch_for "$MERGE_PR")"
     # #7812: _maybe_delete_local_branch's `-d` -> `-D` safety check is now the

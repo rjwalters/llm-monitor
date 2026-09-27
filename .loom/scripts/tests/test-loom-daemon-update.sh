@@ -1225,7 +1225,15 @@ fi
 W8B="$BASE_WORKDIR/w8b"
 mkdir -p "$W8B/cli" "$W8B/lib"
 cp "$UPDATE_SCRIPT" "$W8B/cli/loom-daemon-update.sh"
-cp "$CLI_DIR/../lib/daemon-env-harvest.sh" "$CLI_DIR/../lib/locate-daemon-bin.sh" "$CLI_DIR/../lib/bounded-run.sh" "$W8B/lib/"
+# HARNESS ONLY (#8088). This used to name daemon-env-harvest.sh and
+# locate-daemon-bin.sh — the two libs the pre-port script sourced. The stub
+# sources ../lib/script-helper.sh instead, so the hand-written list left the
+# fixture unable to load at all and this scenario failed 20/20 for a reason
+# that had nothing to do with the race it measures. Copy the whole lib/
+# directory, exactly as install_update_script_into() above already does, so a
+# future change to what the entry point sources cannot silently re-break it.
+# No expectation below moves.
+cp "$CLI_DIR/../lib/"*.sh "$W8B/lib/"
 FIXTURE8B="$W8B/cli/loom-daemon-update.sh"
 ORIG8B="$W8B/cli/.orig.sh"
 cp "$FIXTURE8B" "$ORIG8B"

@@ -5,9 +5,11 @@
 # When the latest release carries no artifact for this host, the refusal used
 # to be one flat line covering both "the per-platform uploads are still
 # running" and "this platform is genuinely unbuilt". fetch_resolve_latest()
-# now asks `loom-daemon release-explain` -- the daemon resolver's own #8515
-# classification, not a second shell copy -- and falls back to the flat line
-# whenever that subcommand is missing, too old, or fails.
+# now names the daemon resolver's own #8515 classification, not a second
+# shell copy. Since #8680 ported this script to `loom-daemon daemon-update`,
+# that classification runs IN PROCESS (release_resolve::explain_no_artifact),
+# so the binary that runs the update is the one that classifies -- there is
+# no separate `release-explain` probe left to be missing (#9185).
 #
 # WHY A SEPARATE SUITE: test-loom-daemon-update-fetch.sh is at the file-size
 # ratchet (see its closing note), and these assertions need a built
@@ -155,13 +157,19 @@ check "still refuses to fall back silently" "$out2" \
     grep -q 'Refusing to silently fall back to a source build' <<<"$out2"
 
 # ------------------------------------------------------------
-# 3. Degrades: a loom-daemon that predates release-explain (clap's exit 2,
-#    empty stdout) leaves today's flat reason, and --fetch fails for the
-#    ORIGINAL reason, never because the classification was unavailable.
+# 3. An old loom-daemon: the FIRST precondition to fire for a binary that
+#    predates the port is the stub's `requires-daemon: daemon-update >= X`
+#    floor (#8285/#8385), refused up front with the floor and the roll
+#    command -- never clap's bare error, never a silent source build.
+#    (#9185: this scenario used to expect the flat reason from a binary
+#    lacking `release-explain`, a shape #8680 made unreachable -- any binary
+#    new enough to run `daemon-update` classifies in process.) The floor is
+#    read from the stub itself, so raising it on a rebase cannot drift this.
 # ------------------------------------------------------------
-echo "3. an old loom-daemon without release-explain"
+echo "3. an old loom-daemon below the daemon-update floor"
 W3="$BASE_WORKDIR/w3"
 setup_fixture "$W3" "$(utc_minutes_ago 5)"
+FLOOR="$(sed -n 's/^# requires-daemon: daemon-update >= \([0-9.]*\).*/\1/p' "$UPDATE_SCRIPT")"
 OLD_BIN="$BASE_WORKDIR/old-loom-daemon"
 cat > "$OLD_BIN" <<'OLDBIN'
 #!/usr/bin/env bash
@@ -173,8 +181,13 @@ OLDBIN
 chmod +x "$OLD_BIN"
 out3="$(run_fetch "$W3" LOOM_DAEMON_SELF_BIN="$OLD_BIN")"
 check "still exits 1 (the refusal, not a crash)" "$out3" grep -q '^EXIT=1$' <<<"$out3"
-check "falls back to the flat reason" "$out3" \
-    grep -q "no usable release artifact was resolved (release v0.20.0 has no artifact for target $TARGET (checked for loom-daemon-$TARGET + loom-daemon-$TARGET.sha256))" <<<"$out3"
+floor_refusal() {
+    [[ -n "$FLOOR" ]] \
+        && grep -qF "too old to run \`loom-daemon daemon-update\`" <<<"$1" \
+        && grep -qF "Required:  >= $FLOOR" <<<"$1"
+}
+check "refused up front by the daemon-update floor (>= ${FLOOR:-<unparsed>})" "$out3" \
+    floor_refusal "$out3"
 check "the old binary's clap error never leaks into the output" "$out3" \
     lacks "unrecognized subcommand" "$out3"
 

@@ -58,9 +58,18 @@ MERGE_PR="$SCRIPTS_DIR/merge-pr.sh"
 # Pin the binary built from this tree so a stale installed daemon cannot answer
 # instead — it would warn-and-keep every branch and fail these cases for the
 # wrong reason.
+#
+# #8191 slice: the porcelain lookups this suite extracts (_primary_worktree_path
+# / _worktree_branch_for) now delegate to `loom-daemon merge-pr worktree-*`, so
+# the LEAF verbs are checked too — a binary with only the `merge-pr` group
+# predates this slice and would make every lookup fail, which the #3710 guard
+# turns into "refuse to clean up anything at all": a whole-suite failure that
+# reads as broken logic rather than as one stale binary.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr" \
+    "merge-pr worktree-primary" "merge-pr worktree-branch-for" \
+    "merge-pr worktree-find-by-branch"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -113,6 +122,10 @@ success() { echo "OK: $*"; }
 error()   { echo "ERROR: $*" >&2; return 1; }
 loom_record_worktree_removal() { :; }  # no-op stub; ledger writes are out of scope here
 
+# #8191 slice: the porcelain lookups below shell out through _mp_worktree, so it
+# is extracted with them — without it they die with "_mp_worktree: command not
+# found" under `set -e`.
+eval "$(extract_fn _mp_worktree           "$MERGE_PR")"
 eval "$(extract_fn _primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _worktree_branch_for   "$MERGE_PR")"
 # #7812: _maybe_delete_local_branch's `-d` -> `-D` safety check is now the

@@ -8,22 +8,25 @@ as described in [observability](observability.md).
 
 ## Identity and process boundaries
 
-Every new execution receives a random nonzero 64-bit root span ID. An issue
+No trace or span ID is random; the derivations and the provenance every span
+carries are policy: [trace identity](trace-identity.md). An issue
 number never identifies an execution: retries and restarts of one issue are
-distinct executions. An issue sweep's trace ID, however, is its issue's **story
-trace** (#9037), keyed per harness-ops D32 v1 (#9068): trace ID and story root
-span ID are SHA-256-derived from `loom-story/v1:github:<repo_id>:<issue>`, where
-`repo_id` is GitHub's numeric id for the checkout's `origin` (resolved once per
-repo and cached), so every sweep of the issue, on any host and across renames,
-lands in one trace, parented to the story root and tagged `loom.issue`,
-`loom.repo`, `loom.story_id`, `loom.story` (`owner/repo#n`) and
-`loom.story.key_version` (`v1`). Completed CI runs of the issue join the same
-story as `loom.ci.run` / `loom.ci.job` spans (#9088; see
-[ci-observability](ci-observability.md#story-stitching-9088)). The story root span itself is emitted when the
-story ends (a later phase of #9037); until then backends show it as a missing
-parent. Executions outside an issue, in a checkout with no GitHub `origin`, or
-whose `repo_id` cannot be resolved (warned once per repo) get a random trace
-ID — never a name-derived one. Before an owned sweep process is
+distinct executions, each with a root span ID derived from its sweep id. An
+issue sweep's trace ID, however, is its issue's **story trace** (#9037), keyed
+per harness-ops D32 v1 (#9068): trace ID and story root span ID are
+SHA-256-derived from `loom-story/v1:github:<repo_id>:<issue>`, where `repo_id`
+is GitHub's numeric id for the checkout's `origin` (resolved once per repo and
+cached), so every sweep of the issue, on any host and across renames, lands in
+one trace, parented to the story root and tagged `loom.issue`, `loom.repo`,
+`loom.story_id`, `loom.story` (`owner/repo#n`) and `loom.story.key_version`
+(`v1`). Completed CI runs of the issue join the same story as `loom.ci.run` /
+`loom.ci.job` spans (#9088; see
+[ci-observability](ci-observability.md#story-stitching-9088)). The story root
+span itself is emitted when the story ends (a later phase of #9037); until
+then backends show it as a missing parent. Executions outside an issue, in a
+checkout with no GitHub `origin`, or whose `repo_id` cannot be resolved
+(warned once per repo) get their own deterministic trace derived from the
+repo key and sweep id — never a random one. Before an owned sweep process is
 spawned, Loom persists its root identity under `.loom/logs/trace-context/` and
 passes `LOOM_TRACEPARENT` plus `LOOM_TRACE_CONTEXT_FILE` to that child. Reopening
 the same execution after a daemon restart reuses its identity. A new attempt
@@ -73,7 +76,8 @@ transport behavior; live lifecycle acceptance requires the native workload too.
 ## Owned lifecycle instrumentation
 
 Sweep dispatch persists the root before spawning, including the failed-spawn
-path. Independent scheduled roles receive independent roots. Rust worker launches
+path. Independent scheduled roles receive independent roots, and join stories
+after the fact (below). Rust worker launches
 record preflight and runtime spans; a rejected preflight does not create a runtime
 span. Pi and OpenCode receive the validated context through their environment,
 and the shared native read/write/edit/bash bridge records tool name and outcome.
@@ -96,6 +100,43 @@ zero. Outcome logs include existing grouped usage, failure classification, order
 Judge verdicts and Doctor counts. Grouped usage inherits the source journal's
 attribution window and is not a measured provider bill. Free-form role error text,
 configuration blobs, prompts and account contents are not exported.
+
+## Role-runner ticks join stories after the fact (#9168)
+
+A role-runner tick (Judge, Curator, Champion, Doctor, …) is spawned without a
+target, so its `loom.role_attempt` root is its own trace. Once the tick ends,
+the same transcript pass that tallies `role_tick.outcome` `actions` also
+collects the issues and PRs the tick **wrote** to: `gh issue|pr
+comment/edit/close/reopen/…`, `gh pr merge|review|ready`, `merge-pr.sh <N>`
+(not `--dry-run`), and `gh api` `POST`/`PATCH`/`PUT`/`DELETE` on
+`repos/<o>/<r>/{issues,pulls}/<N>/…`. Reads (`view`, `list`, `diff`,
+`checks`, `GET`) never count; a command naming another repository (`-R`,
+URL, explicit API path, `GH_REPO`) or run after a `cd` out of the tick's
+checkout is refused, and one whose repository cannot be told (`cd $DIR`,
+`GH_HOST`, `GIT_DIR`) yields nothing (#9180); a branch name or `$VAR` names
+nothing. Here-document bodies — also `cat<<EOF` and the
+`--body "$(cat <<'EOF' … EOF)"` form — are never parsed as commands.
+
+Each distinct target gets one additional `loom.role_attempt` span in its story
+trace, parented to the story root (`story_context(repo_id, N)`). One batched,
+cached (10 min) GraphQL `issueOrPullRequest` lookup says whether
+the number is an issue — its own story — or a PR, which joins a story by the
+CI stitcher's rule: exactly one same-repo closing issue, counting the
+`feature/issue-N` head branch. Zero or several candidates, a foreign closing
+reference, a failed lookup, or an unresolvable `repo_id` → no story span.
+The whole lookup — `repo_id` included — shares one 20 s deadline per tick, and
+a failed or rate-limited lookup is not retried for that repository for 60 s. The
+span id is derived from the story root, `loom.role_tick`, the tick's execution
+id (`loom.sweep_id`) and the target (`pr:<M>` / `issue:<N>`), so a re-emit
+yields the same id. It carries `loom.role`, `loom.issue`, `loom.pr_number`
+(PR targets), `loom.story`, `loom.story.key_version`, `loom.repo`,
+`loom.result`, `loom.runtime`/`loom.model` when known, and
+`loom.timing_source=tick` — its start and end are the whole tick's, not the
+individual action's — plus a link to the tick's own root. The spans are
+appended to the tick's trace journal and drained like every lifecycle span.
+All of this is best-effort after the tick's child has exited; it never fails
+the tick. Non-Claude runtimes record no transcript actions, so their ticks
+join no story yet.
 
 ## Journals and recovery
 

@@ -24,9 +24,10 @@
 
 ## The policy
 
-**Every GitHub Actions run of every `2amlogic` repository — its runs, jobs,
+**Every GitHub Actions run of every repository of the configured owners
+(default `2amlogic`) — its runs, jobs,
 durations, outcomes, and completed-job logs — is captured in SigNoz** by the
-`loom-daemon ci-telemetry` poller. Capture is **org-scoped**: a new repo or a
+`loom-daemon ci-telemetry` poller. Capture is **owner-scoped**: a new repo or a
 new workflow is in scope on the day it appears, found by auto-discovery, with
 no per-repo enrollment step to forget. **Run/job duration and outcome metrics
 are never excludable** — not per repo, not per workflow, not temporarily. **Log
@@ -97,13 +98,14 @@ enforced only on a host where [Rollout](#rollout) has enabled it.
 
 ## Capture scope & exclusions
 
-- **Scope is the org, not a repo list.** The `org` key of the
-  `autonomous.ciTelemetry` config block (default `2amlogic`) names the captured org; repo
-  discovery walks it on every poll. There is no allowlist of repos to keep in
-  sync.
+- **Scope is a list of owners, not a repo list.** The `owners` key of the
+  `autonomous.ciTelemetry` config block (default `["2amlogic"]`) names the
+  captured organizations **and user accounts** (#9188 — `rjwalters/loom` is
+  user-owned); repo discovery walks each on every poll. There is no allowlist
+  of repos to keep in sync. See [Owners](#owners-orgs-and-users-9188).
 - **Metrics and run/job records are unconditional.** Durations, outcomes
   (success, failure, **cancelled** — a first-class outcome, never noise), and
-  the `ci.run`/`ci.job` records are emitted for every repo in the org. A
+  the `ci.run`/`ci.job` records are emitted for every repo of every owner. A
   config surface that would suppress them for a repo does not satisfy this
   policy. Phase 1's repo-exclusion key (`excludedRepos`) therefore carries the
   same reason requirement and every entry is a **policy exception** reviewed
@@ -289,10 +291,11 @@ signoz README — and is not a prerequisite for this policy.
 
 A `loom-daemon ci-telemetry` poller. Each cycle it:
 
-1. Lists the org's repositories (`GET /orgs/{org}/repos`, paginated). Each
-   page is ETag-cached on disk, so an unchanged org costs `304 Not Modified`
-   responses, which do not count against the rate limit. Archived repos and
-   `excludedRepos` are skipped.
+1. Lists each owner's repositories (`GET /orgs/{o}/repos?type=all` for an
+   organization, `GET /users/{u}/repos?type=owner` for a user; paginated).
+   Each page is ETag-cached on disk, so an unchanged owner costs `304 Not
+   Modified` responses, which do not count against the rate limit. Archived
+   repos and `excludedRepos` are skipped.
 2. Per repo, lists workflow runs created since that repo's **floor**
    (`GET /repos/{o}/{r}/actions/runs?created=>=<floor>`, paginated). The floor
    is the repo's **watermark** or the trailing **24-hour rescan window**,
@@ -310,15 +313,16 @@ rescan window (below the watermark) is re-listed by that window instead.
 
 | Command | Does |
 |---|---|
-| `loom-daemon ci-telemetry --once [--org ORG] [--workspace PATH]` | One poll cycle. Runs whether or not `enabled` is set. |
-| `loom-daemon ci-telemetry status [--json]` | Health, ledger size, per-repo watermarks, records emitted/exported. |
+| `loom-daemon ci-telemetry --once [--owner OWNER]… [--org ORG] [--workspace PATH]` | One poll cycle (`--owner` repeatable; `--org` is the deprecated alias). Runs whether or not `enabled` is set. |
+| `loom-daemon ci-telemetry status [--json]` | Health, each owner (kind, repo count, skip reason), ledger size, per-repo watermarks, records emitted/exported. |
 | Daemon poller | Runs every `intervalSecs` when `autonomous.ciTelemetry.enabled=true`. |
 
 `--once` exit codes:
 
 - `0`: the cycle completed cleanly.
-- `1`: the cycle failed. The printed reason is one of `discovery-failed`,
-  `io-failed`, or `N repo(s) failed` with the first repo's reason.
+- `1`: the cycle failed. The printed reason is one of `discovery-failed`
+  (every owner failed), `io-failed`, or `N repo(s) failed` with the first
+  reason (a skipped owner counts, as `owner X: discovery-failed: …`).
 - `75`: skipped, and the caller must wait. Either another cycle holds this
   host's lock (`busy`), or the org is in a rate-limit backoff (`rate-limited` /
   `backing-off`).
@@ -341,7 +345,8 @@ never shows as healthy:
 | Key | Env override | Default |
 |---|---|---|
 | `enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` (off by default) |
-| `org` | `LOOM_CI_TELEMETRY_ORG` | `"2amlogic"` |
+| `owners` | `LOOM_CI_TELEMETRY_OWNERS` (comma-separated) | `["2amlogic"]`. Orgs and users; see [Owners](#owners-orgs-and-users-9188). |
+| `org` (deprecated) | `LOOM_CI_TELEMETRY_ORG` | Single-owner alias of `owners`, which wins over it at the same tier. |
 | `intervalSecs` | `LOOM_CI_TELEMETRY_INTERVAL_SECS` | `120` |
 | `excludedRepos` | none (committed config only) | `[]`. Each entry is `{"repo": "<name or owner/name>", "reason": "<why>"}`, and `repo` matches case-insensitively. See [Capture scope & exclusions](#capture-scope--exclusions). |
 | `logCaptureEnabled` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED` | `false`. Honoured since phase 2 (#8825); see [Phase 2 reference](#phase-2-reference-completed-job-logs-8825). |
@@ -358,6 +363,35 @@ window, whichever is older (#8898).
 Requests go through `gh api` (`$LOOM_GH_BIN` overrides the binary), with the
 same credentials as every other forge call the daemon makes.
 
+### Owners (orgs and users, #9188)
+
+Precedence is **env > config > default** across tiers, and within one tier
+`owners` wins over `org`: `LOOM_CI_TELEMETRY_OWNERS`, then
+`LOOM_CI_TELEMETRY_ORG`, then config `owners`, then config `org`, then
+`["2amlogic"]`. The config tier is the merged effective config. An empty value
+counts as unset at its tier. Logins are trimmed and de-duplicated
+case-insensitively.
+
+- **Kind.** An owner named through `owners` is probed once per daemon
+  lifetime with `GET /users/{owner}` → `type` (`Organization` or `User`). A
+  failed probe or any other type is never guessed: the owner is skipped this
+  cycle, named in the cycle's errors and in `status`, and probed again next
+  cycle. An owner from the `org` alias (or `--org`) or the default is a
+  **declared organization** and is not probed, so an `org`-only config makes
+  exactly the requests it made before #9188.
+- **Discovery.** Organizations use `orgs/{o}/repos?type=all`, users use
+  `users/{u}/repos?type=owner`. That endpoint lists a user's **public**
+  repos only. Each owner's pages share the one ETag cache, keyed by request
+  path.
+- **Failure.** A rate limit or a rejected credential still aborts the whole
+  cycle. Any other failure skips only that owner. The cycle is
+  `discovery-failed` only when every owner failed.
+- **Unchanged.** The ledger, watermarks, and dedup keys are keyed by
+  `owner/repo` already, so existing state carries over. The rate-limit
+  backoff is still one per host (one token), and the single-captain gate is
+  unchanged. Exclusions should name `owner/repo`, because a bare name
+  matches that repo under every owner.
+
 ### Rate limits
 
 Each interval makes about one discovery request per page, plus one runs
@@ -367,7 +401,7 @@ that the rescan window re-lists costs nothing beyond that page, because the
 ledger answers it without a jobs listing.
 
 A `403` rate-limit response, a secondary limit, or a `429` **backs off the
-whole org**, never a single repo:
+whole poller** (every owner), never a single repo:
 
 - The backoff lasts until `Retry-After` if the response has one, otherwise
   until the `X-RateLimit-Reset` epoch, otherwise exponentially (60s doubling,
