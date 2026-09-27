@@ -1660,65 +1660,84 @@ _strip_closed_issue_building_labels() {
 # parent merge already happened. Runs BEFORE branch deletion so the parent
 # branch ref still resolves as reconcile-stack.sh's rebase <upstream> argument.
 
-# Reconcile (or defer) one discovered child PR. Best-effort; returns 0.
-_reconcile_one_stacked_child() {
-  local child_pr="$1" child_branch="$2" parent_branch="$3"
+# The two decisions here are `loom-daemon merge-pr reconcile-plan` and
+# `merge-pr reconcile-child` (Rust, loom-daemon/src/merge_pr/reconcile.rs —
+# #8191 slice). The plan owns the parent-branch gate, the children-rollup parse
+# and each child's derived issue number; the child verb owns safe/unsafe and the
+# deferral comment's byte-frozen text. Everything with an EFFECT stays here: the
+# live `gh pr list` discovery (never the daemon registry), the uncached `gh api`
+# label read, the reconcile-stack.sh invocation and the #4856 comment post.
+#
+# Why these: the retired shell wrote the `feature/issue-<N>` predicate out TWICE
+# — once as the parent gate, once as the child derivation, 90 lines apart against
+# two different variables — and reached the force-push-authorising answer through
+# three stacked `|| echo '{}'` / `|| true` layers that each turn a failed lookup
+# into the empty string, which `grep -qx` then reports as "no claim". That is the
+# one wrong answer in this file that rebases a branch a Builder still has checked
+# out. The port keeps the same disposition (force-with-lease is the remaining
+# protection) but makes it a decided one, and it is now impossible to match
+# `loom:building-paused` by widening a `grep`.
+#
+# Fail direction: OPEN, like the pre-merge sibling `merge-pr stacked-children`.
+# A missing or older daemon prints no sentinel, and the seam then WARNS and skips
+# auto-reconciliation for this pass — exactly the disposition the pre-existing
+# "reconcile-stack.sh not found" skip already has. This runs after the merge has
+# already happened and cannot make a merge wrong, so it must not be able to stop
+# one; the cost of a skip is the one manual reconcile-stack.sh invocation every
+# message on both routes already prints. That is why it raises no
+# `requires-daemon: merge-pr` floor. Silence is never a route: `reconcile` (the
+# force-pushing one) is reachable only through a positive sentinel.
 
-  # Derive the child ISSUE number from its head branch (feature/issue-<N>) so we
-  # can check its live claim label. A child branch that is not a feature/issue-N
-  # branch has no loom:building claim to race, so it is treated as safe.
-  local child_issue=""
-  if [[ "$child_branch" =~ ^feature/issue-([0-9]+)$ ]]; then
-    child_issue="${BASH_REMATCH[1]}"
-  fi
+# The roll-this-host remediation both skip paths below append. Guarded with
+# `declare -F` exactly as the other fail-open seams (#3747 item 2, #7827,
+# partial-reset, closed-building) are: `_mp_daemon_roll_hint` is defined ~700
+# lines above, OUTSIDE the span test-merge-pr-auto-reconcile.sh extracts and
+# sources, so an unguarded call would put `command not found` into the one
+# message whose whole job is to tell an operator what to do next.
+#
+# One line, like `_mp_daemon_roll_hint` itself: this file is over the file-size
+# ratchet's threshold, so it may shrink but not grow (.loom/docs/file-size-policy.md).
+_mp_reconcile_roll_hint() { declare -F _mp_daemon_roll_hint >/dev/null || return 0; _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)"; }
+
+# Reconcile (or defer) one child PR from the plan. Best-effort; returns 0.
+_reconcile_one_stacked_child() {
+  local child_pr="$1" child_branch="$2" parent_branch="$3" child_issue="$4"
 
   # Fresh (uncached) label read — mirrors _reset_one_partial_issue: use plain
   # `gh api` (not $GH, which may be gh-cached) so a stale cached view cannot mask
-  # a live re-claim. A read failure is treated as "not building" (safe) since the
-  # reconcile itself is best-effort and force-with-lease still protects the branch.
-  local building="false"
-  if [[ -n "$child_issue" ]]; then
-    local issue_json issue_labels
-    issue_json="$(gh api "repos/$REPO_NWO/issues/$child_issue" 2>/dev/null || echo '{}')"
-    issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
-    if printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
-      building="true"
-    fi
-  fi
+  # a live re-claim. Skipped entirely when the plan derived no issue number,
+  # which is the "child branch is not feature/issue-<N>, so no claim to race"
+  # case; the verb reaches the same answer from an empty --child-issue.
+  local issue_labels=""; [[ -z "$child_issue" ]] || issue_labels="$(gh api "repos/$REPO_NWO/issues/$child_issue" 2>/dev/null | jq -r '.labels[]?.name' 2>/dev/null || true)"
 
-  if [[ "$building" == "true" ]]; then
-    # Unsafe: defer, do not rebase.
-    info "Stacked reconcile: child PR #$child_pr (issue #$child_issue) is still loom:building — deferring auto-rebase to avoid racing a live Builder"
-    local ts comment
-    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    comment="## Stacked parent merged — reconciliation deferred
-
-Parent branch \`$parent_branch\` squash-merged, but this child's issue #$child_issue is still \`loom:building\` — a Builder likely has this branch checked out. Auto-reconciliation was **skipped** to avoid racing that in-progress work with an out-of-band \`git rebase --onto\` + \`push --force-with-lease\`.
-
-**What happens next**: once issue #$child_issue is no longer \`loom:building\`, a subsequent parent-merge-triggered pass will reconcile this PR automatically. You can also reconcile it by hand now (from a clean checkout, only once the Builder has finished):
-
-\`\`\`
-./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch
-\`\`\`
-
----
-*Deferred by merge-pr.sh (#3747) at $ts*"
-    # forge_gh_comment_rl_safe (#4856): the REST comments endpoint is shared
-    # by issues and PRs, so the same helper covers this `gh pr comment` call
-    # site's GraphQL rate-limit fallback.
-    forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" 2>/dev/null || \
-      warning "Could not post deferred-reconciliation comment on PR #$child_pr"
-    return 0
-  fi
-
-  # Safe: no live claim — run the existing reconcile script unmodified. Do NOT
-  # re-implement the rebase/force-with-lease/retarget logic inline.
-  info "Stacked reconcile: parent '$parent_branch' merged; reconciling child PR #$child_pr onto the default branch"
-  if "$SCRIPT_DIR/reconcile-stack.sh" "$child_pr" "$parent_branch"; then
-    success "Stacked reconcile: child PR #$child_pr reconciled onto the default branch"
-  else
-    warning "Stacked reconcile: reconcile-stack.sh failed for child PR #$child_pr (rebase conflict, rejected force-with-lease push, or retarget failure). The parent merge is unaffected — reconcile manually: ./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch"
-  fi
+  local out rc=0
+  out="$(printf '%s\n' "$issue_labels" | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" merge-pr reconcile-child --child-pr "$child_pr" --parent-branch "$parent_branch" --child-issue "$child_issue" 2>/dev/null)" || rc=$?
+  case "${out%%$'\n'*}" in
+    "LOOM-RECONCILE-CHILD defer")
+      # Unsafe: defer, do not rebase.
+      info "Stacked reconcile: child PR #$child_pr (issue #$child_issue) is still loom:building — deferring auto-rebase to avoid racing a live Builder"
+      # Everything after the marker is the comment body verbatim, so the text
+      # cannot be reshaped by a line-oriented read on this side.
+      local comment="${out#*$'\nLOOM-RECONCILE-COMMENT\n'}"
+      # forge_gh_comment_rl_safe (#4856): the REST comments endpoint is shared
+      # by issues and PRs, so the same helper covers this `gh pr comment` call
+      # site's GraphQL rate-limit fallback.
+      forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" 2>/dev/null || \
+        warning "Could not post deferred-reconciliation comment on PR #$child_pr"
+      ;;
+    "LOOM-RECONCILE-CHILD reconcile")
+      # Safe: no live claim — run the existing reconcile script unmodified. Do
+      # NOT re-implement the rebase/force-with-lease/retarget logic inline.
+      info "Stacked reconcile: parent '$parent_branch' merged; reconciling child PR #$child_pr onto the default branch"
+      if "$SCRIPT_DIR/reconcile-stack.sh" "$child_pr" "$parent_branch"; then
+        success "Stacked reconcile: child PR #$child_pr reconciled onto the default branch"
+      else
+        warning "Stacked reconcile: reconcile-stack.sh failed for child PR #$child_pr (rebase conflict, rejected force-with-lease push, or retarget failure). The parent merge is unaffected — reconcile manually: ./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch"
+      fi
+      ;;
+    *)
+      warning "Stacked reconcile: SKIPPING child PR #$child_pr — 'loom-daemon merge-pr reconcile-child' exited $rc without a LOOM-RECONCILE-CHILD verdict, so whether a Builder still holds issue #${child_issue:-?} is unknown. Rebasing on a guess could force-push over uncommitted work, so nothing was done. The parent merge is unaffected — reconcile by hand once that is answered: ./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch $(_mp_reconcile_roll_hint)" ;;
+  esac
   return 0
 }
 
@@ -1726,9 +1745,6 @@ Parent branch \`$parent_branch\` squash-merged, but this child's issue #$child_i
 # (or defer) each. Best-effort; returns 0 unconditionally.
 _auto_reconcile_stacked_children() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-
-  # Only a parent PR on a feature/issue-<N> branch can have stacked children.
-  [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
 
   # Prefer the pre-merge snapshot the guard above already captured (#8010
   # item 2) over a fresh post-merge query: GitHub retargets an open child PR
@@ -1739,13 +1755,31 @@ _auto_reconcile_stacked_children() {
   # registry) is only a fallback for when the guard never ran (e.g. this
   # function invoked standalone, as the unit tests do).
   local children_json="${STACKED_CHILDREN_JSON:-}"
-  [[ -n "$children_json" ]] || children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
-    --json number,headRefName 2>/dev/null || echo '[]')"
-  [[ -n "$children_json" ]] || return 0
 
-  local count
-  count="$(echo "$children_json" | jq 'length' 2>/dev/null || echo 0)"
-  [[ "$count" -gt 0 ]] || return 0
+  # AT MOST TWO plan calls, which is what the `for` bounds structurally.
+  #
+  # Pass `gate`: the parent-branch gate. NOT-STACKED is decided from
+  # --parent-branch alone, so feeding it `[]` when no snapshot exists answers
+  # the gate without a forge round trip — which is why the live query below
+  # still costs nothing on an ordinary non-stacked merge. Only a stacked parent
+  # with no snapshot falls through to pass `live` and queries, precisely when
+  # the retired shell queried.
+  #
+  # The gate is also where the fail-OPEN skip is taken, BEFORE the query rather
+  # than after it. An unanswered gate is indistinguishable from NOT-STACKED, so
+  # on a host whose daemon predates these verbs this path runs once per merge;
+  # it must not also spend a `gh pr list` on a rollup nothing will read.
+  local plan rc verdict count _pass bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}"
+  for _pass in gate live; do
+    rc=0; plan="$(printf '%s' "${children_json:-[]}" | "$bin" merge-pr reconcile-plan --parent-branch "$PR_BRANCH" 2>/dev/null)" || rc=$?
+    verdict="${plan%%$'\n'*}"
+    [[ "$verdict" == "LOOM-RECONCILE-PLAN NOT-STACKED" ]] && return 0
+    [[ "$verdict" == "LOOM-RECONCILE-PLAN COUNT "* ]] || { warning "Stacked reconcile: skipping auto-reconciliation for '$PR_BRANCH' — 'loom-daemon merge-pr reconcile-plan' exited $rc without a plan${verdict:+ (it said: $verdict)}. The parent merge is unaffected; reconcile any stacked child by hand: ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH $(_mp_reconcile_roll_hint)"; return 0; }
+    [[ -z "$children_json" ]] || break   # the snapshot (or pass `live`'s query) already answered
+    children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
+      --json number,headRefName 2>/dev/null || echo '[]')"; children_json="${children_json:-[]}"
+  done
+  count="${verdict#LOOM-RECONCILE-PLAN COUNT }"; [[ "$count" -gt 0 ]] || return 0
 
   info "Stacked reconcile: found $count open child PR(s) based on '$PR_BRANCH'"
 
@@ -1754,12 +1788,18 @@ _auto_reconcile_stacked_children() {
     return 0
   fi
 
-  local rows child_pr child_branch
-  rows="$(echo "$children_json" | jq -r '.[] | "\(.number)\t\(.headRefName)"' 2>/dev/null || true)"
-  while IFS=$'\t' read -r child_pr child_branch; do
-    [[ -n "$child_pr" ]] || continue
-    _reconcile_one_stacked_child "$child_pr" "$child_branch" "$PR_BRANCH"
-  done <<< "$rows"
+  local line child_pr child_branch child_issue
+  while IFS= read -r line; do
+    case "$line" in
+      "LOOM-RECONCILE-PLAN CHILD "*)
+        IFS=$'\t' read -r child_pr child_branch child_issue <<<"${line#LOOM-RECONCILE-PLAN CHILD }"
+        [[ -n "$child_pr" ]] || continue
+        _reconcile_one_stacked_child "$child_pr" "$child_branch" "$PR_BRANCH" "$child_issue"
+        ;;
+      "LOOM-RECONCILE-PLAN MALFORMED "*)
+        warning "Stacked reconcile: ignoring an unusable child row from the forge — ${line#LOOM-RECONCILE-PLAN MALFORMED }" ;;
+    esac
+  done <<< "$plan"
 
   return 0
 }
@@ -2890,19 +2930,30 @@ _remove_loom_worktree() {
 # recoverable later (loom-clean, or a future merge that actually closes the
 # issue).
 #
+# The decision — close-target membership, then (only if needed) the live
+# state comparison — is `loom-daemon merge-pr issue-close-gate` (Rust,
+# loom-daemon/src/merge_pr/issue_close_gate.rs — #8191 slice), fed
+# $close_targets on stdin. The fast-path call (no --state) answers from
+# membership alone for the overwhelming common case (`Closes #N`); only when
+# it answers NEED-STATE (exit 3) does this wrapper pay for the extra
+# forge_get_issue_state round trip and call again with --state. Both forge
+# reads stay here.
+#
+# A daemon that cannot decide (missing, older than this slice, or answering
+# off-protocol) is warned about and resolves to PRESERVE — the same fail
+# direction the original in-shell comparison already had for any lookup
+# failure, now also covering "the decision could not be delegated at all".
+#
 # Returns 0 (true — safe to clean up) or 1 (false — preserve the worktree).
 _issue_is_closed_for_cleanup() {
-  local issue_number="$1"
-
-  local close_targets
+  local issue_number="$1" close_targets out rc=0 state
   close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
-  if echo "$close_targets" | grep -qx "$issue_number"; then
-    return 0
-  fi
-
-  local state
-  state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH" 2>/dev/null || true)"
-  [[ "$state" == "CLOSED" ]]
+  out="$(printf '%s\n' "$close_targets" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr issue-close-gate --issue "$issue_number" 2>/dev/null)" || rc=$?
+  [[ $rc -eq 3 && "$out" == "LOOM-ISSUE-CLEANUP NEED-STATE" ]] && { state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH" 2>/dev/null || true)"; rc=0; out="$(printf '%s\n' "$close_targets" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr issue-close-gate --issue "$issue_number" --state "$state" 2>/dev/null)" || rc=$?; }
+  [[ $rc -eq 0 ]] && return 0
+  [[ $rc -eq 1 ]] && return 1
+  warning "The async-close-race cleanup gate for issue #$issue_number (#4186) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr issue-close-gate' exited $rc rather than 0/1 (a loom-daemon predating #8191's slice has no such verb). Preserving the worktree rather than guessing (fail-unsafe-to-preserve) — if #$issue_number is actually closed, a future check will clean it up, or remove it by hand once confirmed. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+  return 1
 }
 
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then

@@ -146,7 +146,6 @@ test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-queued-stacked-children.sh
-test-merge-pr-auto-reconcile.sh
 test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-daemon-version-floor.sh
 test-merge-pr-help.sh
@@ -154,7 +153,6 @@ test-merge-pr-merge-method.sh
 test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-unstable-fallback.sh
 test-merge-pr-wait-for-checks-empty-settle.sh
-test-merge-pr-worktree-path.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
