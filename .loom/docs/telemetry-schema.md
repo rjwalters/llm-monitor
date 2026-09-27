@@ -1143,6 +1143,7 @@ A point-in-time view of the multi-account token pool (host-level — no `repo` /
       "provider": "claude",
       "rank": 0,
       "usage_fraction": 0.42,
+      "usage_fraction_weekly": 0.63,
       "limit_window_reset_at": "2026-07-30T18:00:00Z",
       "exhausted": false
     },
@@ -1158,8 +1159,8 @@ A point-in-time view of the multi-account token pool (host-level — no `repo` /
 }
 ```
 
-Per account, `rank` / `usage_fraction` / `limit_window_reset_at` are omitted when
-unknown; `provider` and `exhausted` are always present. `provider` is the
+Per account, `rank` / `usage_fraction` / `usage_fraction_weekly` /
+`limit_window_reset_at` are omitted when unknown; `provider` and `exhausted` are always present. `provider` is the
 lowercase `AccountProvider` name (`claude`, `codex`, …) and is what a consumer
 groups on to show each provider's availability on its own — a reader MUST treat
 a row with no `provider` (a daemon that predates this field) as `claude`, which
@@ -1169,7 +1170,13 @@ is the only pool such a daemon ever sampled.
 of its pipe-delimited columns (`name|status|5h_util|limit_reset` — see
 [`token-pool.md`](token-pool.md)): `rank` is the row's position, `usage_fraction`
 is `5h_util`, `exhausted` is derived from `status`, and `limit_window_reset_at`
-is `limit_reset`.
+is `limit_reset`. `usage_fraction_weekly` (#9005) is the rolling 7-day window's
+utilization (`0..1`), read from the `.ranking.weekly.json` sidecar the same
+`tokens check --ranking` run writes beside `.ranking` (`.ranking` has no room
+for a fifth column — see `tokens_pool/ranking_weekly.rs`). It is absent when
+the probe returned no 7-day reading, when the sidecar is missing or
+unparseable, or when `.ranking` was rewritten after it (a stale weekly value is
+never paired with a newer ranking).
 
 **Every other provider's rows** (`codex`, …) come from the multi-provider account
 registry (`.loom/accounts.json` + the machine-level profile root) joined with the
@@ -1177,7 +1184,24 @@ provider-health state file: one row per *enabled* account, `exhausted` is the
 daemon's own account-wide eligibility verdict (`ReauthRequired`, or a live
 `cooldown_until` hold), and `limit_window_reset_at` is that hold's deadline when
 there is one. These pools measure no usage fraction and have no ranking, so
-`rank` / `usage_fraction` are always absent for them — absent, not `0`.
+`rank` / `usage_fraction` / `usage_fraction_weekly` are always absent for them —
+absent, not `0`. Neither is a configured plan limit substituted: a provider with
+no utilization source (Codex, OpenCode/Z.ai, Kimi) reports *unknown*.
+
+Over OTLP each account row becomes gauges labelled `account`, `provider` and
+(Claude only) `rank`, one data point per known value — an unknown field emits
+no point, so a missing series means *unknown*, never a measured `0`:
+
+| Metric | Unit | Source field |
+|---|---|---|
+| `loom.tokens.usage_fraction` | `1` | `usage_fraction` (5-hour window) |
+| `loom.tokens.usage_fraction_weekly` | `1` | `usage_fraction_weekly` (rolling 7-day window, #9005) |
+| `loom.tokens.exhausted` | `1` | `exhausted` (always emitted) |
+
+Standing SigNoz queries over these — per-account 5h and weekly utilization,
+last week's used fraction of subscription capacity per provider, and idle
+headroom at each weekly reset — are in
+`defaults/observability/signoz/quota-utilization.sql`.
 
 `limit_window_reset_at` is the instant the window **currently gating that
 account** rolls over — the 7-day window for an `exhausted` account (when it

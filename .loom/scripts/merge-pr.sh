@@ -158,19 +158,40 @@ error_head_moved() {
   exit 3
 }
 
-# #5579: detect a head-SHA-mismatch response from either forge's merge API.
-# Distinct from the existing "Base branch was modified" matcher below (that
-# one means the PR's BASE fell behind and a rebase-and-retry is correct;
-# this one means the PR's OWN head moved, so retrying would either fail again
-# or silently merge a different diff than the one that was approved). String
-# provenance is documented on forge_merge_pr in lib/forge-helpers.sh —
-# GitHub REST and Gitea are verified against each forge's own source/spec; the
-# GitHub GraphQL (auto-merge) string, from the retired server-side arm (#8427),
-# is best-effort and kept only so an operator-armed merge's error still
-# classifies.
-_is_head_mismatch_response() {
-  echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
-}
+# Which route a FAILED merge's forge error TEXT sends the retry loop below down
+# (#8191 slice). Prints one of: merge-in-progress (HTTP 405), head-mismatch
+# (#5579 — the PR's OWN head moved past the SHA we gated on, so retrying would
+# either fail again or silently merge a diff Judge never approved),
+# base-modified (the PR's BASE fell behind; rebase-and-retry is correct), other
+# (stop). String provenance stays documented on forge_merge_pr in
+# lib/forge-helpers.sh — GitHub REST and Gitea verified against each forge's own
+# source/spec, the GitHub GraphQL `expectedHeadOid` spelling best-effort from the
+# retired server-side arm (#8427).
+#
+# This replaces three separate `grep` matchers in three separate `if` blocks
+# whose relative ORDER was the entire safety property: a head-mismatch reaching
+# the base-modified arm answers a moved head with forge_update_branch and another
+# merge attempt. Nothing asserted that order except an `awk` scan over THIS
+# FILE's source text looking for which `grep` appeared first. It is now one
+# ordered `match` in loom-daemon/src/merge_pr/response.rs, pinned by a
+# differential against the frozen retired ladder
+# (loom-daemon/tests/merge_pr_response_differential.rs) and by the precedence
+# unit tests beside the module. Asymmetric case-sensitivity is preserved
+# verbatim: the head-mismatch alternation was `grep -Ei`, its two siblings bare
+# `grep -q`.
+#
+# Returns 3 when no route could be OBTAINED — which the caller must never
+# collapse into the `other` route. Fails CLOSED there, deliberately: the routes
+# are not interchangeable, so an unresolvable binary leaves only "guess a route"
+# or "refuse and say which happened", and only the second is distinguishable
+# from a merge verdict afterwards. It cannot stop a healthy merge — a merge that
+# SUCCEEDS never reaches this function; only one that already failed does.
+#
+# `printf '%s'`, not the retired `echo "$1"`: bash's `echo` silently swallows an
+# argument that is exactly -n/-e/-E, and the response is arbitrary forge bytes.
+# The differential's corpus includes those three inputs, so that substitution is
+# checked to change no answer rather than assumed equivalent.
+_classify_merge_response() { local _k; _k="$(printf '%s' "$1" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr classify-response 2>/dev/null)" || _k=""; [[ "$_k" == "LOOM-MERGE-RESPONSE "* ]] || return 3; printf '%s' "${_k#LOOM-MERGE-RESPONSE }"; }
 
 # #8164: record that THIS script pushed to the head branch, via
 # forge_update_branch() ("Base branch was modified" retry). Deliberately does
@@ -2283,9 +2304,17 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
     break
   fi
 
+  # Classify the response ONCE, before any of the three routes below (#8191
+  # slice). Placed after the merged-despite-error recheck above deliberately: that
+  # one is a forge round-trip rather than a string test, and a PR that merged
+  # underneath us has no route to choose. A helper failure here is reported as a
+  # HELPER failure — never folded into the terminal "other" route, which would
+  # make "could not classify" indistinguishable from "no marker matched".
+  MERGE_RESPONSE_KIND="$(_classify_merge_response "$MERGE_RESPONSE")" || error "Merge blocked: PR #$PR_NUMBER's merge-response classifier could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr classify-response' returned no LOOM-MERGE-RESPONSE verdict (missing binary, or one predating the subcommand). The routes it chooses between are not interchangeable: one retries after syncing the base, and one must NEVER retry a head that moved past the approved SHA (#5579). An unobtainable classification therefore refuses rather than guesses. This is a helper failure, NOT a merge verdict — nothing about this PR was rejected. The forge reported: $MERGE_RESPONSE. $(_mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+
   # Check for "Merge already in progress" (HTTP 405)
   # This happens when auto-merge triggers at the same time as our merge attempt
-  if echo "$MERGE_RESPONSE" | grep -q "Merge already in progress"; then
+  if [[ "$MERGE_RESPONSE_KIND" == "merge-in-progress" ]]; then
     info "Merge already in progress (HTTP 405), waiting for completion..."
     sleep 5
     RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
@@ -2306,16 +2335,19 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
   # NOT retry-and-merge: retrying would either fail again (session still
   # pushing) or silently squash a different diff than the one Judge approved.
   # Exit 3 so the caller (Champion) re-queues instead of treating this as a
-  # failure. See error_head_moved()/_is_head_mismatch_response() above.
+  # failure. See error_head_moved()/_classify_merge_response() above.
   # Since #8164, via _head_moved_or_resync(): a mismatch caused by this run's
   # own base-sync earns exactly one re-read-and-retry; anything else is the
   # same exit-3 re-queue as before.
-  if _is_head_mismatch_response "$MERGE_RESPONSE"; then
+  # This arm MUST precede the base-modified arm below; since #8191 that
+  # precedence lives in the classifier's own ordered match, not in the order of
+  # these two `if`s, so a reorder here cannot change which route is taken.
+  if [[ "$MERGE_RESPONSE_KIND" == "head-mismatch" ]]; then
     _head_moved_or_resync "$MERGE_RESPONSE" && continue
   fi
 
   # Check for stale branch error (base branch was modified)
-  if echo "$MERGE_RESPONSE" | grep -q "Base branch was modified"; then
+  if [[ "$MERGE_RESPONSE_KIND" == "base-modified" ]]; then
     if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
       info "Branch is behind base branch, updating... (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)"
 

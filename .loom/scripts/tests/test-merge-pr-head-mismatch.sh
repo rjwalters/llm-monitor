@@ -19,25 +19,37 @@
 #      was retired by #8427; the native `loom-daemon forge auto-merge`
 #      verb's `expectedHeadOid` threading is covered by forge_cmd.rs's own
 #      unit tests.
-#   2. The merge-pr.sh classifier (_is_head_mismatch_response) and exit-code
+#   2. The merge-pr.sh classifier (_classify_merge_response) and exit-code
 #      helper (error_head_moved): extracted and unit-tested directly, the
 #      same "extract from source" strategy test-merge-pr-auto-reconcile.sh
 #      uses, so the test stays in lockstep with the script. Confirms the
-#      classifier fires on the verified GitHub REST / Gitea strings, a
-#      best-effort GraphQL pattern, and does NOT fire on the pre-existing,
-#      semantically distinct "Base branch was modified" string (that one
-#      means "rebase onto base and retry" — conflating the two would either
-#      retry forever against a moving target or silently merge a different
-#      diff than the one Judge approved).
+#      classifier routes the verified GitHub REST / Gitea strings and a
+#      best-effort GraphQL pattern to `head-mismatch`, and does NOT route the
+#      pre-existing, semantically distinct "Base branch was modified" string
+#      there (that one means "rebase onto base and retry" — conflating the two
+#      would either retry forever against a moving target or silently merge a
+#      different diff than the one Judge approved).
+#
+#      Since #8191 the classification itself is Rust
+#      (loom-daemon/src/merge_pr/response.rs) and `_classify_merge_response` is
+#      the shell seam onto it. Every fixture below is UNCHANGED; only the
+#      assertion's shape moved, from "the extracted `grep` predicate returns
+#      true" to "the extracted shell function, driving the REAL binary, prints
+#      the head-mismatch route". That is strictly stronger — it exercises the
+#      shipped implementation through its real caller rather than a `grep` copy
+#      (defaults/docs/verification-recipes.md §6, "verify the CALL SHAPE") —
+#      and it additionally pins the three routes the old boolean could not
+#      distinguish at all, since `false` used to mean "405, base-modified, or
+#      nothing" indiscriminately.
 #   3. Source-wiring: merge-pr.sh threads $MERGE_PRECONDITION_SHA into the
-#      merge call, and its retry loop checks the new classifier BEFORE the
-#      existing "Base branch was modified" retry branch (ordering matters:
-#      the two matchers must stay mutually exclusive, but a future edit that
-#      accidentally reorders them could still cause the "Base branch was
-#      modified" retry to eat a head-mismatch case first). Since #8410 there
-#      is only ONE merge call — the server-side auto-merge arm, whose
-#      precondition expired the moment it was armed, is gone — and `--auto`
-#      additionally re-reads the head after its check-settle wait
+#      merge call, and the head-mismatch route is taken before the
+#      base-modified one. Since #8191 that precedence is no longer a property
+#      of this file's statement ORDER — it is the classifier's own ordered
+#      match — so the `awk` source-order scan that used to assert it is retired
+#      here with a named successor; see the `retired()` record in Part 3. Since
+#      #8410 there is only ONE merge call — the server-side auto-merge arm,
+#      whose precondition expired the moment it was armed, is gone — and
+#      `--auto` additionally re-reads the head after its check-settle wait
 #      (_revalidate_merge_guards) so a mid-wait force-push re-queues (exit 3)
 #      instead of being merged over.
 #
@@ -59,11 +71,25 @@ FORGE_HELPERS_SRC="$HELPERS_DIR/lib/forge-helpers.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW_LABEL='\033[1;33m'
 NC='\033[0m'
 
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
+
+# An assertion that CANNOT survive the port, retired under the three-part test
+# in defaults/docs/verification-recipes.md §6 (the convention #8184 introduced).
+# Printed, not deleted: a reader must be able to see what was removed, why it
+# can never be true again, and what proves the property now. Counted as run so
+# the totals stay honest.
+retired() { # <what> <property> <why-structural> <successor>
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${YELLOW_LABEL}RETIRED${NC}: $1"
+    echo "      property:   $2"
+    echo "      structural: $3"
+    echo "      successor:  $4"
+}
 
 assert_eq() {
     local expected="$1" actual="$2" msg="$3"
@@ -176,19 +202,31 @@ rm -f "$CURL_ARGS_FILE"
 # unit-tested directly (same strategy as test-merge-pr-auto-reconcile.sh).
 # ============================================================================
 echo ""
-echo "Testing _is_head_mismatch_response / error_head_moved (extracted)..."
+echo "Testing _classify_merge_response / error_head_moved (extracted)..."
+
+# Pin the REAL binary the extracted seam shells out to. Fatal rather than a
+# skip, per lib/require-daemon-bin.sh's own rationale: the fixtures below are
+# the evidence that the port preserved a deleted `grep` predicate's behaviour,
+# and a suite that SKIPped itself would delete that evidence while reporting
+# green.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 
 CLASSIFIER_FILE="$(mktemp)"
+# `_classify_merge_response` is a single dense line (merge-pr.sh is
+# ratchet-frozen and `shell-budget --check` refuses any growth of the portable
+# pool), so it is captured by `print; next` rather than the brace-matching
+# error_head_moved needs — the same split test-merge-pr-head-sync-retry.sh makes
+# for _refresh_precondition_sha.
 awk '
   /^error_head_moved\(\) \{/ { capture_error=1; capture_error_open=1 }
   capture_error { print; if (/^}/) capture_error=0 }
-  /^_is_head_mismatch_response\(\) \{/ { capture=1 }
-  capture { print }
-  /^}/ && capture { capture=0 }
+  /^_classify_merge_response\(\) \{/ { print; next }
 ' "$MERGE_PR_SRC" > "$CLASSIFIER_FILE"
 
-if ! grep -q '_is_head_mismatch_response()' "$CLASSIFIER_FILE"; then
-    echo -e "${RED}FATAL${NC}: could not extract _is_head_mismatch_response from $MERGE_PR_SRC" >&2
+if ! grep -q '_classify_merge_response()' "$CLASSIFIER_FILE"; then
+    echo -e "${RED}FATAL${NC}: could not extract _classify_merge_response from $MERGE_PR_SRC" >&2
     exit 2
 fi
 if ! grep -q 'error_head_moved()' "$CLASSIFIER_FILE"; then
@@ -206,7 +244,8 @@ YELLOW=''
 # shellcheck disable=SC1090
 source "$CLASSIFIER_FILE"
 
-# Positive fixtures: MUST fire.
+# Positive fixtures: MUST route to head-mismatch. Fixtures verbatim from before
+# the #8191 port; only the assertion's shape changed (see the header's Part 2).
 positive_fixtures=(
     "github_rest:Error: Head branch was modified. Review and try the merge again. (HTTP 409)"
     "gitea:{\"message\":\"head out of date\",\"url\":\"https://gitea.example.com/api/v1/...\"}"
@@ -215,37 +254,80 @@ positive_fixtures=(
 for entry in "${positive_fixtures[@]}"; do
     name="${entry%%:*}"
     value="${entry#*:}"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if _is_head_mismatch_response "$value"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: _is_head_mismatch_response fires on $name"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: _is_head_mismatch_response missed $name ('$value')"
-    fi
+    assert_eq "head-mismatch" "$(_classify_merge_response "$value")" \
+      "_classify_merge_response routes $name to head-mismatch"
 done
 
-# Negative fixtures: MUST NOT fire — especially the pre-existing "Base branch
-# was modified" string, which triggers the OLD retry-and-update-branch path.
-# Conflating the two would either retry forever against a moving head or
-# silently merge a diff different from the one Judge approved.
+# Negative fixtures: MUST NOT route to head-mismatch — especially the
+# pre-existing "Base branch was modified" string, which triggers the
+# retry-and-update-branch path. Conflating the two would either retry forever
+# against a moving head or silently merge a diff different from the one Judge
+# approved.
+#
+# Each now asserts the EXACT route rather than merely "not head-mismatch". The
+# retired boolean could not tell these four apart at all — `false` meant "405,
+# base-modified, or no marker" indiscriminately — so this is discriminating
+# power the port makes available, not a weakening.
 negative_fixtures=(
-    "base_modified:Error: Base branch was modified. Review and try the merge again. (HTTP 409)"
-    "merge_in_progress:Merge already in progress"
-    "clean_status:Pull request Pull request is in clean status (enablePullRequestAutoMerge)"
-    "unstable_status:Pull request Pull request is in unstable status (enablePullRequestAutoMerge)"
+    "base_modified:base-modified:Error: Base branch was modified. Review and try the merge again. (HTTP 409)"
+    "merge_in_progress:merge-in-progress:Merge already in progress"
+    "clean_status:other:Pull request Pull request is in clean status (enablePullRequestAutoMerge)"
+    "unstable_status:other:Pull request Pull request is in unstable status (enablePullRequestAutoMerge)"
 )
 for entry in "${negative_fixtures[@]}"; do
     name="${entry%%:*}"
-    value="${entry#*:}"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if _is_head_mismatch_response "$value"; then
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: _is_head_mismatch_response false-fired on $name (would misroute the pre-existing retry path)"
-    else
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: _is_head_mismatch_response correctly ignores $name"
+    rest="${entry#*:}"
+    want="${rest%%:*}"
+    value="${rest#*:}"
+    assert_eq "$want" "$(_classify_merge_response "$value")" \
+      "_classify_merge_response routes $name to $want, not head-mismatch"
+done
+
+# The route the two SHA-shaped arms cannot both take. A response naming BOTH
+# branches must go to head-mismatch: routing it to base-modified would answer a
+# head that moved past the approved SHA with forge_update_branch and another
+# merge attempt. In the shell this was a property of which `grep` appeared first
+# in merge-pr.sh; it is now the classifier's own ordered match, and this drives
+# that through the real seam rather than reading source text.
+assert_eq "head-mismatch" \
+  "$(_classify_merge_response "Error: Base branch was modified.
+Error: Head branch was modified. (HTTP 409)")" \
+  "a response naming BOTH branches routes to head-mismatch (precedence, through the real binary)"
+assert_eq "head-mismatch" \
+  "$(_classify_merge_response "Error: Head branch was modified. (HTTP 409)
+Error: Base branch was modified.")" \
+  "...and in the other textual order, so the answer is not an artifact of which marker comes first"
+
+# The fail-CLOSED contract of the seam itself. A binary that cannot answer must
+# make `_classify_merge_response` return non-zero, so merge-pr.sh's caller
+# refuses and SAYS it was a helper failure — never silently yield the terminal
+# `other` route, which would be indistinguishable from "no marker matched".
+#
+# Exercised at the real `set -euo pipefail` the production script runs under
+# (verification-recipes.md §6, "verify the CALL SHAPE"): a unit test of a
+# refusal proves the function refuses, not that anything refuses. The hazard is
+# specific — `x="$(cmd)"` adopts cmd's status under `set -e`, and the seam is a
+# PIPELINE, so pipefail decides whether the `|| _k=""` fallback is even reached.
+for shape in "absent:$STUB_DIR/does-not-exist" "stale:$STUB_DIR/stale-daemon"; do
+    label="${shape%%:*}"
+    binpath="${shape#*:}"
+    if [[ "$label" == "stale" ]]; then
+        # Knows --version, does not know the subcommand — exactly what clap
+        # does on a binary predating the port.
+        printf '%s\n' '#!/usr/bin/env bash' \
+            '[[ "${1:-}" == "--version" ]] && { echo "loom-daemon 0.19.161"; exit 0; }' \
+            'echo "error: unrecognized subcommand" >&2; exit 2' > "$binpath"
+        chmod +x "$binpath"
     fi
+    rc=0
+    out="$(
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        source "$CLASSIFIER_FILE"
+        LOOM_DAEMON_BIN="$binpath" _classify_merge_response "Error: Base branch was modified."
+    )" || rc=$?
+    assert_eq "3" "$rc" "_classify_merge_response fails CLOSED on a $label daemon (rc 3, not a route)"
+    assert_eq "" "$out" "_classify_merge_response prints no route on a $label daemon (silence is never 'other')"
 done
 
 # error_head_moved must exit 3 (distinct from error()'s exit 1), per the
@@ -299,15 +381,10 @@ else
     echo -e "  ${RED}FAIL${NC}: could not confirm MERGE_PRECONDITION_SHA's uncached-read derivation"
 fi
 
-# Ordering: in BOTH loops, the new classifier must appear BEFORE the existing
-# "Base branch was modified" grep, so a future accidental reorder can't let
-# the base-modified retry path eat a head-mismatch response first.
-sync_loop_order=$(awk '
-  /^for MERGE_ATTEMPT in \$\(seq 1 \$MAX_MERGE_RETRIES\); do/ { infor=1 }
-  infor && /_is_head_mismatch_response "\$MERGE_RESPONSE"/ { print "mismatch"; exit }
-  infor && /grep -q "Base branch was modified"/ { print "base_modified"; exit }
-' "$MERGE_PR_SRC")
-assert_eq "mismatch" "$sync_loop_order" "synchronous retry loop checks the head-mismatch classifier before 'Base branch was modified'"
+retired "the awk source-order scan asserting _is_head_mismatch_response appeared before the 'Base branch was modified' grep inside the MERGE_ATTEMPT loop" \
+  "A head-SHA-mismatch response must never be routed into the base-modified arm. That arm answers the failure with forge_update_branch and another merge attempt — i.e. it spends an irreversible operation on a head that has moved past the SHA the approving review described (#5579)." \
+  "Both greps are gone. There is no longer a pair of 'if' blocks whose relative order decides the route: merge-pr.sh classifies ONCE into a route token, and the precedence lives in a single ordered 'match' in loom-daemon/src/merge_pr/response.rs::classify. The two arms in the loop now test disjoint string values, so reordering them cannot change any outcome — the property this scan protected has become unrepresentable rather than merely guarded. (A source scan could not have asserted it anyway once the matchers left the file.)" \
+  "loom-daemon/src/merge_pr/response/tests.rs::head_mismatch_wins_over_base_modified and ::merge_in_progress_wins_over_everything assert the precedence directly, in both textual orders; loom-daemon/tests/merge_pr_response_differential.rs replays every ORDERED PAIR of the five markers under three separators against the frozen retired grep ladder (tests/fixtures/merge-pr-response-retired.sh) and additionally proves, in swapping_the_two_sha_routes_would_be_caught, that its corpus distinguishes the correct ladder from a reordered one. Part 2 of THIS suite drives the same precedence through the real binary via _classify_merge_response. Strictly stronger: the scan checked where a line SAT; these check what the classifier ANSWERS."
 
 # The `--auto` path no longer has a retry loop of its own (#8410); instead it
 # detects a head that moved DURING its check-settle wait, proactively, before

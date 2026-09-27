@@ -431,6 +431,14 @@ It fires when `starved{state="ready"}` stays above 0 on a host for 15 min.
 Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
+
+**Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
+gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
+and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
+`.ranking.weekly.json` sidecar `tokens check --ranking` writes). Providers with
+no utilization source emit neither — absent, not `0`. Standing queries for
+per-account utilization, idle headroom at weekly reset, and last week's used
+capacity per provider are in `defaults/observability/signoz/quota-utilization.sql`.
 Completed-sweep phase durations are covered by the cycle-time rollup.
 
 **Dispatch refusals, turnaround and stage dwell (#8907, #8929).** Typed

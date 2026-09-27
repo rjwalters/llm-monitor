@@ -4336,6 +4336,7 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 | `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
+| `autonomous.autoUpdate.rollStallCooldownSecs` | `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS` | `21600` (6h) | Bounds the `rollStallDeadlines` suppression above in TIME as well as by the `in_flight == 0` sample (#9010): once a standing unsatisfiability declaration has stood for this long, it is dropped and the next tick arms a roll for **one** more bounded attempt — if the host still cannot drain, the detector re-declares after `rollStallDeadlines` more deadlines rather than cycling, so the cost is one paused-dispatch budget per cooldown period instead of unbounded staleness on a host whose `in_flight == 0` sample never lands. Zero/invalid → default, exactly like `rollStallDeadlines`: a `0` would clear a declaration on the tick it was made, re-entering #8998's livelock through the knob. Set it very large to make the retry effectively unreachable |
 | `autonomous.ciTelemetry.enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` | Periodic GitHub Actions run/job capture (#8824, phase 2 #8825). Read-only observer: it can never change a dispatch, claim, or merge decision. **Restart required** — `spawn_task` resolves the whole block once, before the poller task is spawned; it is never re-read inside the poll loop. See [`ci-observability.md`](ci-observability.md) |
 | `autonomous.ciTelemetry.owners` | `LOOM_CI_TELEMETRY_OWNERS` (comma-separated) | `["2amlogic"]` | Orgs **and user accounts** whose repos are auto-discovered and polled (#9188). Each kind comes from `GET /users/{owner}`, probed once per daemon lifetime. Wins over `org` at the same tier. Empty → unset. **Restart required** — same one-time `spawn_task` resolution as `enabled` |
 | `autonomous.ciTelemetry.org` | `LOOM_CI_TELEMETRY_ORG` | — | Deprecated single-owner alias of `owners`: one declared organization, not probed. Empty → unset. **Restart required** |
@@ -9359,24 +9360,33 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   primitive a supersede uses, so dispatch (and role spawns) resume and #6007's
   bookkeeping is fully reset — and **no new roll is armed** until in-flight is
   observed at zero. **Be precise about what clears it**, because "self-clearing"
-  is easy to over-read: the declaration is dropped only by an auto-update tick
-  that *samples* `in_flight == 0`, i.e. on the `autoUpdate.intervalSecs` cadence
-  (default 900s) and **with dispatch running**. That is strictly harder to hit
-  than the drain's own quiescence watch, which is continuous *and* observes a
-  paused dispatcher where in-flight can only fall: once dispatch resumes, a
-  cap-12 dispatcher refills the in-flight set as soon as the long sweep ends, so
-  a 900s sample can miss every lull and the host can stay un-updated
-  indefinitely. There is no time-based retry — the trade this makes is
-  *unbounded paused dispatch* for *unbounded staleness on a permanently-busy
-  host*, which is the better of the two (dispatch and role spawns come back, and
-  the reason is named), but it is not "it fixes itself shortly". A bounded
-  cooldown retry is tracked separately in #9010. The finding is logged at WARN,
-  published as `auto_update_note`, recorded as `drain_note`, and emitted on the
-  bus as `daemon.drain.roll_unsatisfiable`; it names the deadline count, the
-  in-flight floor, how long the **stalled episode** has run (which spans ticks
-  with nothing armed — it is not the live roll's armed duration), and the three
-  operator actions (`loom-daemon list` to find the sweep, `loom-daemon cancel
-  --sweep <id>`, or `restart --drain --force-after-timeout` to force through).
+  is easy to over-read: the *fast path* is an auto-update tick that *samples*
+  `in_flight == 0`, i.e. on the `autoUpdate.intervalSecs` cadence (default 900s)
+  and **with dispatch running**. That is strictly harder to hit than the drain's
+  own quiescence watch, which is continuous *and* observes a paused dispatcher
+  where in-flight can only fall: once dispatch resumes, a cap-12 dispatcher
+  refills the in-flight set as soon as the long sweep ends, so a 900s sample can
+  miss every lull. **The declaration also expires on TIME (#9010).** Once it has
+  stood for `rollStallCooldownSecs` (default 21600s / 6h; env
+  `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`, `env > config > default`, a
+  zero/invalid value dropped on both tiers exactly like `rollStallDeadlines`,
+  since a `0` would clear a declaration on the tick it was made) the whole
+  episode is dropped and the next tick arms a roll normally, for **one** more
+  bounded attempt. If the host still cannot drain, the detector re-declares
+  after `rollStallDeadlines` more deadlines rather than cycling, so the cost is
+  one bounded paused-dispatch budget per cooldown period, not a continuous one —
+  staleness is **bounded**, not indefinite. A cooldown-released retry logs its
+  own WARN (`RELEASING ONE BOUNDED RETRY`) naming how many cooldown retries have
+  already been spent since the host was last seen idle; that count is zeroed by
+  the next `in_flight == 0` sample, so a host that recovers and later stalls
+  again starts from "retry 1". The finding is logged at WARN, published as
+  `auto_update_note`, recorded as `drain_note`, and emitted on the bus as
+  `daemon.drain.roll_unsatisfiable`; it names the deadline count, the in-flight
+  floor, how long the **stalled episode** has run (which spans ticks with
+  nothing armed — it is not the live roll's armed duration), the cooldown
+  window and retries already spent, and the three operator actions
+  (`loom-daemon list` to find the sweep, `loom-daemon cancel --sweep <id>`, or
+  `restart --drain --force-after-timeout` to force through).
   **The fail-safe is untouched: no sweep is ever cancelled**, and the pre-update
   binary keeps running — the change trades a silent indefinite livelock for one
   loud, actionable state, not for a cancelled sweep. Deliberately narrow in the
@@ -9901,11 +9911,12 @@ below.
 
 **Opt-in, default OFF** (it has side effects on the running process). Enable via
 `autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence, settle
-window, stampede-gate deadline, and unsatisfiable-drain threshold with
+window, stampede-gate deadline, and unsatisfiable-drain threshold/cooldown with
 `intervalSecs` (default 900) / `settleSecs` (default 600) / `deferDeadlineSecs`
-(default 21600) / `rollStallDeadlines` (default 3). All five knobs resolve
-**env > config > default** through `config_resolver`, so the `.loom-project/`
-tier is honored like every other `autonomous.*` block.
+(default 21600) / `rollStallDeadlines` (default 3) / `rollStallCooldownSecs`
+(default 21600, #9010). All six knobs resolve **env > config > default** through
+`config_resolver`, so the `.loom-project/` tier is honored like every other
+`autonomous.*` block.
 
 **Exactly one loop per daemon process** — not a `spawn_multi_*` per-workspace
 fan-out. Its subject is the daemon process itself (one binary, one source

@@ -859,7 +859,11 @@ decisions shape how it is consumed:
   avoid. Instead, `monitor.rs` writes `.ranking.classes.json` beside
   `.ranking` (`tokens_pool::monitor_classes`, its own `schema` field), read
   only by the observability path — `.ranking`'s four-field shape and every
-  existing reader are untouched.
+  existing reader are untouched. The per-account weekly (7-day) utilization
+  follows the same rule (#9005): every `tokens check --ranking` run writes
+  `.ranking.weekly.json` (`tokens_pool::ranking_weekly`), read only by the
+  telemetry collector for `loom.tokens.usage_fraction_weekly`, and ignored
+  once `.ranking` is rewritten after it.
 - **Coverage stays honest.** Only the class actually in use appears in
   `models` (today: `fable` only). An absent class reads as "no data", never
   coerced to a fabricated `0.0` — `MonitorAccount::class_utilization` is a map,
