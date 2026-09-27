@@ -1010,7 +1010,31 @@ struct UsageChartWindow: View {
         return (minutesToExhaust, limitName)
     }
 
+    /// Discards a projection whose exhaustion instant lands at or after the
+    /// window's own reset (#221). `resetAt == nil` means the window's reset
+    /// is unknown, not that it never resets, so an estimate is kept in that
+    /// case rather than assumed safe or discarded — the historical
+    /// (pre-#221) behavior for a window with no reset data.
+    private func projectionPrecedesReset(
+        minutes: Double,
+        resetAt: Date?,
+        now: Date = Date()
+    ) -> Bool {
+        guard let resetAt = resetAt else { return true }
+        let exhaustionInstant = now.addingTimeInterval(minutes * 60)
+        return exhaustionInstant < resetAt
+    }
+
     func timeUntilCreditsRunOut() -> String? {
+        // A stale reading's rate is no longer true — the account may have
+        // stopped polling for any reason (#148), so any projection built from
+        // its history is equally stale. Suppress rather than show a frozen
+        // extrapolation.
+        if let oauthPoller = oauthPoller,
+           AccountFreshness.isStale(lastUpdated: account.lastUpdated, pollInterval: oauthPoller.pollInterval) {
+            return nil
+        }
+
         // Build session and weekly data point arrays
         var sessionPoints: [(Date, Double)] = []
         var weeklyPoints: [(Date, Double)] = []
@@ -1025,8 +1049,23 @@ struct UsageChartWindow: View {
         }
 
         // Estimate time for each limit type
-        let sessionEstimate = estimateTimeToLimit(points: sessionPoints, limitName: "session limits")
-        let weeklyEstimate = estimateTimeToLimit(points: weeklyPoints, limitName: "weekly limits")
+        var sessionEstimate = estimateTimeToLimit(points: sessionPoints, limitName: "session limits")
+        var weeklyEstimate = estimateTimeToLimit(points: weeklyPoints, limitName: "weekly limits")
+
+        // Discard any estimate whose projected exhaustion instant lands at or
+        // after its own window's reset (#221) — an impossible projection
+        // (e.g. "limited in ~2.3 days" for a session window resetting in 40
+        // minutes). The reset comes from the latest polled reading, not from
+        // `fullDataPoints`, which carries no reset field.
+        let latestRateLimit = store.latestUsage[account.id]?.rateLimit
+        if let session = sessionEstimate,
+           !projectionPrecedesReset(minutes: session.minutes, resetAt: latestRateLimit?.session?.resetAt) {
+            sessionEstimate = nil
+        }
+        if let weekly = weeklyEstimate,
+           !projectionPrecedesReset(minutes: weekly.minutes, resetAt: latestRateLimit?.weekly?.resetAt) {
+            weeklyEstimate = nil
+        }
 
         // Find the shorter time
         var bestEstimate: (minutes: Double, limitType: String)? = nil
