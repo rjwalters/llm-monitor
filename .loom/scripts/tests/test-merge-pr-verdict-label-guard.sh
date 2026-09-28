@@ -239,6 +239,38 @@ run_guard
 assert_eq "1" "$LAST_RC" "loom:pr + loom:review-requested -> merge hard-blocked (exit 1)"
 assert_contains "$LAST_OUT" "loom:review-requested" "Block message names loom:review-requested"
 
+# T10 (#9016): the critical-file-hold release path, end to end through this
+# guard. Champion's criterion-#3 hold keeps `loom:pr` and adds `loom:operator`,
+# and its documented human path is "remove the label, then run merge-pr.sh".
+# Before #9016 Champion re-added the label on its next tick, so the operator's
+# second command hit T4's block again (merge train #8996: the label was back
+# 1m42s later). The Champion-side fix is head-scoped and lives in
+# champion-critical-file-hold.md; what has to be true HERE is that the release
+# actually opens the merge, and that it opens it for NOTHING ELSE.
+DRY_RUN=false
+PR_HEAD_SHA="c0ffee1"
+PR_LABELS=$'loom:pr\nloom:operator\nloom:urgent'
+run_guard
+assert_eq "1" "$LAST_RC" "#9016: while the critical-file hold's loom:operator is on, the merge is still refused"
+
+# The operator's release: the label is gone, `loom:pr` (Judge's approval of this
+# head) stays. No flag, no bypass — the contradiction is simply no longer there.
+PR_LABELS=$'loom:pr\nloom:urgent'
+run_guard
+assert_eq "0" "$LAST_RC" "#9016: once the operator removes loom:operator, merge-pr.sh passes this guard with no override flag"
+assert_not_contains "$LAST_OUT" "Merge blocked" "#9016: a released critical-file hold produces no block message"
+
+# And the release is scoped to that one label: a genuine Judge rejection racing
+# an approval is exactly as fatal as it was, with or without a hold label in the
+# set. This is #8112's property, which #9016 must not have weakened.
+PR_LABELS=$'loom:pr\nloom:changes-requested'
+run_guard
+assert_eq "1" "$LAST_RC" "#9016 does not weaken #8112: loom:pr + loom:changes-requested is still a hard block"
+PR_LABELS=$'loom:pr\nloom:changes-requested\nloom:urgent'
+run_guard
+assert_eq "1" "$LAST_RC" "#9016 does not weaken #8112: a rejection blocks even with loom:operator absent"
+assert_contains "$LAST_OUT" "loom:changes-requested" "#9016: the rejection is still the named blocker"
+
 # --- FAILS CLOSED when the implementation behind the guard cannot run ---
 #
 # Moving this decision from a sourced shell function into a SUBPROCESS

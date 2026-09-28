@@ -1291,72 +1291,42 @@ _check_partial_increment_close_conflict() {
   # shellcheck disable=SC2046
   bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run) 2>/dev/null)" || bt_rc=$?; if [[ $bt_rc -eq 0 ]]; then [[ -z "$bt_warn" ]] || warning "$bt_warn"; else warning "Skipped backticked-trailer advisory warning check: loom-daemon rejected 'merge-pr-refs backticks-partial-increment-warnings' (exit $bt_rc) -- most likely a daemon predating this mode. Not refusing; this check is advisory-only."; fi; [[ -n "$partial_refs" ]] || return 0
 
-  # Closing references GitHub will honor on merge, from three unioned signals:
-  #   1. the body's own closing keywords (quota-free regex);
-  #   2. this PR's COMMIT MESSAGES (#4595) — quota-free REST, and the source of
-  #      the squash commit message this script does not override;
-  #   3. GitHub's authoritative closingIssuesReferences (best-effort — empty
-  #      under GraphQL quota exhaustion, but when it does answer it also
-  #      surfaces a Development-sidebar link that no text reveals).
-  # The commit fetch happens only past the partial_refs early-return above, so
-  # the common (non-partial-increment) path costs zero extra API calls.
-  local body_close_refs commit_messages commit_close_refs graphql_close_refs close_refs
-  body_close_refs="$(_body_closing_refs "$pr_body")"
-  commit_messages="$(_pr_commit_messages)"
-  commit_close_refs="$(printf '%s\n' "$commit_messages" | _closing_refs_stdin)"
-  graphql_close_refs="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
-  close_refs="$(printf '%s\n%s\n%s\n' "$body_close_refs" "$commit_close_refs" "$graphql_close_refs" \
-    | grep -E '^[0-9]+$' | sort -un || true)"
-
-  local issue_num issue_json
-  while IFS= read -r issue_num; do
-    [[ -n "$issue_num" ]] || continue
-
-    # Fresh (uncached) read — plain `gh api`, not $GH, mirroring
-    # _reset_one_partial_issue's freshness discipline. Skip PRs that slipped
-    # through the regex (the issues endpoint also returns PRs).
-    issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
-    if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
-      continue
-    fi
-    # Only an issue that is OPEN right now can be closed BY this merge; one that
-    # is already closed was closed by something else and is not ours to revert.
-    if [[ "$(echo "$issue_json" | jq -r '.state // ""')" != "open" ]]; then
-      continue
-    fi
-    PARTIAL_OPEN_BEFORE_MERGE="${PARTIAL_OPEN_BEFORE_MERGE:+$PARTIAL_OPEN_BEFORE_MERGE }$issue_num"
-
-    if ! grep -qx "$issue_num" <<<"$close_refs"; then
-      continue
-    fi
-    PARTIAL_CONFLICT_ISSUES="${PARTIAL_CONFLICT_ISSUES:+$PARTIAL_CONFLICT_ISSUES }$issue_num"
-
-    local body_offending commit_offending partial_offending dr=""
-    # Match _check_no_open_stacked_children's dry-run contract: report the
-    # would-be outcome without claiming a merge is happening.
-    [[ "${DRY_RUN:-false}" == "true" ]] && dr="[dry-run] "
-    body_offending="$(_closing_ref_snippets "$pr_body" "$issue_num")"
-    commit_offending="$(_closing_ref_snippets "$commit_messages" "$issue_num")"
-    # The declaration text itself (AC #4, #5234) — quoted alongside the closing
-    # keyword below so an operator can see both sides and judge for themselves
-    # whether the declaration was a real trailer or, e.g., prose that happened
-    # to survive the structural anchor.
-    partial_offending="$(_partial_increment_ref_snippets "$pr_body" "$issue_num")"
-
-    # Name the source, because the operator remedy differs per source: edit the
-    # PR body, reword/amend a commit, or unlink a Development-sidebar reference.
-    if [[ -n "$body_offending" ]]; then
-      warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num (\"$partial_offending\"), but its body ALSO carries a closing reference to #$issue_num (\"$body_offending\") — GitHub honors a closing keyword ANYWHERE in the body, so merging this PR WILL close #$issue_num against the declared intent."
-      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, edit the PR body so no closing keyword is immediately followed by \`#$issue_num\` (e.g. write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`), then re-run this merge."
-    elif [[ -n "$commit_offending" ]]; then
-      warning "${dr}Partial-increment conflict (#4595): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num (\"$partial_offending\"), but a closing keyword in a commit message of this PR references #$issue_num (\"$commit_offending\") — this merge squashes without overriding the commit message, so GitHub composes the squash message from these commits and merging WILL close #$issue_num against the declared intent."
-      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, reword the offending commit message (\`git commit --amend\` / \`git rebase -i\` + force-push) so no closing keyword is immediately followed by \`#$issue_num\`, then re-run this merge."
-    else
-      warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num (\"$partial_offending\"), but GitHub reports #$issue_num as a closing target of this PR (no closing keyword found in the body or commit messages — most likely a Development-sidebar link), so merging this PR WILL close #$issue_num against the declared intent."
-      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, unlink #$issue_num from this PR's Development sidebar, then re-run this merge."
-    fi
-  done <<< "$partial_refs"
-
+  # Which declared issues are open now, and which a closing reference will
+  # close anyway (#4569), from three unioned signals: the body's own closing
+  # keywords (quota-free regex); this PR's COMMIT MESSAGES (#4595) — quota-free
+  # REST, and the source of the squash message this script does not override;
+  # and GitHub's closingIssuesReferences (best-effort — empty under GraphQL
+  # exhaustion, but it alone surfaces a Development-sidebar link). The commit
+  # fetch happens only past the partial_refs early-return above, so the common
+  # path costs zero extra API calls.
+  #
+  # The decision — the union, each issue's PR/open read, the membership test
+  # and the source-attributed warning — is `loom-daemon merge-pr
+  # partial-conflict` (Rust, loom-daemon/src/merge_pr/partial_conflict.rs —
+  # #8191 slice). Only the forge reads stay here: fresh (uncached) plain
+  # `gh api`, not $GH, per issue, mirroring _reset_one_partial_issue. They go
+  # over stdin NUL-framed (a bash string cannot hold NUL, so the framing is
+  # lossless and has no argv size limit). The plan's OPEN/CONFLICT<TAB>n lines
+  # fill the two sets the post-merge pass reads; WARNING<TAB>text is replayed.
+  # Fail CLOSED without the DONE terminator: an unread plan is not an empty
+  # one, and read as empty it would leave a partial increment this merge
+  # closes with nothing recorded to revert it.
+  local frame=() issue_num plan rc=0 kind val dr=()
+  frame=("$pr_body" "$(_pr_commit_messages)" "$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)")
+  while IFS= read -r issue_num; do [[ -n "$issue_num" ]] || continue; frame+=("$issue_num" "$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"); done <<< "$partial_refs"
+  [[ "${DRY_RUN:-false}" != "true" ]] || dr=(--dry-run)
+  plan="$(printf '%s\0' "${frame[@]}" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr partial-conflict --pr "$PR_NUMBER" ${dr[@]+"${dr[@]}"} 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 || "$plan" != *"LOOM-PARTIAL-CONFLICT-DONE" ]]; then
+    plan="Merge blocked: PR #$PR_NUMBER's partial-increment close-conflict guard (#4569) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr partial-conflict' exited $rc without the LOOM-PARTIAL-CONFLICT-DONE terminator (a loom-daemon predating #8191's slice has no such verb). Refusing rather than reading silence as 'no conflict': this plan records which declared partial increments a stray closing reference will close, which is what the post-merge pass reverts. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+    [[ "${DRY_RUN:-false}" == "true" ]] || error "$plan"; warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $plan"; return 0
+  fi
+  while IFS=$'\t' read -r kind val; do
+    case "$kind" in
+      OPEN) PARTIAL_OPEN_BEFORE_MERGE="${PARTIAL_OPEN_BEFORE_MERGE:+$PARTIAL_OPEN_BEFORE_MERGE }$val" ;;
+      CONFLICT) PARTIAL_CONFLICT_ISSUES="${PARTIAL_CONFLICT_ISSUES:+$PARTIAL_CONFLICT_ISSUES }$val" ;;
+      WARNING) warning "$val" ;;
+    esac
+  done <<< "$plan"
   return 0
 }
 

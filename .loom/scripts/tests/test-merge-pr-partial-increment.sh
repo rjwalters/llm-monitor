@@ -60,8 +60,9 @@ MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
 # The post-merge reset's decision is `loom-daemon merge-pr partial-reset`
-# (#8191 slice), so the same binary must carry that verb too.
-loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset"
+# and the pre-merge conflict guard's is `merge-pr partial-conflict` (#8191
+# slices), so the same binary must carry both verbs too.
+loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset" "merge-pr partial-conflict"
 
 # Colors
 RED='\033[0;31m'
@@ -905,6 +906,31 @@ assert_eq "" "$PARTIAL_OPEN_BEFORE_MERGE" \
 assert_not_contains "$nofetch_err" "simulated commits fetch failure" \
   "No partial-increment ref -> commits endpoint is never called"
 unset LOOM_TEST_COMMITS_FAIL
+
+# T31 (#8191): the conflict decision moved to `loom-daemon merge-pr
+# partial-conflict`. A daemon that cannot answer must REFUSE the merge -- an
+# unread plan is not an empty one, and read as empty it would record nothing
+# for the post-merge pass to revert -- while --dry-run only reports it.
+reset_log
+fake_no_conflict="$STUB_DIR/fake-loom-daemon-no-partial-conflict"
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$fake_no_conflict"
+chmod +x "$fake_no_conflict"
+saved_bin="${LOOM_DAEMON_BIN:-}"
+export LOOM_DAEMON_BIN="$fake_no_conflict"
+PR_JSON='{"body":"Verify, then close #123.\n\nContributes to #123"}'
+nc_rc=0
+( _check_partial_increment_close_conflict ) 2>"$STUB_DIR/stderr.log" || nc_rc=$?
+assert_eq "1" "$nc_rc" "#8191: daemon without 'merge-pr partial-conflict' -> the merge is refused"
+assert_contains "$(read_stderr)" "partial-increment close-conflict guard (#4569) could not run" \
+  "#8191: the refusal names the guard that could not run"
+DRY_RUN=true
+nc_rc=0
+( _check_partial_increment_close_conflict ) 2>"$STUB_DIR/stderr.log" || nc_rc=$?
+DRY_RUN=false
+export LOOM_DAEMON_BIN="$saved_bin"
+assert_eq "0" "$nc_rc" "#8191: --dry-run with no answerable daemon -> reported, not exited"
+assert_contains "$(read_stderr)" "[dry-run] Would BLOCK merge of PR #999" \
+  "#8191: --dry-run phrases the refusal as conditional"
 
 echo ""
 echo "Testing the post-merge premature-close revert..."
