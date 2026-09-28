@@ -2027,21 +2027,30 @@ _wait_for_checks_then_sync_merge() {
       if [[ "$lookup_rc" -ne 0 ]]; then
         error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) that cannot be classified as required or informational (fails closed)"
       fi
-      local overlap
-      overlap="$(comm -12 \
-        <(printf '%s\n' "$failing" | sort -u) \
-        <(printf '%s\n' "$required" | sort -u))"
-      if [[ -n "$overlap" ]]; then
-        error "Cannot merge PR #$PR_NUMBER: a required status check has failed ($(printf '%s' "$overlap" | tr '\n' ' ')). Fix the check and re-run the merge."
-      fi
-      if [[ -z "$pending" ]]; then
-        # Only informational (non-required) checks failing and nothing pending →
-        # a synchronous merge is safe (matches the UNSTABLE #3486 fallback).
-        info "PR #$PR_NUMBER: only informational (non-required) check(s) failing; proceeding to synchronous merge"
-        return 0
-      fi
-      # Informational failures but other checks still running — fall through to
-      # the pending wait below.
+      # The overlap/proceed-or-continue decision itself is `loom-daemon
+      # merge-pr checks-failure` (Rust, loom-daemon/src/merge_pr/
+      # checks_failure.rs — #8191 slice): given the failing/required/pending
+      # check-name sets already fetched above (the forge reads stay here —
+      # $required's lookup covers Gitea too, unlike stale-checks' GitHub-only
+      # one), whether a required check is among the failing ones (refuse), only
+      # informational ones are and nothing is pending (proceed), or
+      # informational failures coexist with a still-pending check (fall
+      # through to the pending wait below, unchanged). A guard fault (missing
+      # binary, older install, malformed output) refuses the merge, same as
+      # every other guard in this file: a caller cannot tell "only
+      # informational checks failing" from "never classified".
+      local _cf_out _cf_rc=0
+      _cf_out="$(printf '%s\0%s\0%s\0' "$failing" "$required" "$pending" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr checks-failure --pr "$PR_NUMBER" 2>/dev/null)" || _cf_rc=$?
+      # Only informational (non-required) checks failing and nothing pending →
+      # a synchronous merge is safe (matches the UNSTABLE #3486 fallback).
+      # Informational failures with other checks still running (PENDING) fall
+      # through to the pending wait below, exactly as before.
+      case "$_cf_rc:$_cf_out" in
+        1:LOOM-CHECK-FAILURE-REQUIRED$'\t'*) error "Cannot merge PR #$PR_NUMBER: a required status check has failed (${_cf_out#*$'\t'}). Fix the check and re-run the merge." ;;
+        0:LOOM-CHECK-FAILURE-PROCEED) info "PR #$PR_NUMBER: only informational (non-required) check(s) failing; proceeding to synchronous merge"; return 0 ;;
+        0:LOOM-CHECK-FAILURE-PENDING) ;;
+        *) error "Merge blocked: PR #$PR_NUMBER's failing-check classification (#8191 slice) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr checks-failure' exited $_cf_rc without a recognized LOOM-CHECK-FAILURE-* sentinel. A guard that cannot run refuses the merge rather than passing it. $(_mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")" ;;
+      esac
     fi
 
     if [[ -n "$pending" ]]; then
