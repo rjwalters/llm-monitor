@@ -2,6 +2,74 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-09-29
+
+- **Issue #230** (closed): Read Loom-profile Codex usage from 'accounts check --live' instead of rollout snapshots
+- **PR #232**: feat(codex): prefer loom-daemon's live rate-limit check over rollout snapshots
+
+### 2026-09-27
+
+- **Issue #220** (closed): feat(ui): show elapsed-time-normalized 'even burn' position (glide-slope mark) per rate-limit window
+- **PR #224**: feat: show elapsed-time-normalized even-burn mark per rate-limit window
+- **Issue #221** (closed): fix(chart): time-to-limit projection ignores the window's reset instant
+- **PR #223**: fix(chart): time-to-limit projection ignores the window's reset instant
+- **Issue #219** (closed): feat(monitoring): evaluate Stage-11-Agentics/glideslope as reference implementation for LLM monitoring
+- **PR #222**: docs: evaluate glideslope as a reference implementation (#219)
+
+### 2026-09-26
+
+- **PR #218**: feat: read rolled Claude tokens from ~/.claude-oauth and the Loom pool
+- **PR #216**: fix: persist Codex snapshot diagnostics; export ranking.json on launch
+- **PR #217**: fix(security): ignore sibling copies of the Loom token pool
+
+### 2026-09-25
+
+- **PR #207**: chore(deps): bump the github-actions group across 1 directory with 2 updates
+- **PR #214**: feat: read-only visibility into Loom's Codex profiles
+- **PR #211**: refactor!: rename Claude Monitor to LLM Monitor (2.0)
+- **PR #209**: feat: z.ai (GLM Coding Plan) accounts as a third provider
+- **Issue #212** (closed): Flaky selftest: CodexAppServer argfail-stub race under host load
+- **PR #213**: fix: surface codex's stderr when it exits before the handshake (#212)
+
+### 2026-09-18
+
+- **Issue #196** (closed): quota_calibration is never populated: compute tokens-per-weekly-point per account and alert on step changes
+- **Issue #202** (closed): selftest hangs in a local swift:6.1 container on every subprocess-spawning test (documented Linux verification path can't run the suite)
+- **PR #206**: fix: replace readabilityHandler pipe drains with a blocking-read thread (#202)
+- **Issue #199** (closed): Surface quota calibration series in chart + menu-bar step-change alert
+- **PR #205**: feat: surface quota calibration series in chart + menu-bar step-change alert
+- **Issue #201** (closed): Ingested token spend is invisible: every read path joins on the NULL inferred_account_id
+- **PR #204**: feat: fall back to host-total token chart when nothing is attributed
+- **Issue #198** (closed): Compute daily quota calibration series (tokens-per-weekly-point) and export
+- **PR #203**: feat: compute and export a daily quota-calibration series
+- **Issue #197** (closed): Revive Swift transcript token ingest (token_usage/token_sessions writer)
+- **PR #200**: feat: revive transcript token ingest (token_usage/token_sessions writer)
+
+### 2026-09-17
+
+- **Issue #194** (closed): Investigate legacy oauth_credentials.source='codex' vs expected 'codex-home'
+- **PR #195**: fix: give a stranded OpenAI/Codex account a voice instead of silence (#194)
+- **Issue #55** (closed): docs: README screenshots predate provider badges and the Premium % column
+- **PR #193**: docs: refresh README screenshots and move them into docs/
+
+### 2026-09-16
+
+- **PR #184**: Fix Codex app-server spawn failing on newer CLI's --ask-for-approval values
+- **Issue #188** (closed): accounts push/pull over ssh: converge a fleet's monitor stores without hand-shipping plaintext token bundles
+- **PR #192**: feat: stream account bundles over ssh with `accounts push`/`pull`
+- **Issue #187** (closed): scripts/install-linux.sh: one-command install/upgrade of the headless daemon on a Linux fleet host
+- **PR #191**: feat: add scripts/install-linux.sh for one-command daemon install/upgrade
+- **Issue #185** (closed): Publish a static-stdlib linux-x64 release binary — the documented Linux build is runtime-dependent and both fleet workers were running a binary that cannot load
+- **PR #190**: ci: publish a static-stdlib linux-x64 release binary
+- **Issue #186** (closed): docs: Linux build must use --static-swift-stdlib (or the swift:6.1 container); document the 'cannot open shared object file' failure and cure
+- **PR #189**: docs: document --static-swift-stdlib for deployable Linux builds
+
+### 2026-08-19
+
+- **Issue #179** (closed): Simplify UsageStore history loaders: dedup cutoff-date boilerplate and decimation filter
+- **PR #182**: refactor: dedupe UsageStore chart-history cutoff and decimation logic
+- **Issue #181** (closed): [Refiled] accounts can persist with email=NULL (address only in account_name) — resolved
+
 ### 2026-08-16
 
 - **Issue #176** (closed): Dedup repeated --db/--help CLI option parsing across CodexCLI and AccountSyncCLI
