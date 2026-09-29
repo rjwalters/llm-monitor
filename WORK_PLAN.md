@@ -9,9 +9,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 _None._
 
-## Urgent
+## Operator Priority
 
-Issues flagged as highest priority (`loom:urgent`).
+Issues the operator starred (`loom:operator-priority`); land these first.
 
 _None._
 
@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report
 
 ## PRs Awaiting Review
 
@@ -43,11 +43,11 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
+- **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)*
 
 ## Proposed (Architect / Hermit)
 
-- **#179**: Simplify UsageStore history loaders: dedup cutoff-date boilerplate and decimation filter *(hermit)*
+_None._
 
 ## Epics
 
@@ -58,12 +58,12 @@ _None._
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Urgent | 0 |
+| Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 1 |
-| Architect / Hermit proposals | 1 |
+| Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
