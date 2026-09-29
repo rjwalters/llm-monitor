@@ -1162,15 +1162,15 @@ Exit 2 is not an absent marker: fetch failed (usually quota; retry later) or `lo
 
 ### Points estimate marker (`<!-- loom:points=<N> -->`, #9056)
 
-Alongside the tier, always emit a numeric point estimate — coarse, uncalibrated judgment of total sweep cost (tokens + wall-clock + iterations), not a formula:
+Points are **labels** (#9431): pick exactly one `points:<N>` — `N` one of `1`, `2`, `3`, `5`, `8`, `13`, the `loom:complexity` closed-vocabulary rule — per the rubric in `.loom/docs/story-points.md`: size of one clean landing, not sweep cost or the tier; above 13, split — never size 21. Attach it **in the same `gh issue edit` that applies `loom:curated`** (no second API call); re-assignment **replaces** the prior label (never stacks); a rescope to `loom:triage` updates or removes it in the same mutation — stale points must not survive a scope change:
 
-```html
-<!-- loom:points=<N> -->
+```bash
+gh issue edit <number> --remove-label "points:<old>" --add-label "loom:curated,points:<new>"
 ```
 
-`N` **MUST** be exactly one of `1`, `2`, `3`, `5`, `8`, `13` — same closed-vocabulary rule as `loom:complexity`; out-of-vocabulary is a curation defect, not style. Guidance only: `mechanical`→1-2, `routine`→3-5, `complex`→8-13 — deviate when scope warrants. `require-complexity-marker.sh` blocks `loom:curated` on this marker too.
+Still emit the body marker with the same N — `require-complexity-marker.sh` blocks `loom:curated` on it.
 
-**A related but distinct marker convention** exists for `loom:operator-mechanical` items: `<!-- loom:capability=<name> -->` names the host/credential/admin capability needed (#6892) — same anchored-comment parsing, but a separate convention (no effect on model routing, only alongside `loom:operator-mechanical`). See `defaults/docs/label-state-machine.md` → "Capability-declaration convention" for vocabulary/parser contract; no Curator action required today (docs-only, see #6885/#6893).
+**Related but distinct**: `<!-- loom:capability=<name> -->` (#6892, alongside `loom:operator-mechanical` only) is a separate convention, no Curator action — see `defaults/docs/label-state-machine.md` → "Capability-declaration convention" (#6885/#6893).
 
 ## Where to Add Enhancements
 

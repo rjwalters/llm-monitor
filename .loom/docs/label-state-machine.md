@@ -12,6 +12,13 @@ invisible to `gh pr list`, the dashboard, or any label-filtered query. See
 prompted this (four Judge-approved PRs sat held-but-invisible for up to 126
 hours).
 
+One auxiliary vocabulary rides the curation transition: when the Curator
+applies `loom:curated`, it attaches exactly one `points:*` story-point size
+label (`1`/`2`/`3`/`5`/`8`/`13`, rubric in `.loom/docs/story-points.md`,
+#9431) in the same `gh issue edit` — re-assignment replaces it, and a rescope
+back to `loom:triage` updates or removes it, so stale points never survive a
+scope change.
+
 `loom:operator` moves that state onto the label substrate, where every other
 pipeline state already lives.
 

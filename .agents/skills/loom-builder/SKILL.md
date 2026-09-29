@@ -1265,15 +1265,14 @@ fi
   a duplicate trailer for an identity already present. Full reference:
   `defaults/docs/commit-signoff.md`.
 
-### Closing vs Partial Increments (family/epic issues)
+### Closing vs Non-Closing References (multi-PR landings)
 
-Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a
-**partial increment** of a larger tracked body of work that must stay open
-(`Part of #N` / `Contributes to #N`). The full decision rule — when to use the
-non-closing reference, and the requirement to carry the **same** reference in both
-the PR body and the commit messages — is the canonical guidance in
-**builder-pr.md § "Partial increments (family/epic issues)"**. Do not restate it
-here; follow it there.
+Decide whether this PR **fully** resolves the issue (`Closes #N`) or is one of
+several PRs it lands through, so the issue must stay open (`Part of #N` plus a
+`Loom-Issue: owner/repo#N` trailer). The full decision rule — it covers ANY
+multi-PR landing, not only declared `loom:epic` families — is canonical in
+**builder-pr.md § "Multi-PR landings: every PR declares its issue"**. Do not
+restate it here; follow it there.
 
 ### Creating the PR
 
@@ -1320,7 +1319,7 @@ When claiming:
 
 When creating PR:
 - [ ] Add `loom:review-requested` (at creation only)
-- [ ] PR body uses `Closes #N` (full implementation) or `Part of #N` (partial increment of a family/epic issue) — same reference in the commit message
+- [ ] PR body uses `Closes #N` (final PR) or `Part of #N` + `Loom-Issue: owner/repo#N` (any earlier PR) — same reference in the commit message
 
 After PR creation:
 - [ ] STOP - do not touch any PR labels

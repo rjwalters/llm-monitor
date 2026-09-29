@@ -2171,6 +2171,8 @@ comparator rank, so the two differ whenever sharding or
 than a hard-coded string. `loom:curated` / `loom:triage` are unordered and never
 listed. The single-workspace tick has no plan (`plan: null`). Field reference:
 [`telemetry-schema.md` § `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+Folding several hosts' plans into one fleet order (`merge_plans`, #9310) is a
+separate rule: [`dispatch-plan.md`](dispatch-plan.md).
 
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 
