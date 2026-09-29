@@ -51,13 +51,16 @@ be getting better.
 GitHub Actions (every 2amlogic repo, auto-discovered)
         │  REST: org repos (ETag-cached) → runs (created_after floor) → jobs
         │        → completed-job log text (phase 2; text/plain, not a zip)
+        │        → suite-timings artifact (#9089; only for a run with an
+        │          unemitted shell-suite shard leg — zero requests otherwise)
         ▼
 loom-daemon ci-telemetry poller (per host; one poller is the normal case)
   durable dedup ledger  .loom/state/ci-telemetry/seen.jsonl  (exactly once per job)
   local journal         .loom/logs/ci-telemetry.jsonl        (written with no exporter)
         │  records: ci.run, ci.job, ci.job.log
         │  metrics: loom.ci.run.duration_ms, loom.ci.job.duration_ms
-        │  traces:  one trace per run, one span per job
+        │  traces:  one trace per run, one span per job, and under each job
+        │           one span per executed step and per executed suite (#9089)
         ▼
 observability OTLP exporter (the existing durable queue + drain loop)
         │
@@ -172,8 +175,9 @@ The retro is
 [`ci-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/ci-queries.sql):
 numbered, parameterized sections, run in one pass from the trial's private
 bundled `clickhouse-client` (invocation in the signoz README's "CI retro
-queries"). Sections 1–6 have a matching saved view in the README's "Saved
-views" table.
+queries"). Every section except 7 and 8 has a matching saved view in the
+README's "Saved views" table (those two join or aggregate across logical
+sources and are `clickhouse-client`-only).
 
 | # | Question | Source (horizon) |
 |---|---|---|
@@ -185,6 +189,12 @@ views" table.
 | 6 | **Where did a slow run's time go?** Run wall-clock vs its longest job, job count and summed job time | `ci.run` / `ci.job` records (7 days) |
 | 7 | **Per issue, where did the time go — Builder, CI, Judge, merge?** (#9007) Joins `loom_analytics.raw_ship_outcome` (apply `cycle-time-extract.sql` first) to the `ci.run` triggered by that issue's `feature/issue-N` branch, on the issue number recovered from `loom.ci.ref`. Reports Builder/Judge/merge-phase seconds beside the CI run's queue time (`ci_queued_s`, from `loom.ci.queued_ms`) and its running time (`ci_wall_s`). The queue split is a #9007 follow-up; `ci_queued_s` is NULL for runs recorded before it. One thing it deliberately does **not** claim: "lead time" is the sweep's own `total_duration_sec`, not issue-filed-to-merged (no forge issue-open timestamp reaches this stream — see [`cycle-time-questions.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/cycle-time-questions.md) §"What this question set cannot answer") | `sweep.outcome` rollup + `ci.run` records (7-day CI horizon; sweep-side per the rollup's own retention) |
 | 8 | **How much CI time went to re-date bumps vs new code vs re-runs?** (#9337) Run count, running time and queue time per repo per `loom.ci.trigger_reason` — `stale_main_bump` is the time lost to #8508 re-date commits after `main` moved. `unrecorded` = runs captured before #9337 | `ci.run` records (7 days) |
+| 9 | **How long do jobs wait for a runner?** (#9089) P50/P90/max `loom.ci.queued_ms` per repo + workflow + job, per bucket — the per-job analogue of section 1, so a runner-queue-cap burst localizes to one job family; alert when p90 exceeds 60s | `ci.job` records (7 days) |
+| 10 | **Are a run's matrix legs balanced?** (#9089) Per run attempt, the spread between the slowest and fastest leg sharing one `loom.ci.shard.kind` — the rebalancing signal `run-ci-suites.sh`/nextest partitioning tuning needs | `ci.job` records (7 days) |
+| 11 | **Where did a job's time go, step by step?** (#9089) P50/P90/max/total `loom.ci.step` span duration per repo + workflow + job + step, ranked by p90 — "did this Rust leg's ~250s go to compiling or to running tests?". The first section reading traces rather than logs or metrics | `loom.ci.step` spans (7 days) |
+| 12 | **Which shell test suites are the slow ones?** (#9089) P50/P90/max/total `loom.ci.suite` span duration per repo + workflow + job + suite, ranked by total time, with the #7791 retry count and the failure count for the same window beside it — so a suite that is slow because it runs twice is distinguishable from one that is simply slow | `loom.ci.suite` spans (7 days) |
+| 13 | **Which suites should move between shards?** (#9089) Per run attempt and leg, the summed suite time that leg carried and its slowest suite. Section 10 says *whether* the legs are imbalanced; this says what to **move** | `loom.ci.suite` spans (7 days) |
+| 14 | **What set a run's floor — one slow job, queueing, or a `needs:` chain?** (#9089) Per run attempt, the job with the largest queue + running sum (`critical_job`), its queue share kept separate from its work, the run's own queue segment, and the residual `unexplained_s` that is the serialized-dependency time. Section 6 could only say queueing *or* a chain dominated; with per-job `queued_ms` these separate | `ci.run` + `ci.job` records (7 days) |
 
 Section 7's join key is the **issue** number, not a PR number: `ci.run`/
 `ci.job` **log** records carry no PR/issue attribute of their own (only
@@ -507,14 +517,18 @@ gitignored.
 configuration**, following the `sweep-outcome-telemetry.jsonl` pattern, so the
 poller is useful offline. Each line is a
 [`TelemetryEnvelope`](telemetry-schema.md) with `schema_version: 8`. Each
-completed job produces three lines, and so does each completed run:
+completed job produces three lines, and so does each completed run — plus,
+since #9089, one extra line per executed step of that job (see [Step
+spans](#step-spans-9089)) and, for a sharded shell-suite leg whose timings
+artifact could be read, one per suite it ran (see [Suite
+spans](#suite-spans-9089)):
 
 | `record.kind` | Fields | OTLP signal |
 |---|---|---|
 | `ci.run` | `repo`, `visibility`, `run_id`, `run_attempt`, `workflow`, `ref`, `head_sha`, `event`, `status`, `conclusion`, `triggered_by`, `started_at`, `completed_at`, `duration_ms`, `queued_ms` (`run_started_at − created_at`, #9007 follow-up; absent when GitHub reported no start), `trigger_reason` (#9337, see [Trigger attribution](#trigger-attribution-9337)) | log record `ci.run`, timestamped at `completed_at` |
-| `ci.job` | `repo`, `visibility`, `run_id`, `job_id`, `workflow`, `job`, `runner` (first runner label), `attempts` (the job's run attempt), `status`, `conclusion`, `timed_out`, `started_at`, `completed_at`, `duration_ms` | log record `ci.job` |
+| `ci.job` | `repo`, `visibility`, `run_id`, `job_id`, `workflow`, `job`, `runner` (first runner label), `attempts` (the job's run attempt), `status`, `conclusion`, `timed_out`, `started_at`, `completed_at`, `duration_ms`, `queued_ms` (`started_at − created_at`, #9089; absent when GitHub reported no `created_at` for the job), `shard_index` / `shard_total` / `shard_kind` (#9089, see [Per-job queue wait and shard attributes](#per-job-queue-wait-and-shard-attributes-9089)) | log record `ci.job` |
 | `ci.duration` | `metric` (`run`\|`job`), `repo`, `visibility`, `run_id`, `run_attempt`, `job_id`, `workflow`, `job`, `runner`, `conclusion`, `started_at`, `completed_at`, `duration_ms` | one data point of the `loom.ci.run.duration_ms` / `loom.ci.job.duration_ms` delta histogram |
-| `trace.span` | `loom.ci.run` (root) or `loom.ci.job` (child of its run span) | trace: one per run attempt, one span per job |
+| `trace.span` | `loom.ci.run` (root), `loom.ci.job` (child of its run span), `loom.ci.step` (#9089, child of its job span), or `loom.ci.suite` (#9089, also a child of its job span) | trace: one per run attempt, one span per job, one span per executed step, one span per executed suite of a sharded shell-suite leg |
 
 Why `ci.duration` is a separate record: each envelope maps to exactly one
 OTLP signal, because the exporter acknowledges contiguous same-signal
@@ -535,7 +549,9 @@ The attribute and label vocabulary is declared once, in
 - `CI_LOG_ATTRIBUTE_KEYS`: the `loom.ci.*` log attributes. Log records also
   carry the shared `loom.repo` and `loom.repo.visibility`. Already includes
   `loom.ci.head_sha` and `loom.ci.ref` (the head branch), plus
-  `loom.ci.queued_ms` on `ci.run` (the CI queue segment, #9007 follow-up).
+  `loom.ci.queued_ms` on `ci.run` (the CI queue segment, #9007 follow-up) and,
+  since #9089, on `ci.job` too (see [Per-job queue wait and shard
+  attributes](#per-job-queue-wait-and-shard-attributes-9089)).
 - `CI_SPAN_ATTRIBUTE_KEYS`: the `loom.ci.*` span attributes. Since #9007 this
   also includes `loom.ci.queued_ms` (run span only; the span itself starts
   at `run_started_at`, so the queue wait is otherwise invisible in the
@@ -550,9 +566,24 @@ The attribute and label vocabulary is declared once, in
   always-admitted key list and the collector's span `keep_keys`. Since #9088
   a run that belongs to an issue is also copied into that issue's story trace
   (see [Story stitching](#story-stitching-9088)); the per-run trace itself
-  is still joined to sweeps by attribute only.
+  is still joined to sweeps by attribute only. Since #9089 the job span also
+  carries `loom.ci.queued_ms` (its own `started_at − created_at`).
 - Both lists also carry `loom.ci.trigger_reason` (#9337), and the run span
   carries `loom.ci.run_attempt` so a `flaky_retry` is auditable from the span.
+- Both lists also carry `loom.ci.shard.index`, `loom.ci.shard.total` and
+  `loom.ci.shard.kind` (#9089, `ci.job` / job span only) — see [Per-job queue
+  wait and shard attributes](#per-job-queue-wait-and-shard-attributes-9089).
+- `CI_SPAN_ATTRIBUTE_KEYS` alone also carries `loom.ci.step` and
+  `loom.ci.step_number` (#9089, `loom.ci.step` spans only — there is no
+  `ci.step` log record and no step metric series). See [Step
+  spans](#step-spans-9089).
+- `CI_SPAN_ATTRIBUTE_KEYS` alone also carries `loom.ci.suite`,
+  `loom.ci.suite.outcome` and `loom.ci.suite.retried` (#9089, `loom.ci.suite`
+  spans only — likewise no log record and no metric series). The outcome has
+  its own key rather than reusing `loom.ci.conclusion`: that one carries
+  GitHub's vocabulary (`success`/`failure`/…) everywhere else, and mixing a
+  suite's `pass`/`fail`/`skip` into it would corrupt every group-by over it.
+  See [Suite spans](#suite-spans-9089).
 - `CI_METRIC_LABEL_KEYS`: the metric labels, and **only** these:
   `repo`, `workflow`, `job`, `runner`, `conclusion`. Metric labels never
   include a sha, ref, run id or issue number.
@@ -583,6 +614,167 @@ The gateway's `transform/privacy` `keep_keys` lists in
 Two tests fail if the config and the constants disagree:
 `ci_telemetry::tests::collector_allowlist_matches_the_ci_vocabulary_exactly`
 and `collector_fanout::gateway_forwards_exactly_the_ci_telemetry_vocabulary`.
+
+### Per-job queue wait and shard attributes (#9089)
+
+Two extensions to the `ci.job` record and `loom.ci.job` span, both computed
+from data the poller already fetches — no extra API calls:
+
+- **`queued_ms`.** `started_at − created_at`, floored at zero, the same
+  formula #9007 uses for `ci.run`'s `queued_ms` (`run_started_at −
+  created_at`) but scoped to one job. The run-level queue segment can hide a
+  job-specific runner-queue-cap burst: on 2026-09-26 per-job waits reached p90
+  212s and a max of 1,064s while the median stayed at 6s, invisible from the
+  run alone. `None` when GitHub reported no `created_at` for the job (a
+  pre-#9089 recording) — never a zero queue.
+- **Shard attributes.** `loom.ci.shard.index` / `loom.ci.shard.total` /
+  `loom.ci.shard.kind`, parsed from the job's *display name* by
+  `ci_telemetry::records::parse_shard` — no artifact or annotation needed.
+  `ci.yml`'s two sharded job families already print `(index/total)` in their
+  `name:`: `Rust Unit Tests (1/3)`, `Rust OTLP Feature Tests (2/3)` (both
+  `cargo nextest run --partition count:k/N`, `shard_kind =
+  nextest-partition`), and `Shell Test Suites (hermetic, 1/2)`
+  (`LOOM_CI_SHARD` round robin, `shard_kind = shell-suite-shard`). A job whose
+  name carries no trailing `(k/N)` group is unsharded: `shard_kind = "none"`,
+  `shard_index` and `shard_total` both `None`. `shard_kind` is always present
+  (unlike the two numeric fields) — "not sharded" is itself the answer, not an
+  absence. Editing a matrix's job name in `ci.yml` without keeping this suffix
+  convention silently stops shard attribution; there is no independent
+  validation of the two staying in sync.
+
+`ci-queries.sql` sections 9 (job queue-wait percentiles, alert when p90 >
+60s) and 10 (shard imbalance: spread between a run's slowest and fastest leg
+sharing one `shard_kind`) consume these.
+
+### Step spans (#9089)
+
+Each executed step of a job becomes one `loom.ci.step` span, a **child of
+that job's span**, so the run trace is three levels deep: run → job → step. A
+job span alone cannot say whether a Rust leg's ~250s went to compiling
+(~90–110s) or to running tests; every CI tuning decision on #9065 needed step
+timings and pulled them from the jobs API by hand. They are built from the
+`steps[]` array of the jobs listing the poller **already** fetches, so this
+costs no extra API call and no new configuration.
+
+| Property | Value |
+|---|---|
+| Span name | `loom.ci.step` |
+| Parent | its `loom.ci.job` span, in the run attempt's trace |
+| Span id | derived from `(repo, job_id, step number)` — the **number**, not the name, so renaming a step in `ci.yml` does not fork its identity and two steps sharing a name stay distinct. Replay and a second host emit byte-identical ids, which is what lets the journal deduplicate on `span\|<span_id>` |
+| Window | the step's own `started_at` → `completed_at`, floored so a skewed pair never ends before it starts |
+| Status | the **step's** `conclusion` (`success` → Ok, `failure`/`timed_out`/`startup_failure` → Error), not its job's |
+| Attributes | `loom.ci.step` (name), `loom.ci.step_number`, plus its job's `loom.repo`, `loom.repo.visibility`, `loom.ci.run_id`, `loom.ci.job_id`, `loom.ci.job`, `loom.ci.workflow`, `loom.ci.conclusion` and the shard trio above — so "which step of which leg is slow" is one group-by, not a trace join |
+| Cap | `MAX_STEP_SPANS_PER_JOB` = 64 spans per job; the step name is sanitized and truncated to 200 chars, because `bounded_attributes` **drops** a value over 256 chars or containing a control character and would otherwise silently lose the attribute that says which step it is |
+
+What is deliberately **not** emitted:
+
+- **A step that did not run is absent, never a zero-length span.** A step
+  GitHub reported no `started_at` or no `completed_at` for (one the job never
+  reached, or one still in progress) produces nothing. A zero-length span at
+  the job's start would read as "ran instantly" — the opposite of the truth.
+- **No `ci.step` log record and no step duration metric.** The metric label
+  allowlist admits no step dimension, and a per-step histogram would multiply
+  the 30-day series count by every job's step count. Step timings are a
+  7-day trace-horizon signal, read by `ci-queries.sql` section 11 — the only
+  section that reads `signoz_traces.signoz_index_v3`.
+- **Nothing derived from log text.** These spans come from the jobs *API*, not
+  from the runner's `##[group]Run …` markers — see [Why there is no `step`
+  attribute](#why-there-is-no-step-attribute), which remains the rule for the
+  `ci.job.log` stream.
+
+### Suite spans (#9089)
+
+Each shell test suite a **sharded** `Shell Test Suites` leg ran becomes one
+`loom.ci.suite` span, also a **child of that leg's job span** (a sibling of its
+step spans, not a child of one — a suite is not attributable to a single step
+boundary, and nesting it under the `run:` step would imply a containment the
+data does not establish). A job span says the leg took 113s and its step spans
+say ~110s of that was one `run:` step; only these say **which** of the leg's
+~118 suites spent it, which is exactly what rebalancing the `LOOM_CI_SHARD`
+split needs.
+
+**Why an artifact.** Per-suite durations exist only inside the runner.
+`run-ci-suites.sh` prints them, but the printed report is read by eye in one
+job's log — and nothing may be derived from log text (see [Why there is no
+`step` attribute](#why-there-is-no-step-attribute)), while
+`GITHUB_STEP_SUMMARY` is not readable through the API. So the script also
+writes the same data as JSON and `ci.yml` uploads it.
+
+| Property | Value |
+|---|---|
+| Producer | `defaults/scripts/tests/run-ci-suites.sh` writes `LOOM_CI_SUITE_TIMINGS` (default `/tmp/ci-suite-timings.json`), once, after every suite's outcome is known — set it to the empty string to write nothing |
+| Wire format | `{"schema": "loom.ci.suite-timings/1", "run_id", "run_attempt", "branch", "shard": "k/N", "total_duration_s", "suites": [{"suite", "outcome", "started_at_epoch", "ended_at_epoch", "retried"}]}`. **Absolute instants, not a duration**: a span needs a wall-clock window, and suites run concurrently, so the overlap between windows is the signal (it is what shows a leg's parallelism) |
+| Artifact | `ci-suite-timings-<shard>`, uploaded `if: always()` with `if-no-files-found: ignore`. The poller downloads **only** artifacts whose name starts with `ci-suite-timings`, so renaming it silently stops suite spans |
+| Transport | `gh run download` (`GithubApi::download_artifact`). `/actions/artifacts/{id}/zip` answers a zip, which every other method's `String::from_utf8_lossy` body path would corrupt; delegating the transfer *and* the unzip to `gh` avoids adding a zip reader for one small JSON file |
+| Cost gate | **Zero requests** unless the run has at least one *not-yet-emitted* `shell-suite-shard` job. A repo that does not shard shell suites pays nothing, not even the artifacts listing, and a re-listed run whose jobs are all already seen re-downloads nothing |
+| Pairing | the unique `shell-suite-shard` job of that run whose `(index, total)` equals the record's `shard`. Zero matches or several is `NoUniqueJob` — never guessed, the same rule [story stitching](#story-stitching-9088) follows for an ambiguous candidate. A `nextest-partition` leg with the same `(k/N)` is **not** a match |
+| Span id | derived from `(repo, job_id, sanitized suite name)`. The **name** is the identity here, unlike a step's number, because a suite's position within a shard is not stable — `ci-wired.txt` order and the `LOOM_CI_SHARD` round robin both shift every entry when one suite is added, and an ordinal-derived id would fork on every manifest edit and make "this suite's duration over the last week" unanswerable |
+| Window | the suite's own instants, **clamped inside the job's** GitHub-reported window. A child span outside its parent renders as a detached bar, and GitHub's window is the authority, not the runner's `date +%s` |
+| Status | the **suite's** own outcome (`pass` → Ok, `fail`/`missing`/`no-result` → Error, `skip`/unrecognised → Unset), never its job's conclusion — the fixture leg concludes `success` while one of its suites failed |
+| Attributes | `loom.ci.suite`, `loom.ci.suite.outcome`, `loom.ci.suite.retried`, plus its job's identity and the shard trio, so "which suite of which leg" is one group-by rather than a trace join |
+| Caps | `MAX_ARTIFACT_BYTES` = 1 MiB per file, `MAX_ARTIFACTS_PER_RUN` = 8, `MAX_SUITE_SPANS_PER_JOB` = 512; suite names control-stripped and truncated to 200 chars, and the outcome coerced into a closed vocabulary (anything else becomes `unknown`) |
+
+**Every value in that record is untrusted input.** A fork's `pull_request` runs
+the **fork's** `run-ci-suites.sh`, so suite names, outcomes and windows are
+attacker-controlled text, not repo state — hence the byte cap before parsing,
+the span cap, the sanitization (`bounded_attributes` *drops* a value over 256
+chars or containing a control character, which would silently lose the one
+attribute naming the suite), the closed outcome vocabulary, and the clamp. A
+record failing any check is skipped **and counted**, never repaired into
+something plausible.
+
+What is deliberately **not** emitted, and what a failure costs:
+
+- **A suite that did not run is absent.** A suite skipped by
+  `run-ci-suites.sh`'s live-daemon guard (#6386), missing from disk, or whose
+  result file was lost is written into the record with a `0/0` window and
+  produces no span — a
+  zero-length span at the job's start would read as "ran instantly". So a suite
+  never shows up here as a fast one.
+- **No `ci.suite` log record and no suite duration metric**, for the same
+  reasons as step spans: no metric label admits a suite dimension, and a
+  per-suite histogram would multiply the 30-day series count by every leg's
+  suite count.
+- **A failure here costs this run's suite spans and nothing else.** The work
+  happens *before* the run's units are committed, so the spans ride in their
+  job's own unit and stay exactly-once with everything else; in exchange a
+  failed download, an unparseable/foreign record, or an unmatched shard degrades
+  to no suite spans for that run, counted in the cycle's
+  `suite_artifact_failures` and logged, and is never retried. Holding a run's
+  `ci.run`/`ci.job` records hostage to a side artifact would be the worse
+  failure. Only a rate limit or a rejected credential escapes — those are
+  properties of the host and abort the whole cycle wherever they happen.
+- **Suite spans never reach a story trace.** They are appended after the
+  [story stitching](#story-stitching-9088) pass, so a per-issue story trace is
+  not swamped by one leg's ~118 suite spans.
+
+`ci-queries.sql` sections 12 (slowest suites, with retry and failure counts)
+and 13 (per-leg suite time and slowest suite, the "what to move" counterpart to
+section 10's "whether it is imbalanced") consume these.
+
+### Critical path per run (#9089)
+
+Section 14 of `ci-queries.sql` is the fourth view the issue asks for, and needs
+no new attribute — only the per-job `queued_ms` above. It ranks each run's jobs
+by **queue + running** and names the one that set the floor (`critical_job`),
+keeping that job's queue wait (`critical_queued_s`) separate from its work, and
+reports the run's own pre-job queue segment (`run_queued_s`, #9007) beside it.
+
+The residual — run wall time minus (run queue + critical job total) — is
+`unexplained_s`, and it is the number to act on: it is large exactly when jobs
+ran in **sequence** rather than one job being slow, so a `needs: build-daemon`
+fan-in is the suspect rather than any single leg. It is explicitly **not** a
+dependency-wait measurement: a real one needs the predecessor job's
+`completed_at`, which is a distinct computation and still future work. Expect it
+to go slightly negative on a run whose jobs overlap the run's own reported
+window.
+
+Still future work, tracked separately from what shipped here: per-**test**
+spans from nextest JUnit output (`[profile.ci.junit]`), which would give the
+`nextest-partition` legs what these give the shell-suite legs, and a dependency
+wait span/attribute for the time a job spent waiting on `needs: build-daemon`
+(not derivable from a single job row — it needs the predecessor job's
+`completed_at`).
 
 ### Story stitching (#9088)
 
@@ -653,6 +845,11 @@ that anyone touching this code needs to know:
   named warning) for a `gh` too old to know it.
 
 ### Why there is no `step` attribute
+
+This is a rule about the **`ci.job.log` stream**, and #9089's [step
+spans](#step-spans-9089) do not weaken it: those come from the jobs API's
+`steps[]` array, never from log text, and they carry no log body at all. No
+`ci.job.log` record has ever carried, or may carry, a step attribute.
 
 The per-job stream carries no step delimiter, so a `step` attribute could only
 be derived from the runner's own `##[group]Run …` marker text — that is, from

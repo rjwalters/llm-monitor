@@ -70,6 +70,7 @@ gh issue comment 812 --body "This issue is complex (>6 hours). Decomposed into:
 #    NEVER close a parent issue yourself; the decomposition comment above
 #    is the record, loom:blocked is the terminal state.
 gh issue edit 812 --remove-label "loom:building" --add-label "loom:blocked"
+# Record each child as a park record — see .loom/docs/park-record.md
 
 # Then exit and let the Curator/sweep pipeline pick up each sub-issue.
 ```
@@ -395,6 +396,7 @@ Each sub-issue references this parent for full context. Curator will enhance the
 EOF
 )"
 gh issue edit <parent-number> --remove-label "loom:building" --add-label "loom:blocked"
+# Record each child as a park record — see .loom/docs/park-record.md
 ```
 
 ### Real-World Example
@@ -420,6 +422,7 @@ gh issue edit <parent-number> --remove-label "loom:building" --add-label "loom:b
 # Mark parent blocked — a human closes it once the children are curated
 gh issue comment 524 --body "Decomposed into #534, #535, #536"
 gh issue edit 524 --remove-label "loom:building" --add-label "loom:blocked"
+# Record each child as a park record — see .loom/docs/park-record.md
 ```
 
 **Benefits**:

@@ -62,7 +62,7 @@ If you post a comment via `gh issue comment` / `gh api ... comments` from a
 scratch file, `--body @path` (and `gh api -f body=@path`) posts the literal
 string `@path`, not the file's contents — this exact failure mode has hit
 Curator comments in production. **Full pitfall, incident citation, and
-fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
+fixes**: [`comment-body-literal-path.md`](../loom-comment-body-literal-path/SKILL.md).
 
 ## Argument Handling
 
@@ -774,6 +774,7 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 > - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
 > - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
+> - If this instead names a resolvable dependency on another issue/PR, record it as a park record — see `.loom/docs/park-record.md`.
 
 ### Date-stamp volatile facts
 
@@ -1047,6 +1048,7 @@ fi
 
    # Cannot verify → flag, do not close:
    gh issue edit <number> --add-label "loom:blocked"
+   # Naming a specific issue/PR to verify against? Record it as a park record — see .loom/docs/park-record.md
    gh issue comment <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. Needs verification: please test and close if no longer reproducible."
    ```
 
@@ -1420,6 +1422,7 @@ Then add `loom:blocked` label:
 ```bash
 gh issue edit <number> --add-label "loom:blocked"
 ```
+Also record it as a park record so the unblock sweep can find it — see `.loom/docs/park-record.md`.
 
 ### When Dependencies Complete
 
@@ -2444,7 +2447,7 @@ By keeping issues well-organized, informative, and actionable, you help the team
 
 When you receive a probe command, respond with: `AGENT:Curator:<brief-task>` — e.g. `AGENT:Curator:enhancing-issue-456`.
 
-**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](../loom-probe-protocol/SKILL.md).**
 
 ## Completion
 

@@ -12,6 +12,7 @@ see "Config tiers" below); the operating-core guides (`CLAUDE.md` and
 - [Machine-Level Execution (Epic #3835 Phase 5, #4262)](#machine-level-execution-epic-3835-phase-5-4262)
 - [The Ungated Denial Floor](#the-ungated-denial-floor)
 - [Ask-Tier Composition (#7795)](#ask-tier-composition-7795)
+- [Credential content scan on commit and push (#9133)](#credential-content-scan-on-commit-and-push-9133)
 - [Custom Guard Hooks](#custom-guard-hooks)
 <!-- toc:end -->
 
@@ -427,6 +428,36 @@ A site whose count has moved materially since 2026-09-16 should be re-argued on
 the new data, not on this table. Read a moved count against the two caveats
 above first: check whether a precision fix has already landed for it, and
 whether the new hits are live commands or the guard firing on quoted text.
+
+## Credential content scan on commit and push (#9133)
+
+Every other credential defence is path-based: the managed `.gitignore` block,
+`CREDENTIAL_PATTERNS`, and its shell mirrors. A credential at a path nobody
+listed (a renamed `.loom/tokens.<suffix>/`, a pasted log) is invisible to all
+of them at once. `loom-daemon secret-scan` reads **content** instead: Claude
+OAuth/API keys, GitHub and Tailscale tokens, AWS key ids, Slack tokens, private
+keys and z.ai keys, each matched at its real length so short test fixtures do
+not fire. It never prints a value, only `path:line: class (fp <sha256[:8]>)`.
+
+It runs in three places, with one pattern list:
+
+| Where | Mode | Covers |
+|---|---|---|
+| `guard-loom-workflow.sh` (PreToolUse, every Loom repo) | `--for-command` | `git … commit`: everything the command could stage, including untracked files, since the hook runs before the command's own `git add`. `git … push`: every commit no remote-tracking ref has. |
+| `.githooks/pre-commit`, `.githooks/pre-push` (this repo) | `--staged`, `--pre-push` | Commits made outside a Claude session. Needs `core.hooksPath=.githooks`. |
+| CI `Daemon Checks` → `Secret Scan` | `--range <base>..<head>` | Every PR, and every push to `main`, including one that bypassed the PR rules. |
+
+Commits are scanned one at a time, not as a net diff: a value added and then
+deleted on a branch is still published by the push.
+
+Caveats: `git commit --no-verify` skips the git hooks (the guard and CI still
+apply). The guard scans the repo at the session's `cwd`; a `git -C elsewhere`
+form is left to the hooks and CI. A daemon older than the subcommand makes the
+guard allow, like every other unavailable check.
+
+A synthetic fixture that trips it goes in `.loom/secret-scan-allow`, one
+fingerprint per line with a reason. Never list a real credential there: remove
+it, and rotate it, since anything pushed to a public remote is disclosed.
 
 ## Custom Guard Hooks
 
