@@ -3540,9 +3540,6 @@ bounded reactions follow, purely from that one signal:
 |---|---|---|---|---|
 | Escalating log | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` (5m) | After this many seconds of continuous held+0-in-flight, a `WARN`-level `admission_brake: STARVING …` line fires once per streak, naming the elapsed duration |
 | Escape hatch | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` (15m) | After this many seconds, the brake yields for **exactly one tick** — held reports `false` even though the raw load reading is still over threshold — logged at `ERROR` as `admission_brake: STARVATION ESCAPE HATCH …` |
-| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410). While engaged, no new unstarred issue build is admitted; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
-| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage when `review + changes + merge` debt is **strictly above** this. Zero, negative or non-integer → default. **Live** |
-| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release when the debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 
 The escape hatch does not disable the brake or bypass #5270's "dumb mode"
 gate: it is a periodic, bounded safety valve. The starvation streak resets
@@ -3710,7 +3707,14 @@ repository is now the parallelism boundary:
   those also carrying `loom:blocked`, `loom:operator` or `loom:operator-only`
   (the set `champion-pr-merge.md` names as not merge-eligible; the critical-file
   hold is one of them, via `loom:operator`) — because Champion cannot drain
-  them (#9410). The labels come from the same listing rows. A failed listing records nothing, and an entry older than
+  them (#9410). Likewise the `loom:changes-requested` count leaves out PRs
+  Doctor will not drain — those also carrying `loom:blocked` or
+  `loom:operator-only` (`doctor.md` Priority 2's skip set, the work finder's
+  `PARK_LABELS`; this includes the Doctor-cycle-cap park) — but still counts
+  `loom:operator` (Doctor drains stale held PRs Champion routes to it, #7660)
+  and `loom:treating` (a live Doctor claim) (#9421). The
+  `loom:review-requested` count is unfiltered: Judge's queue has no label
+  exclusions. The labels come from the same listing rows. A failed listing records nothing, and an entry older than
   `demandWidth.staleSecs` is ignored, so an axis nobody has observed recently is
   **unobserved** and changes nothing. For a PR role,
   `width = clamp(ceil(debt / perRun), 1, min(max, roleMaxConcurrent budget))`
@@ -3767,8 +3771,12 @@ of its own.
   repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391))
   with `autonomous.roleRunner.demandWidth.staleSecs`:
   `debt = review + changes + merge` over the axes with a fresh entry. **No
-  forge call** is added. The merge axis excludes operator-held PRs
-  (`loom:blocked` / `loom:operator` / `loom:operator-only`). The ledger covers
+  forge call** is added. Each axis leaves out the PRs its role will not
+  drain: merge excludes operator-held PRs (`loom:blocked` / `loom:operator` /
+  `loom:operator-only`), changes excludes parked PRs (`loom:blocked` /
+  `loom:operator-only` — not `loom:operator`, which Doctor still drains;
+  #9421), and review is unfiltered. An axis whose every PR is excluded reads
+  as observed zero, not unobserved. The ledger covers
   only the repositories whose roles this host runs, so the back-off is
   per-host and two hosts can disagree.
 - **The ledger comes from the role runner. With the role runner off (or
@@ -4613,6 +4621,9 @@ knobs not yet audited here.
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
 | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410). While engaged, no new unstarred issue build is admitted; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage when `review + changes + merge` debt is **strictly above** this. Zero, negative or non-integer → default. **Live** |
+| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release when the debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |

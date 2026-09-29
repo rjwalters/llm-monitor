@@ -663,12 +663,7 @@ Issue #99: "fix the crash bug"
 → Then: Mark `loom:curated` after enhancement (NOT `loom:issue` unless starred — see "Who promotes")
 ```
 
-### Why This Matters
-
-1. **Quality Enhancement**: Curator improves issue quality before human review
-2. **Two-Gate Approval**: Architect→Human, then Curator→Human ensures thorough vetting
-3. **Approval Control**: The Curator never decides what gets implemented (`loom:issue`); a star is the operator's decision — see "Who promotes `loom:curated` → `loom:issue`" above
-4. **Clear Standards**: `loom:curated` means enhanced, `loom:issue` means approved for work
+**Why**: `loom:curated` means enhanced, `loom:issue` means approved for work — and the Curator never decides the latter (see "Who promotes").
 
 ## Decomposing Oversized Issues
 
@@ -704,9 +699,7 @@ When skipped, the Builder hits these issues at implementation time — usually a
 ./.loom/scripts/create-issue.sh --title "Sub-issue A" --label "loom:triage"
 ```
 
-### Related: Builder decomposition
-
-The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builder-complexity.md`) currently labels decomposed sub-issues with `loom:issue` directly, skipping both human approval *and* Curator review. That parallel defect is **out of scope for this rule** and should be tracked in a separate follow-up issue; the Curator rule above stands on its own.
+The Builder's decomposition path (`builder-complexity.md`) follows the same `loom:triage`-only rule.
 
 ## Curation Activities
 
@@ -758,7 +751,7 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 > - Use `grep -qFx` (exact match) — not `grep -qF` — so `src/foo.ts` doesn't match `src/foo.ts.bak`.
 > - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
-> - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
+> - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed. No numbered blocker exists; the `COMMENT` above is the recorded reason ("Adding Dependencies").
 > - If this instead names a resolvable dependency on another issue/PR, record it as a park record — see `.loom/docs/park-record.md`.
 
 ### Date-stamp volatile facts
@@ -1031,10 +1024,9 @@ fi
    gh issue comment <number> --body "Closing as not planned: resolved by PR #<pr_number> (merged <sha>); the condition no longer reproduces."
    gh issue close <number> --reason "not planned"
 
-   # Cannot verify → flag, do not close:
+   # Cannot verify → flag, do not close. Comment FIRST; never cite the merged PR as a blocker:
+   gh issue comment <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. No open numbered blocker: needs verification — please test and close if no longer reproducible."
    gh issue edit <number> --add-label "loom:blocked"
-   # Naming a specific issue/PR to verify against? Record it as a park record — see .loom/docs/park-record.md
-   gh issue comment <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. Needs verification: please test and close if no longer reproducible."
    ```
 
 **Why this matters**: closing on a **clear, stated rationale** keeps the backlog healthy and — because the work-finder only polls *open* issues — removes the item from the queue without a loop. But an **unverified** guess should be flagged, not closed, and never close an issue that is being actively built (`loom:building`) by another agent (see issue #2084 where a curator closed #1981 mid-processing, requiring manual intervention — coordinate via a comment when an issue is in flight).
@@ -1403,11 +1395,10 @@ If you discover dependencies during curation:
 This issue requires [dependency] to be implemented first.
 ```
 
-Then add `loom:blocked` label:
+Only then add `loom:blocked`. **Record the blocker before the label (#9102):** every `--add-label "loom:blocked"` needs the **body** to declare each **open** blocker — a park record (`.loom/docs/park-record.md`), a `## Dependencies` entry, or a `Blocked by #N` / `Depends on #N` / `Requires #N` line (what `check-stale-blocked`, #8927, the unblock sweep and `merge-pr.sh` read; not comments). Never cite an already-closed item — your re-check below would unblock it. No open numbered blocker? Say so in a comment posted just before the label; never invent one.
 ```bash
 gh issue edit <number> --add-label "loom:blocked"
 ```
-Also record it as a park record so the unblock sweep can find it — see `.loom/docs/park-record.md`.
 
 ### When Dependencies Complete
 

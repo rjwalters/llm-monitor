@@ -706,18 +706,15 @@ _worktree_sparse() {
 # default branch checked out. Relies on the global DEFAULT_BRANCH (resolved via
 # loom_default_branch before this is called).
 fetch_latest_main() {
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
-    fi
-
-    if git fetch origin "$DEFAULT_BRANCH" 2>/dev/null; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Fetched latest origin/$DEFAULT_BRANCH"
-        fi
+    # `--` ends option parsing (#9106); loom_default_branch has already refused
+    # an unsafe $DEFAULT_BRANCH before this function can be reached.
+    local quiet=""
+    [[ "$JSON_OUTPUT" == "true" ]] && quiet=1
+    [[ -n "$quiet" ]] || print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
+    if git fetch origin -- "$DEFAULT_BRANCH" 2>/dev/null; then
+        [[ -n "$quiet" ]] || print_success "Fetched latest origin/$DEFAULT_BRANCH"
     else
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
-        fi
+        [[ -n "$quiet" ]] || print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
     fi
 }
 
@@ -1415,6 +1412,13 @@ if ! DEFAULT_BRANCH="$(loom_default_branch)"; then
     exit 1
 fi
 
+# #9106: $DEFAULT_BRANCH reaches `git fetch origin -- "$DEFAULT_BRANCH"` (and
+# `origin/$DEFAULT_BRANCH` refs) as a bare operand. It is normally locally
+# derived, but LOOM_DEFAULT_BRANCH is an env escape hatch and `ls-remote
+# --symref` reads it off the remote — so loom_default_branch validates its own
+# result and returns non-zero on an unsafe name, which lands in the arm above
+# (check_branch_name has already printed the precise refusal to stderr).
+
 # Fetch latest changes from origin/$DEFAULT_BRANCH before creating the worktree
 # Uses fetch-only to avoid conflicts with worktrees that have it checked out
 fetch_latest_main
@@ -1430,13 +1434,18 @@ fetch_latest_main
 BASE_REF="origin/$DEFAULT_BRANCH"
 BASE_DISPLAY="$DEFAULT_BRANCH"
 if [[ -n "$BASE_BRANCH" ]]; then
-    git fetch origin "$BASE_BRANCH" 2>/dev/null || true
+    # #9106: --base names a branch that reaches `git fetch` as a bare operand.
+    # Refuse an unsafe name outright — a `--base --upload-pack=/tmp/x` would
+    # otherwise be handed straight to git as a switch.
+    check_branch_name "$BASE_BRANCH" "--base branch" || {
+        [[ "$JSON_OUTPUT" == "true" ]] && echo '{"success": false, "error": "unsafe-base-branch-name", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
+        exit 1
+    }
+    git fetch origin -- "$BASE_BRANCH" 2>/dev/null || true
     if git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
-        BASE_REF="origin/$BASE_BRANCH"
-        BASE_DISPLAY="origin/$BASE_BRANCH"
+        BASE_REF="origin/$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
     elif git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-        BASE_REF="$BASE_BRANCH"
-        BASE_DISPLAY="$BASE_BRANCH"
+        BASE_REF="$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
     else
         if [[ "$JSON_OUTPUT" == "true" ]]; then
             echo '{"success": false, "error": "base-branch-not-found", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
@@ -1446,9 +1455,7 @@ if [[ -n "$BASE_BRANCH" ]]; then
         fi
         exit 1
     fi
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
-    fi
+    [[ "$JSON_OUTPUT" == "true" ]] || print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
 fi
 
 # Determine branch name
@@ -1632,7 +1639,9 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # keyed on the base branch: when $stale_ref IS origin/$BRANCH_NAME
             # its own remote was already fetched by the drift check above, and
             # refreshing the base too is harmless.
-            if git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
+            # `--` ends option parsing (#9106); both candidate operands were
+            # already gated by check_branch_name above.
+            if git -C "$WORKTREE_PATH" fetch origin -- "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
                loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
                 if [[ "$JSON_OUTPUT" != "true" ]]; then
                     print_success "Stale worktree reset to $stale_display"

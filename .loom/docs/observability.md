@@ -507,7 +507,10 @@ clears. At a sweep's terminal transition, the execution's exact token
 breakdown is journalled as one `loom.runtime.usage` span per model and scope
 (execution/attempt) in the sweep's trace,
 and the transcript-ingest pass stamps the sweep's `session.summary` log with
-the same trace when the match is unambiguous. Details are in
+the same trace when the match is unambiguous — which needs the summary to know
+its issue, so #9445 resolves that from the session's worktree/branch as well as
+from a slash-command argument (and its `loom.repo` from the workspace's git
+remote, as an `owner/name` slug or not at all). Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new

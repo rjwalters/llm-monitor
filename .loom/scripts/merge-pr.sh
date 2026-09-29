@@ -466,11 +466,14 @@ source "$SCRIPT_DIR/lib/branch-landed.sh"
 # fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
 # to the literal "main"/"master" check in _maybe_delete_local_branch below.
 DEFAULT_BRANCH_NAME=""
-if [[ -f "$SCRIPT_DIR/lib/default-branch.sh" ]]; then
-  # shellcheck source=lib/default-branch.sh
-  source "$SCRIPT_DIR/lib/default-branch.sh"
-  DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
-fi
+# Sourced UNCONDITIONALLY (#9106). This lib carries check_branch_name, the
+# ref-operand validator every forge-derived branch name below must pass before
+# it reaches a git argv, and a fail-closed security guard must not be optional:
+# the old `if [[ -f ... ]]` guard let a partially-resynced .loom/ drop the
+# validator silently. A missing lib now aborts here instead.
+# shellcheck source=lib/default-branch.sh
+source "$SCRIPT_DIR/lib/default-branch.sh"
+DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
 forge_detect
 
 # Use gh-cached for read-only queries to reduce API calls (see issue #1609)
@@ -621,6 +624,13 @@ PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha // empty')
 # forge_get_pr responses already carry a `labels` array in this shape, so no
 # extra API call is needed beyond the fetch above.
 PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)
+# #9106: $PR_BRANCH is `.head.ref` — chosen by whoever opened the PR. Everything
+# downstream (the _recheck_mergeable_before_refusal fetch, branch_landed,
+# update-ref refs/loom/parent/<branch>, the local `git branch -D`) puts it in a
+# git argv, so it is validated ONCE here and the merge is denied outright if it
+# is not a safe ref operand. The reason names the offending ref, so the refusal
+# is greppable in the run log.
+check_branch_name "$PR_BRANCH" "head branch of PR #$PR_NUMBER" || error "Merge blocked: PR #$PR_NUMBER's head branch is not a safe git ref operand (see the check_branch_name refusal above, #9106). Refusing before any git command runs on '$PR_BRANCH'. Rename the branch on the PR and re-run."
 
 # Check if already merged
 if [[ "$PR_MERGED" == "true" ]]; then
@@ -808,7 +818,7 @@ _check_champion_hold_state_staleness() {
 _check_loom_pr_label() {
   local msg rc=0 flags=()
   [[ "$ALLOW_UNAPPROVED" == "true" ]] && flags+=(--allow-unapproved)
-  msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr loom-pr-guard --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" "${flags[@]}" 2>/dev/null)" || rc=$?
+  msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr loom-pr-guard --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" ${flags[@]+"${flags[@]}"} 2>/dev/null)" || rc=$?
   if [[ $rc -eq 0 && "$msg" == "LOOM-PR-GUARD-CLEAN" ]]; then
     _check_champion_hold_state_staleness
     return 0
@@ -928,6 +938,7 @@ _check_loom_pr_label
 # _mp_daemon_roll_hint's `${sub} >= ` lookup resolving to the merge-gate version,
 # which is the one a refused MERGE should name.
 # requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
+# requires-daemon: notify-cleared-blockers optional   #9102 — the post-merge close-triggered loom:blocked re-check; a daemon lacking the verb exits non-zero, `_notify_cleared_blockers` prints one warning and the merge proceeds. A delayed notice, never a failed merge: the next sweep's `check-stale-blocked` pre-wave pass reports the same stale block.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -1576,18 +1587,28 @@ _strip_one_closed_issue_building_label() {
 _strip_closed_issue_building_labels() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
 
-  local close_targets
+  local close_targets issue_num
   close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
   [[ -n "$close_targets" ]] || return 0
 
-  local issue_num
+  # Loop status is 0: each body command (continue / the helper) returns 0.
   while IFS= read -r issue_num; do
     [[ -n "$issue_num" ]] || continue
     _strip_one_closed_issue_building_label "$issue_num"
   done <<< "$close_targets"
-
-  return 0
 }
+
+# ---------------------------------------------------------------------------
+# Close-triggered `loom:blocked` re-check (#9102; item 2 of #8927's deferred
+# fix list). `loom-daemon check-stale-blocked` (#8927) finds a stale block at
+# the next sweep pre-wave; this finds it the moment the blocker closes: every
+# open `loom:blocked` issue/PR citing this merged PR, or an issue it closed, as
+# a blocker gets a comment now (never a label edit). Resolving the closed set,
+# the decision and the comment all live in `loom-daemon notify-cleared-blockers`
+# (reusing the advisory's enumeration and the `dep_recheck` parsers — no second
+# parser, .loom/docs/shell-language-policy.md); it always exits 0. Best-effort
+# and GitHub-only, like every step in this section.
+_notify_cleared_blockers() { [[ "$FORGE_TYPE" == "github" ]] || return 0; "${LOOM_DAEMON_BIN:-loom-daemon}" notify-cleared-blockers --pr "$PR_NUMBER" --repo "$REPO_NWO" --repo-root "${REPO_ROOT:-.}" --quiet || warning "Close-triggered loom:blocked re-check (#9102) did not run; the next sweep's check-stale-blocked pass still covers it."; }
 
 # ---------------------------------------------------------------------------
 # Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,
@@ -1837,8 +1858,17 @@ _recheck_mergeable_before_refusal() {
   # git merge-tree check before conceding this is a genuine conflict.
   [[ -n "$resolved_attempt" ]] && _MPR_FLAGS+=(--resolved-attempt "$resolved_attempt")
   if [[ -z "$resolved_attempt" ]]; then
+    # #9106: both refs are forge-controlled ($base_ref from `.base.ref`,
+    # $head_ref from `.head.ref`) and the fetch below puts them in a git argv.
+    # A name git would parse as a switch is refused HERE, before the fetch —
+    # refuse-stale is the fail-closed verdict (it denies the merge without
+    # claiming a content conflict). An EMPTY ref keeps its pre-existing
+    # --refs-missing classification, which this must not swallow. The `--`
+    # after `origin` is defence in depth, not the gate.
     if [[ -z "$base_ref" || -z "$head_ref" ]]; then _MPR_FLAGS+=(--refs-missing)
-    elif git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
+    elif ! check_branch_name "$base_ref" "base ref of PR #$pr_number" || ! check_branch_name "$head_ref" "head ref of PR #$pr_number"; then
+      echo "refuse-stale:PR #$pr_number carries a ref name that is not a safe git operand (base='$base_ref' head='$head_ref') — refused before 'git fetch' could parse it as a switch (#9106). Rename the branch on the PR and re-run."; return 0
+    elif git -C "$repo_root" fetch -q origin -- "$base_ref" "$head_ref" 2>/dev/null; then
       if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then _MPR_FLAGS+=(--tree clean); else _MPR_FLAGS+=(--tree conflict); fi
     else _MPR_FLAGS+=(--fetch-failed); fi
   fi
@@ -2427,6 +2457,11 @@ _reset_partial_increment_labels || true
 # header comment above) and at the same confirmed-merge choke point.
 # Best-effort — never fails the merge.
 _strip_closed_issue_building_labels || true
+
+# Close-triggered loom:blocked re-check (#9102). Runs right after the
+# loom:building cleanup above, at the same confirmed-merge choke point.
+# Best-effort — never fails the merge. See the function's own header above.
+_notify_cleared_blockers || true
 
 # Automated stacked-PR reconciliation (#3747, stacked-PR v2 item 1). Runs at the
 # same confirmed-merge choke point, and BEFORE branch deletion below so the
