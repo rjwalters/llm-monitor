@@ -888,8 +888,22 @@ class OAuthPoller: ObservableObject {
         return rolledOver ? rolledOverCodexSnapshotMessage : noCodexSnapshotMessage
     }
 
-    /// Read one Loom profile's latest rate-limit snapshot. Never spawns
-    /// `codex`, never reads a credential (see `CodexProfiles`).
+    /// Read one Loom profile's current rate limits, from whichever of the two
+    /// read-only sources saw the account most recently. Never spawns `codex`,
+    /// never reads a credential (see `CodexProfiles` / `LoomAccountsCheck`).
+    ///
+    /// 1. **Loom's live check** (`LoomAccountsCheck`, #230) — measured inside
+    ///    the profile's own session container by the process that owns its
+    ///    refresh chain, and cached by `refreshLoomCodexLiveReadings`.
+    /// 2. **The profile's rollout snapshot** (`CodexProfiles`) — whatever Codex
+    ///    itself last recorded on disk during normal use.
+    ///
+    /// The live reading wins **only when it is newer**, never merely because it
+    /// is live: a host whose container is down reports `session_unavailable`
+    /// with no measurement at all, and letting that displace a good local
+    /// reading is precisely the stale-overwrite the freshness rules (#148)
+    /// exist to prevent. Either way the row carries *the observation's own*
+    /// timestamp, so `AccountFreshness`'s backstop applies unchanged.
     // Not private: SelfTest drives it directly (it is synchronous, so the
     // real poll path runs without an async hop), like `updateCredentialStatus`.
     func pollCodexSnapshot(_ credential: OAuthCredential) {
@@ -907,27 +921,119 @@ class OAuthPoller: ObservableObject {
             updateCredentialStatus(credential, status: loggedOut || !rolledOver ? .missing : .valid, error: message)
             if let id = credential.id { persistCredentialError(id: id, error: message) }
         }
-        guard let snapshot = CodexProfiles.latestSnapshot(home: home) else {
-            reportNoReading(rolledOver: false)
-            return
-        }
-        guard !snapshot.rateLimit.isEmpty else {
-            // Every window in the newest reading has rolled over since: the
-            // account's current usage is unknown, not what it was then.
-            reportNoReading(rolledOver: true)
+        let rollout = CodexProfiles.latestSnapshot(home: home)
+        let usableRollout = rollout.flatMap { $0.rateLimit.isEmpty ? nil : $0 }
+        let live = loomCodexLiveReading(home: home)
+
+        let observedAt: Date
+        let rateLimit: RateLimitSnapshot
+        let plan: String?
+        let source: String
+        if let live = live, usableRollout.map({ live.observedAt > $0.observedAt }) ?? true {
+            observedAt = live.observedAt
+            rateLimit = live.rateLimit
+            plan = nil  // `accounts check` reports availability, not the plan name.
+            source = "loom-accounts-check-live"
+        } else if let snapshot = usableRollout {
+            observedAt = snapshot.observedAt
+            rateLimit = snapshot.rateLimit
+            plan = snapshot.plan
+            source = "codex-rollout-snapshot"
+        } else {
+            // Neither source has a current reading. `rolledOver` distinguishes
+            // "this profile has never recorded one" from "its newest one has
+            // since rolled over", because the two have different remedies.
+            reportNoReading(rolledOver: rollout != nil)
             return
         }
         writeSnapshotToDB(accountId: accountId, snapshot: ProviderUsageSnapshot(
             provider: .openai, accountKey: accountId, httpStatus: 200,
-            rateLimit: snapshot.rateLimit, plan: snapshot.plan,
-            rawFields: ["source": "codex-rollout-snapshot",
-                        "observed_at": ISO8601DateFormatter().string(from: snapshot.observedAt)]
-        ), observedAt: snapshot.observedAt)
-        if let plan = snapshot.plan, let db = try? openDatabase(dbPath) {
+            rateLimit: rateLimit, plan: plan,
+            rawFields: ["source": source,
+                        "observed_at": ISO8601DateFormatter().string(from: observedAt)]
+        ), observedAt: observedAt)
+        if let plan = plan, let db = try? openDatabase(dbPath) {
             try? db.run("UPDATE accounts SET plan = ? WHERE id = ?", plan, accountId)
         }
         updateCredentialLastPoll(credential, error: nil)
         updateCredentialStatus(credential, status: .valid, error: nil)
+    }
+
+    // MARK: - Loom live Codex check (#230)
+
+    /// How often `loom-daemon accounts check --live` is run, in seconds.
+    /// Matched to the usage poll: it *is* the usage reading for a pooled
+    /// profile, and running it more often would spend container probes on data
+    /// nothing reads any sooner.
+    var loomLiveCheckInterval: TimeInterval = 600
+
+    private var lastLoomLiveCheck: Date?
+    /// The newest live report's rows, by account name. Empty until the first
+    /// successful run, and deliberately **kept** across a failed one: an
+    /// already-fetched reading does not become wrong because the next probe
+    /// could not run, and `pollCodexSnapshot`'s newer-wins rule retires it on
+    /// its own as soon as a rollout snapshot overtakes it.
+    private var loomLiveReadings: [String: LoomAccountsCheck.Reading] = [:]
+    /// A host that does not run Loom has no daemon binary. That is a normal
+    /// steady state, not a fault, so it is said once per process.
+    private var reportedLoomDaemonUnavailable = false
+
+    /// The live reading for a profile home, or nil when none was measured.
+    /// A row the probe could not measure (`not_logged_in`,
+    /// `session_unavailable`, …) carries no windows and is **not** a reading —
+    /// it never displaces the rollout snapshot.
+    func loomCodexLiveReading(home: String) -> LoomAccountsCheck.Reading? {
+        let profile = (home as NSString).lastPathComponent
+        guard !profile.isEmpty else { return nil }
+        let report = LoomAccountsCheck.Report(observedAt: .distantPast, readings: loomLiveReadings)
+        return report.reading(forProfile: profile).flatMap { $0.hasMeasurement ? $0 : nil }
+    }
+
+    /// Test seam: inject a live report without spawning `loom-daemon`.
+    /// `SelfTest` uses it to drive `pollCodexSnapshot`'s newer-wins rule
+    /// offline, the same way it drives the snapshot path directly.
+    func setLoomCodexLiveReadings(_ readings: [String: LoomAccountsCheck.Reading]) {
+        loomLiveReadings = readings
+    }
+
+    /// Refresh the cached live readings if the cadence has elapsed and this
+    /// host actually has snapshot-mode profiles to refresh.
+    ///
+    /// Every failure mode — no `loom-daemon`, a disabled shared registry, a
+    /// spawn error, a timeout, undecodable output — leaves the cache alone and
+    /// returns silently. The rollout-snapshot path is a complete fallback, so
+    /// none of them is an error worth marking an account unhealthy for.
+    @discardableResult
+    func refreshLoomCodexLiveReadings(
+        for credentials: [OAuthCredential], force: Bool = false
+    ) async -> Int {
+        guard credentials.contains(where: { $0.isCodexSnapshotOnly }) else { return 0 }
+        let now = Date()
+        if !force, let last = lastLoomLiveCheck, now.timeIntervalSince(last) < loomLiveCheckInterval {
+            return 0
+        }
+        // Stamped before the run, not after: a slow or failing probe must not
+        // become a hot loop (the same rule the transcript ingest follows).
+        lastLoomLiveCheck = now
+        guard let binary = LoomAccountsCheck.resolveBinary(),
+              let workspace = LoomAccountsCheck.workspace() else {
+            if !reportedLoomDaemonUnavailable {
+                reportedLoomDaemonUnavailable = true
+                flog.info("Loom live Codex check unavailable (no loom-daemon binary, or the shared "
+                          + "account registry is disabled) — using rollout snapshots only", category: fcat)
+            }
+            return 0
+        }
+        guard let report = await LoomAccountsCheck.run(binary: binary, workspace: workspace) else {
+            flog.warning("Loom live Codex check produced no readable report — keeping rollout snapshots",
+                         category: fcat)
+            return 0
+        }
+        loomLiveReadings = report.readings
+        let measured = report.readings.values.filter { $0.hasMeasurement }.count
+        flog.info("Loom live Codex check: \(measured)/\(report.readings.count) profile(s) measured",
+                  category: fcat)
+        return measured
     }
 
     /// Whether `home` lives under Loom's Codex profile root, i.e. is owned by
@@ -1925,6 +2031,9 @@ class OAuthPoller: ObservableObject {
             return
         }
         flog.info("pollAll: polling \(credentials.count) credential(s)", category: fcat)
+        // Warmed before the loop so every snapshot-mode row in this pass reads
+        // the same report, rather than one probe per account (#230).
+        await refreshLoomCodexLiveReadings(for: credentials)
 
         for credential in credentials {
             await pollWithRetry(credential)
@@ -1942,6 +2051,9 @@ class OAuthPoller: ObservableObject {
         let credentials = loadActiveCredentials()
         reportStrandedCodexIdentities()
         guard !credentials.isEmpty else { return 0 }
+        // Self-throttling on its own cadence, so calling it every tick is cheap
+        // when it is not due (#230).
+        await refreshLoomCodexLiveReadings(for: credentials)
 
         let now = Date()
         var polled = 0

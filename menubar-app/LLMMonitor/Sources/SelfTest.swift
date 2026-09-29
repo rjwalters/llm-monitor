@@ -75,6 +75,10 @@ enum SelfTest {
         testDataDirectoryMigration()
         testCodexRolloutSnapshotParsing()
         testCodexProfileSyncSnapshotMode()
+        testLoomLiveCheckDecoding()
+        testLoomDaemonBinaryAndWorkspaceResolution()
+        testLoomLiveCheckSpawnAgainstStub()
+        testLoomLiveReadingPreferredOnlyWhenNewer()
         testClaudeTokenFileScanning()
         testClaudeTokenTargetAndAccountsEnv()
         testClaudeAccountRekey()
@@ -989,6 +993,309 @@ enum SelfTest {
             expectEqual(CodexProfiles.root(environment: ["LOOM_CODEX_PROFILE_ROOT": " "]), nil,
                         "an explicitly empty LOOM_CODEX_PROFILE_ROOT disables profiles, as in loom-daemon")
         }
+    }
+
+    // MARK: Loom live Codex check (#230)
+
+    /// A `loom-daemon accounts check --provider codex --live --json` document
+    /// in its populated (`report`-nested) envelope, shaped from loom-daemon
+    /// 0.19.503's `ProbeReport::to_json` / `AccountResult::to_json`. Every row
+    /// exercises one of the outcomes the decoder must tell apart.
+    ///
+    /// Reset instants are substituted at call time so "already rolled over" and
+    /// "still live" stay true whenever the suite runs.
+    private static func loomLiveCheckFixture(rankedAt: String, ahead: String, behind: String) -> String {
+        """
+        {
+          "workspace": "/home/ubuntu",
+          "report": {
+            "ranked_at": "\(rankedAt)",
+            "accounts": [
+              {"name": "agent-1", "status": "available", "5h_utilization": 0.12,
+               "7d_utilization": 0.43, "5h_reset": "\(ahead)", "7d_reset": "\(ahead)",
+               "limit_reset": "\(ahead)", "reset_overdue": false},
+              {"name": "agent-2", "status": "unknown", "5h_utilization": null,
+               "7d_utilization": null, "5h_reset": null, "7d_reset": null,
+               "limit_reset": null, "reset_overdue": false, "error": "not_logged_in"},
+              {"name": "agent-3", "status": "unknown", "5h_utilization": null,
+               "7d_utilization": null, "5h_reset": null, "7d_reset": null,
+               "limit_reset": null, "reset_overdue": false, "error": "session_unavailable"},
+              {"name": "agent-4", "status": "exhausted", "5h_utilization": null,
+               "7d_utilization": 1.0, "5h_reset": null, "7d_reset": "\(behind)",
+               "limit_reset": "\(behind)", "reset_overdue": true, "error": "plan_exhausted"}
+            ],
+            "overdue_reset_accounts": 1
+          },
+          "ranking_path": null,
+          "marked_exhausted": [],
+          "cleared": []
+        }
+        """
+    }
+
+    /// Decoding the live-check document: both envelopes, the fraction→percent
+    /// scale, absent-vs-zero, and the rolled-over drop.
+    private static func testLoomLiveCheckDecoding() {
+        let now = Date(timeIntervalSince1970: 1790700000)
+        let iso = ISO8601DateFormatter()
+        let rankedAt = iso.string(from: now.addingTimeInterval(-30))
+        let ahead = iso.string(from: now.addingTimeInterval(3600))
+        let behind = iso.string(from: now.addingTimeInterval(-3600))
+        let fixture = loomLiveCheckFixture(rankedAt: rankedAt, ahead: ahead, behind: behind)
+
+        guard let report = LoomAccountsCheck.decode(Data(fixture.utf8), now: now) else {
+            expect(false, "the populated `report`-nested envelope must decode"); return
+        }
+        expectEqual(report.observedAt, UsageRecord.parseISO(rankedAt),
+                    "the report's own ranked_at is the observation instant")
+        expectEqual(report.readings.count, 4, "every named row is decoded")
+
+        let measured = report.reading(forProfile: "agent-1")
+        expectEqual(measured?.rateLimit.session?.usedPercent, 12,
+                    "5h_utilization is a 0-1 fraction and is scaled to a percent")
+        expectEqual(measured?.rateLimit.weekly?.usedPercent, 43, "7d_utilization likewise")
+        expectEqual(measured?.rateLimit.session?.durationSeconds, 5 * 3600,
+                    "a kind-labelled window takes its bucket's nominal duration")
+        expectEqual(measured?.rateLimit.weekly?.durationSeconds, 7 * 86400, "…and the weekly bucket's")
+        expectEqual(measured?.rateLimit.weekly?.resetAt, UsageRecord.parseISO(ahead), "7d_reset rides along")
+        expect(measured?.hasMeasurement == true, "a measured row is a usable reading")
+
+        let notLoggedIn = report.reading(forProfile: "agent-2")
+        expectEqual(notLoggedIn?.detail, "not_logged_in", "the probe's reason is carried verbatim")
+        expect(notLoggedIn?.rateLimit.session == nil && notLoggedIn?.rateLimit.weekly == nil,
+               "a null utilization is unknown, never 0% used")
+        expect(notLoggedIn?.hasMeasurement == false,
+               "a not-logged-in row is not a reading and must never displace a snapshot")
+
+        let sessionDown = report.reading(forProfile: "agent-3")
+        expectEqual(sessionDown?.detail, "session_unavailable",
+                    "no running session container is reported, not guessed at")
+        expect(sessionDown?.hasMeasurement == false,
+               "a session-unavailable row carries no measurement at all")
+
+        let overdue = report.reading(forProfile: "agent-4")
+        expect(overdue?.rateLimit.weekly == nil,
+               "a window whose reset already passed is dropped as unknown, never carried forward")
+        expect(overdue?.hasMeasurement == false, "…which leaves that row with nothing measured")
+
+        expectEqual(report.reading(forProfile: "AGENT-1")?.name, "agent-1",
+                    "profile matching falls back to a case-insensitive name")
+        expect(report.reading(forProfile: "agent-99") == nil,
+               "a profile with no row in the report simply has no live reading")
+
+        // The empty-pool envelope puts `accounts` at the top level. A host with
+        // no Codex pool is a valid, empty report — not a decode failure.
+        let empty = #"{"workspace":"/home/ubuntu","accounts":[],"ranking_path":null}"#
+        guard let emptyReport = LoomAccountsCheck.decode(Data(empty.utf8), fallbackObservedAt: now, now: now) else {
+            expect(false, "the empty-pool envelope must decode as an empty report"); return
+        }
+        expect(emptyReport.readings.isEmpty, "…with no readings")
+        expectEqual(emptyReport.observedAt, now, "a report with no ranked_at falls back to the read instant")
+
+        expect(LoomAccountsCheck.decode(Data("not json at all".utf8)) == nil,
+               "an unparseable document is no report")
+        expect(LoomAccountsCheck.decode(Data(#"{"workspace":"/x"}"#.utf8)) == nil,
+               "a document with no accounts array is no report")
+    }
+
+    /// `loom-daemon` resolution + the workspace rule, and the fallback when the
+    /// binary is absent. Mirrors `testCodexBinaryResolution`.
+    private static func testLoomDaemonBinaryAndWorkspaceResolution() {
+        withSelfTestTempDir("loom-daemon-bin") { dir in
+            do {
+                let stub = try writeStub(in: dir, name: "loom-daemon", body: "#!/bin/sh\nexit 0\n")
+                expectEqual(LoomAccountsCheck.resolveBinary(environment: ["PATH": dir.path]), stub,
+                            "a PATH entry resolves to an absolute loom-daemon path")
+                expectEqual(
+                    LoomAccountsCheck.resolveBinary(environment: [
+                        LoomAccountsCheck.overrideEnvKey: stub, "PATH": "/nowhere",
+                    ]),
+                    stub, "LLM_MONITOR_LOOM_DAEMON_BIN wins over PATH"
+                )
+                expect(
+                    LoomAccountsCheck.resolveBinary(environment: [
+                        LoomAccountsCheck.overrideEnvKey: dir.appendingPathComponent("absent").path,
+                        "PATH": dir.path,
+                    ]) == nil,
+                    "an override that does not resolve fails loudly rather than silently using PATH"
+                )
+                expect(
+                    LoomAccountsCheck.resolveBinary(environment: ["PATH": "/nowhere", "HOME": "/nowhere"]) == nil,
+                    "a host with no loom-daemon has no live check — the snapshot path is the fallback"
+                )
+
+                expectEqual(LoomAccountsCheck.workspace(environment: ["LOOM_SHARED_ACCOUNTS_ROOT": "/srv/pool"]),
+                            "/srv/pool", "the shared accounts root is honoured verbatim")
+                expectEqual(LoomAccountsCheck.workspace(environment: ["LOOM_SHARED_ACCOUNTS_ROOT": " "]), nil,
+                            "an explicitly empty LOOM_SHARED_ACCOUNTS_ROOT disables it, as in loom-daemon")
+                expectEqual(LoomAccountsCheck.arguments(workspace: "/srv/pool"),
+                            ["accounts", "check", "--provider", "codex", "--live", "--json",
+                             "--workspace", "/srv/pool"],
+                            "--ranking is never passed: the command stays a pure read")
+            } catch {
+                checks += 1
+                failures.append("loom-daemon binary resolution test threw: \(error)")
+            }
+        }
+    }
+
+    /// The end-to-end spawn, against a stub that prints the fixture on stdout,
+    /// noise on stderr, and exits **1** — the status `accounts check` uses for
+    /// "no account is dispatchable", which must not suppress a perfectly good
+    /// report. Plus the two ways the run yields nothing.
+    private static func testLoomLiveCheckSpawnAgainstStub() {
+        withSelfTestTempDir("loom-live") { dir in
+            do {
+                let now = Date()
+                let iso = ISO8601DateFormatter()
+                let fixture = loomLiveCheckFixture(
+                    rankedAt: iso.string(from: now.addingTimeInterval(-30)),
+                    ahead: iso.string(from: now.addingTimeInterval(3600)),
+                    behind: iso.string(from: now.addingTimeInterval(-3600))
+                )
+                let oneLine = fixture.replacingOccurrences(of: "\n", with: " ")
+                let good = try writeStub(in: dir, name: "loom-daemon", body: """
+                #!/bin/sh
+                echo "Registry: repo: /home/ubuntu/.loom/accounts.json" >&2
+                echo "Resolved workspace: /home/ubuntu" >&2
+                echo '\(oneLine)'
+                exit 1
+                """)
+                guard let report = runBlockingReport({
+                    await LoomAccountsCheck.run(binary: good, workspace: "/home/ubuntu", timeout: 20)
+                }) else {
+                    expect(false, "a stub printing the report on stdout must be read"); return
+                }
+                expectEqual(report.readings.count, 4,
+                            "exit 1 ('no account dispatchable') is still a readable report")
+                expectEqual(report.reading(forProfile: "agent-1")?.rateLimit.weekly?.usedPercent, 43,
+                            "…decoded from stdout, with the stderr preamble ignored")
+
+                let silent = try writeStub(in: dir, name: "silent", body: "#!/bin/sh\necho oops >&2\nexit 2\n")
+                expect(runBlockingReport({
+                    await LoomAccountsCheck.run(binary: silent, workspace: "/home/ubuntu", timeout: 20)
+                }) == nil, "a child that prints no JSON yields no report, and no error state")
+
+                expect(runBlockingReport({
+                    await LoomAccountsCheck.run(binary: dir.appendingPathComponent("gone").path,
+                                                workspace: "/home/ubuntu", timeout: 20)
+                }) == nil, "a spawn failure is a silent fallback to rollout snapshots")
+            } catch {
+                checks += 1
+                failures.append("loom live check spawn test threw: \(error)")
+            }
+        }
+    }
+
+    /// `pollCodexSnapshot`'s source choice: the live reading wins only when it
+    /// is genuinely newer than the rollout snapshot, and never when it measured
+    /// nothing. Drives the poller offline through its injection seam.
+    private static func testLoomLiveReadingPreferredOnlyWhenNewer() {
+        withSelfTestTempDir("loom-live-poll") { dir in
+            let fm = FileManager.default
+            let root = dir.appendingPathComponent("codex-profiles").path
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+
+            let home = (root as NSString).appendingPathComponent("agent-1")
+            try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
+            let auth = try! JSONSerialization.data(withJSONObject: ["tokens": ["account_id": "acct-agent-1"]])
+            fm.createFile(atPath: home + "/auth.json", contents: auth)
+
+            // The rollout snapshot: recorded two hours ago, 43% weekly.
+            let snapshotAt = Date().addingTimeInterval(-7200)
+            let snapshotISO = ISO8601DateFormatter().string(from: snapshotAt)
+            let line = #"{"timestamp":"\#(snapshotISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
+            fm.createFile(atPath: home + "/sessions/2026/09/23/rollout-a.jsonl",
+                          contents: Data((line + "\n").utf8))
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            expectEqual(poller.syncCodexProfiles(root: root), 1, "the fixture profile registers")
+            @MainActor func credential() -> OAuthCredential? {
+                poller.loadActiveCredentials().first { $0.isCodexSnapshotOnly }
+            }
+            func weeklyRows() -> [(String?, Double?)] {
+                let db = try! openDatabase(dbPath)
+                var out: [(String?, Double?)] = []
+                for r in try! db.prepare("""
+                    SELECT timestamp, weekly_all_percent FROM usage_history
+                    WHERE account_id = 'acct-agent-1' AND is_synthetic = 0 ORDER BY rowid
+                """).bind() {
+                    out.append((r[0] as? String, r[1] as? Double))
+                }
+                return out
+            }
+
+            func reading(at observedAt: Date, weekly: Double?, detail: String? = nil)
+                -> LoomAccountsCheck.Reading {
+                let window = weekly.map {
+                    RateLimitWindow(kind: .weekly, usedPercent: $0,
+                                    resetAt: Date().addingTimeInterval(3 * 86400), status: "allowed")
+                }
+                return LoomAccountsCheck.Reading(
+                    name: "agent-1", status: weekly == nil ? "unknown" : "available",
+                    detail: detail, observedAt: observedAt,
+                    rateLimit: RateLimitSnapshot(weekly: window)
+                )
+            }
+
+            // 1. A live reading OLDER than the rollout snapshot must not win.
+            poller.setLoomCodexLiveReadings(
+                ["agent-1": reading(at: snapshotAt.addingTimeInterval(-3600), weekly: 5)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 43,
+                        "an older live reading never overwrites the newer rollout snapshot")
+            expectEqual(weeklyRows().last?.0, snapshotISO, "…and the row keeps the snapshot's own timestamp")
+
+            // 2. A newer live reading wins, and carries its own observation time.
+            let liveAt = snapshotAt.addingTimeInterval(3600)
+            let liveISO = ISO8601DateFormatter().string(from: liveAt)
+            poller.setLoomCodexLiveReadings(["agent-1": reading(at: liveAt, weekly: 61)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 61, "a newer live reading is preferred over the snapshot")
+            expectEqual(weeklyRows().last?.0, liveISO,
+                        "the row carries the live observation's own timestamp, so the staleness backstop applies")
+
+            // 3. A newer row that measured NOTHING is not a reading at all.
+            poller.setLoomCodexLiveReadings(
+                ["agent-1": reading(at: liveAt.addingTimeInterval(3600), weekly: nil,
+                                    detail: "session_unavailable")])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 61,
+                        "a session_unavailable row never displaces a reading with real numbers")
+
+            // 4. No live readings at all: the rollout snapshot still polls.
+            poller.setLoomCodexLiveReadings([:])
+            let before = weeklyRows().count
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().count, before,
+                        "re-reading the unchanged snapshot writes no duplicate row")
+            expectEqual(try! openDatabase(dbPath).scalar(
+                "SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'acct-agent-1' AND last_error IS NOT NULL") as? Int64,
+                0, "the fallback path is a normal successful poll, not an error state")
+        }
+    }
+
+    /// `runBlocking`'s counterpart for the live check, whose result type is a
+    /// `LoomAccountsCheck.Report?` rather than a `ProviderUsageSnapshot`.
+    private static func runBlockingReport(
+        _ operation: @escaping @Sendable () async -> LoomAccountsCheck.Report?
+    ) -> LoomAccountsCheck.Report? {
+        let box = ReportBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.report = await operation()
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success else { return nil }
+        return box.report
+    }
+
+    /// `@unchecked Sendable` on the same basis as `AsyncOutcomeBox`: exactly one
+    /// writer (the detached task, before it signals), exactly one reader (the
+    /// calling thread, only after the semaphore wait returns).
+    private final class ReportBox: @unchecked Sendable {
+        var report: LoomAccountsCheck.Report?
     }
 
     // MARK: Data directory rename (2.0)
