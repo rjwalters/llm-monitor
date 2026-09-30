@@ -84,6 +84,8 @@
 # no loom: label` query) stays in judge.md — this is deliberately a single-PR
 # gate, called once per candidate in the fallback walk.
 
+# requires-daemon: forge optional   #9537 — `forge is-fleet` answers "is this PR author one of Loom's own Apps"; with no daemon, or one that predates the verb (clap exits 2), is_fleet_author falls back to the exact `app/loom-fleet-dispatch(-N)` pattern, so an old binary degrades to the pre-#9537 behaviour (plus the numbered members), never to a failure.
+
 set -euo pipefail
 
 CAP=20
@@ -171,15 +173,38 @@ if [[ -z "$HEAD_SHA" ]]; then
   exit 1
 fi
 
-# Loom's own GitHub App dispatch identity is reported by GitHub as
-# `is_bot: true` (same as Dependabot/Renovate/github-actions[bot]), but it is
-# NOT an external bot outside the Loom label workflow — it's Loom's own PR
-# creation path. Allowlist it by exact `.author.login` match so it proceeds
-# to the cap/dedup checks below like any other Loom-authored PR, instead of
-# being permanently invisible to both the primary and fallback Judge queues
-# (#6982). This narrows the bot-author check; it does not weaken it for
-# genuinely external bots.
-if [[ "$IS_BOT" == "true" && "$AUTHOR_LOGIN" != "app/loom-fleet-dispatch" ]]; then
+# Loom's own GitHub App identities are reported by GitHub as `is_bot: true`
+# (same as Dependabot/Renovate/github-actions[bot]), but they are NOT external
+# bots outside the Loom label workflow — they are Loom's own PR creation path.
+# Let them through to the cap/dedup checks below like any other Loom-authored
+# PR, instead of being permanently invisible to both the primary and fallback
+# Judge queues (#6982). This narrows the bot-author check; it does not weaken
+# it for genuinely external bots.
+#
+# #9537: WHICH logins are Loom's is the forge identity broker's answer
+# (`loom-daemon forge is-fleet`: the writer, each reader, legacy logins), not
+# a literal here. The old exact `app/loom-fleet-dispatch` match already missed
+# the numbered pool Apps, and broke outright when an App was renamed. With no
+# daemon, or an older one without the verb (clap exits 2), fall back to
+# Loom's default family, exact name or `-<digits>` only.
+_JFG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+is_fleet_author() {
+  local login="$1" bin="" rc
+  if [[ -f "$_JFG_DIR/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=lib/locate-daemon-bin.sh
+    source "$_JFG_DIR/lib/locate-daemon-bin.sh"
+    bin="$(loom_locate_daemon_bin "$(cd "$_JFG_DIR/../.." 2>/dev/null && pwd)" 2>/dev/null || true)"
+  fi
+  if [[ -n "$bin" ]]; then
+    rc=0
+    "$bin" forge is-fleet "$login" >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    [[ $rc -eq 1 ]] && return 1
+  fi
+  [[ "$login" =~ ^app/loom-fleet-dispatch(-[0-9]+)?$ ]]
+}
+
+if [[ "$IS_BOT" == "true" ]] && ! is_fleet_author "$AUTHOR_LOGIN"; then
   emit "SKIP" "bot-author (outside Loom label workflow; fallback queue cannot advance it)" "$HEAD_SHA" 0 0 0
   exit 10
 fi

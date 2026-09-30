@@ -28,7 +28,6 @@
 # edit), and degrades to today's warn-only behavior when that fetch fails.
 #
 # Strategy: the functions under test (_partial_increment_refs,
-# _closing_refs_stdin, _body_closing_refs, _closing_ref_snippets,
 # _pr_commit_messages, _check_partial_increment_close_conflict,
 # _reset_one_partial_issue, _reset_partial_increment_labels) depend only on
 # globals (PR_JSON, REPO_NWO, PR_NUMBER, FORGE_TYPE, GH,
@@ -160,9 +159,9 @@ source "$HELPERS_DIR/lib/forge-helpers.sh"
 
 # --- Extract the functions under test from merge-pr.sh and source them ---
 # Two spans, each bounded by an anchor line that is NOT part of the span:
-#   1. `_strip_fenced_code_blocks() {` .. `_check_partial_increment_close_conflict
-#      || true` — the #4569 pre-merge guard, its pure-text ref extractors, and
-#      the #5234 code-span/fence-stripping helper the extractors depend on.
+#   1. `_mp_refs() {` .. `_check_partial_increment_close_conflict || true` —
+#      the #4569 pre-merge guard and the loom-daemon-backed ref extractor it
+#      depends on.
 #      Stopping at the INVOCATION line keeps the top-level call out of the
 #      sourced file (we drive the guard explicitly from the tests).
 #   2. `_reset_one_partial_issue() {` .. `# Handle auto-merge mode` — the
@@ -183,15 +182,14 @@ trap 'rm -rf "$FUNCS_FILE" "$STUB_DIR" 2>/dev/null || true' EXIT
 awk '
   /^# requires-daemon:/                                  { print; next }
   /^_mp_daemon_roll_hint\(\) \{/                         { print; next }
-  /^_strip_fenced_code_blocks\(\) \{/                    { capture=1 }
+  /^_mp_refs\(\) \{/                                     { capture=1 }
   /^_check_partial_increment_close_conflict \|\| true/   { capture=0 }
   /^_reset_one_partial_issue\(\) \{/                    { capture=1 }
   /^# Handle auto-merge mode/                           { capture=0 }
   capture { print }
 ' "$MERGE_PR_SRC" > "$FUNCS_FILE"
 
-for _fn in _strip_fenced_code_blocks _partial_increment_refs _closing_refs_stdin \
-           _body_closing_refs _closing_ref_snippets _partial_increment_ref_snippets \
+for _fn in _mp_refs _partial_increment_refs \
            _pr_commit_messages _check_partial_increment_close_conflict \
            _reset_one_partial_issue _reset_partial_increment_labels; do
     if ! grep -q "^${_fn}() {" "$FUNCS_FILE"; then
@@ -431,25 +429,6 @@ assert_not_contains "$log" "issue edit 888" \
 # ---------------------------------------------------------------------------
 # #4569: closing-keyword conflict detection + premature-close revert.
 # ---------------------------------------------------------------------------
-
-echo ""
-echo "Testing _body_closing_refs (GitHub closing-keyword extraction)..."
-
-# The incident phrasing: a closing keyword buried in prose, NOT line-leading.
-assert_eq "123" "$(_body_closing_refs '3. Verify the publish, then close #123.')" \
-  "Prose 'then close #123' is a closing reference (keyword is not line-leading)"
-assert_eq "123" "$(_body_closing_refs 'Closes #123')" \
-  "Canonical 'Closes #123' trailer extracted"
-assert_eq "$(printf '7\n9')" "$(_body_closing_refs 'Fixes #7 and resolved #9')" \
-  "Tense/case variants (Fixes/resolved) both extracted, numerically sorted"
-assert_eq "" "$(_body_closing_refs 'Contributes to #123')" \
-  "Non-closing 'Contributes to #123' is NOT a closing reference"
-assert_eq "" "$(_body_closing_refs 'Discloses #123 and Updates #456')" \
-  "Word-boundary guard: 'Discloses'/'Updates' are not closing keywords"
-assert_eq "" "$(_body_closing_refs 'close issue #123')" \
-  "'close issue #123' is NOT a closing reference (keyword not adjacent to #N)"
-assert_eq "1234" "$(_body_closing_refs 'Closes #1234')" \
-  "Full number is extracted (no #123 prefix confusion)"
 
 echo ""
 echo "Testing _partial_increment_refs prose/code-span guarding (#5234)..."
@@ -1053,14 +1032,10 @@ assert_contains "$src" 'repos/$REPO_NWO/pulls/$PR_NUMBER/commits' \
   "merge-pr.sh reads the PR's commit messages for closing keywords (#4595)"
 assert_contains "$src" '--paginate' \
   "merge-pr.sh paginates the commits fetch (>30-commit PRs are not truncated)"
-assert_contains "$src" '_strip_fenced_code_blocks' \
-  "merge-pr.sh strips fenced code blocks before matching a partial-increment declaration (#5234)"
 retired "merge-pr.sh's source contains the inline-code-span strip" \
     "inline code spans are blanked before the line-leading anchor runs, so the anchor sees the text a reader sees rather than the raw markup. (The #5234 incident itself is caught by the ANCHOR, not by this strip: its mention is mid-sentence. On a single line the strip only ever ADDS matches -- measured, 0 of 29 corpus entries change without it.)" \
     "the strip is now blank_inline_code() in Rust; this file no longer runs sed" \
     "merge_pr::refs::tests::the_inline_code_strip_changes_the_answer_and_this_pins_which_way, which asserts the one single-line shape where the strip is load-bearing (\"\`x\` Part of #5\" -> [5]) and would fail if the strip were removed -- the property the original successor did NOT pin."
-assert_contains "$src" '_partial_increment_ref_snippets' \
-  "merge-pr.sh quotes the matched partial-increment declaration text in the pre-merge warning (#5234 AC #4)"
 
 # --- Summary ---
 echo ""

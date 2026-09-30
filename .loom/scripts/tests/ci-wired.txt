@@ -48,7 +48,6 @@ test-champion-issue-promo-escalation-respects-human-hold.sh
 test-champion-pr-merge-negation-guard.sh
 test-champion-premise-false-close.sh
 test-champion-standing-authorization.sh
-test-check-branch-name.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-conflict-markers.sh
@@ -56,6 +55,7 @@ test-check-dependabot-labels.sh
 test-check-evaluating-staleness.sh
 test-check-git-identity.sh
 test-check-guards-installed.sh
+test-check-merge-config.sh
 test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
@@ -79,6 +79,7 @@ test-cpu-budget.sh
 test-create-pr-provenance.sh
 test-create-pr-superseded-issue.sh
 test-create-pr-version-check.sh
+test-curator-rightsizing.sh
 test-default-branch.sh
 test-dependency-parse.sh
 test-detect-unlabeled-epics.sh
@@ -90,7 +91,6 @@ test-epic-label-preserved-on-escalation.sh
 test-extract-capability-markers.sh
 test-filing-lock.sh
 test-fleet-check.sh
-test-fleet-send.sh
 test-forge-check-runs-pagination.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
@@ -175,6 +175,8 @@ test-resync-installed-guard-check.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-dogfood-symlink.sh
+test-resync-installed-stamp.sh
+test-resync-installed-output-staging.sh
 test-resync-installed.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
@@ -187,6 +189,7 @@ test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-script-helper-version-floor.sh
+test-session-mode.sh
 test-spawn-codex-session-exec.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
@@ -210,13 +213,10 @@ test-version-check-gate-callsites.sh
 test-version-check-gate.sh
 test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
-test-worktree-base-override.sh
 test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
-test-worktree-remote-branch-tracking.sh
 test-worktree-root-override.sh
 test-worktree-sentinel.sh
-test-worktree-stale-merged-branch.sh
 
 # tests/hooks/ (repo root) — Claude-path guard suites, wired since #4769.
 tests/hooks/test-guard-destructive-dispatcher.sh
@@ -233,6 +233,7 @@ tests/hooks/test-guard-destructive-mkdir-confinement.sh
 tests/hooks/test-guard-destructive-mktemp-canon.sh
 tests/hooks/test-guard-destructive-readonly-fastpath.sh
 tests/hooks/test-guard-destructive-rm-scope.sh
+tests/hooks/test-guard-destructive-session-scratch.sh
 tests/hooks/test-guard-destructive-stash-scope.sh
 tests/hooks/test-guard-destructive-write-confinement.sh
 tests/hooks/test-guard-loom-workflow.sh

@@ -69,6 +69,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
 # `unknown` fallback for the same reason as the ledger/target-dir libs above:
 # a partially-resynced .loom/ must degrade to "cannot tell, keep the branch",
 # never to a `source` failure that breaks worktree creation and removal.
+#
+# Since #8195 slice 14 this file has no direct caller of its own: the LOCAL
+# branch arm's call moved into `loom-daemon worktree-branch-reuse`, which asks
+# the Rust primitive. The source stays because lib/worktree-forge-pr-check.sh
+# (the sibling origin/<branch> arm) still runs in THIS process and needs it.
 if [[ -f "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/branch-landed.sh" ]]; then
     # shellcheck source=lib/branch-landed.sh
     source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/branch-landed.sh"
@@ -479,53 +484,128 @@ cleanup_partial_worktree_state() {
 }
 
 # --------------------------------------------------------------------------
-# Upstream-tracking correction + stale-worktree drift report (#6095/#6100,
-# #6257/#6291)
+# The LOCAL-branch reuse arm (#6095/#6100, #8280)
 # --------------------------------------------------------------------------
 #
-# Ported to `loom-daemon worktree-upstream` (#8195 slice 9, epic #7810). ONE
-# delegation with two arms, because this script carried TWO hand-maintained
-# copies of the same fix and they drifted:
+# Ported WHOLE to `loom-daemon worktree-branch-reuse` (#8195 slice 14, epic
+# #7810): the "already exists - reusing it" warning, the #6095/#6100
+# upstream-tracking correction, the #8280 already-landed refusal behind its
+# degenerate-tip guard, and the base-ref divergence warning. The full design
+# rationale lives in `loom-daemon/src/worktree_cli/branch_reuse.rs`.
 #
-#   local-branch         the "local branch already exists - reusing it" arm
-#                        (#6095/#6100, the #6086/PR #6093 incident: a branch
-#                        left tracking origin/$DEFAULT_BRANCH turns a later
-#                        `git pull --ff-only` into a silent fast-forward onto
-#                        main's tip)
-#   registered-worktree  the "worktree dir exists and git knows it" fast path
-#                        (#6257/#6291) — the same correction, re-implemented by
-#                        hand eighteen months later because, as that arm's own
-#                        comment said, it is "a completely different code path"
-#                        — plus the behind-the-pushed-tip drift report
+# WHY THIS ARM, AND WHY WHOLE. It is the arm `worktree.sh <N>` takes whenever
+# `refs/heads/feature/issue-N` already exists — which on a host that built an
+# earlier slice of the same issue is the NORMAL state, so it is the arm the
+# partial-increment convention (#3667/#3599) runs through most often. Its four
+# steps are one ordered contract and the ORDER is the part no reviewer can
+# check from either side alone: steps 1-2 must precede the refusal so an
+# operator sees which branch is being judged before it is named, and step 2's
+# `git fetch origin -- <branch>` is what makes step 4's history comparison
+# meaningful. Moving them one at a time would have left this file interleaving
+# a Rust call between two Rust calls purely to preserve print order — the
+# "delegation point that is not a decision boundary" shape #8226 reverted.
 #
-# $3 is the caller's own `git status --porcelain` reading, taken BEFORE the
-# fetch; only its emptiness matters. It is passed rather than re-read inside
-# the subcommand so the hint block it selects agrees with the preserve/reset
-# decision the caller has already made from that same reading.
+# It also retires the LAST `_worktree_upstream_check` call site (slice 12 took
+# the other one, into `worktree-existing`), so the slice-9 wrapper is gone and
+# `worktree-upstream` has no bash caller left at all; and it replaces a
+# `--json` refusal document that was spliced around `$BRANCH_NAME` by hand.
+# `git check-ref-format` permits a `"` in a refname and `$BRANCH_NAME` is
+# `feature/$CUSTOM_BRANCH` — operator input — so that document was not valid
+# JSON for a name a caller could really pass. Same defect slice 13 fixed for
+# `$BASE_BRANCH`, one arm further down the same decision; `serde_json` now
+# builds it.
 #
-# A daemon that predates the port is NOT probed for with `--help` first, and
-# its clap usage error is NOT sent to /dev/null — deliberately, unlike the
-# `worktree-branch-conflict` guard below. There, clap's exit 2 collides with a
-# meaningful answer, so the probe buys correctness; here the exit code is
-# discarded outright, so the only thing a probe or a redirect would buy is
-# quiet. During a rolling fleet upgrade that one stderr line naming the missing
-# subcommand is the best signal available that this check was skipped — and the
-# port itself writes nothing to stderr (pinned by the differential harness), so
-# nothing else can appear there to be confused with it.
+# THE CONTRACT PRESERVED: every message and its ORDER, which of them are gated
+# on --json (all of them), `print_error`'s stderr routing, the fail-open
+# direction on an `unknown` verdict (a forge outage must never block worktree
+# creation — test-worktree-stale-merged-branch.sh Test 5), the non-destructive
+# refusal (the branch is left alone), and the two exit codes this caller
+# branches on.
 #
-# requires-daemon: worktree-upstream optional  #8195 slice 9 — without it neither arm runs: a branch keeps whatever upstream it had and a stale worktree is preserved unannounced, which is the pre-#6095 / pre-#6257 behaviour. A lost diagnosis, not a lost file — nothing on this path creates, deletes or resets anything.
-_worktree_upstream_check() {
-    [[ -n "${_WT_DAEMON_BIN:-}" ]] || return 0
+# NO DAEMON: none of the four steps runs and the branch is reused as-is, which
+# is the pre-#6095 / pre-#8280 behaviour for that host. Every loss is a
+# diagnosis: an upstream left as it was, and a landed branch reused instead of
+# refused. Nothing here creates, deletes or resets anything — the refusal
+# prevents a low-value PR, it does not prevent data loss — so this degrades
+# rather than exiting 2, and `worktree.sh <N>` keeps working on a host with no
+# loom-daemon at all. The `--help` probe routes a daemon predating the
+# subcommand to the same place, because clap's exit 2 would otherwise be read
+# as a refusal and strand an ordinary re-run.
+#
+# Stdout goes to fd 3 (a no-op in human mode, the caller's real stdout under
+# --json) so the refusal document satisfies the #3546 purity contract; the
+# human messages are suppressed by the port itself under --json, never
+# rerouted into that stream.
+# requires-daemon: worktree-branch-reuse optional  #8195 slice 14 — without it the reuse warning, the upstream correction, the already-landed refusal and the divergence warning are all skipped and the local branch is reused as-is (pre-#6095 / pre-#8280 behaviour). A lost diagnosis, not a lost file.
+_worktree_branch_reuse() {
+    if [[ -z "${_WT_DAEMON_BIN:-}" ]] \
+        || ! "$_WT_DAEMON_BIN" worktree-branch-reuse --help >/dev/null 2>&1; then
+        return 0
+    fi
+    "$_WT_DAEMON_BIN" worktree-branch-reuse --repo "$WORKTREE_REPO_ROOT" \
+        --branch "$BRANCH_NAME" --issue "$ISSUE_NUMBER" \
+        --default-branch "$DEFAULT_BRANCH" --base-ref "$BASE_REF" \
+        --base-display "$BASE_DISPLAY" --json-output "$JSON_OUTPUT" >&3 || exit 1
+}
 
-    # Literal-or-empty strings rather than an array, for the bash 3.2 reason
-    # spelled out in cleanup_partial_worktree_state above.
-    local _q="" _u=""
-    [[ "$JSON_OUTPUT" == "true" ]] && _q="--quiet"
-    [[ -n "${3:-}" ]] && _u="--uncommitted"
-    # shellcheck disable=SC2086  # $_q/$_u are fixed literal flags or empty
-    "$_WT_DAEMON_BIN" worktree-upstream --arm "$1" --repo "$2" \
-        --branch "$BRANCH_NAME" --issue "$ISSUE_NUMBER" $_q $_u || true
-    return 0
+# --------------------------------------------------------------------------
+# The "worktree directory already exists" arm (#3548/#6257/#6291/#8287/#6334)
+# --------------------------------------------------------------------------
+#
+# Ported WHOLE to `loom-daemon worktree-existing` (#8195 slice 12, epic #7810):
+# the registration probe, the upstream/drift check, the preserve-vs-reset
+# verdict, the sentinel back-fill and the stale-worktree `git reset --hard`
+# behind its #6334 rescue guard. The full design rationale lives in
+# `loom-daemon/src/worktree_cli/existing.rs`.
+#
+# WHY THIS ARM. It opened with the LAST unanchored
+# `git worktree list | grep -q "$WORKTREE_PATH"` in this script — slice 10
+# retired its twin on the --sparse/--full re-configure arm — and that expression
+# is wrong in both directions. `git worktree list` prints symlink-RESOLVED paths
+# while $WORKTREE_PATH is concatenated and unresolved, so a repo reached through
+# a symlink (every macOS checkout under /tmp) read a LIVE worktree as
+# unregistered and told the caller to `rm -rf` it; and the match is an
+# unanchored substring, so an unregistered `issue-4` matched a registered
+# `issue-44`, ran the drift check and the reset against the MAIN workspace
+# (`git -C` on an unregistered dir resolves to the parent repo) and finished by
+# writing a `.loom-managed` sentinel into crash debris. The port asks the orphan
+# guard's own canonicalizing predicate (slice 5), the same one slice 10 moved to.
+#
+# THE CONTRACT PRESERVED: every message and its ORDER, which of them are gated
+# on --json (the registered arm's are, the unregistered arm's are not), the
+# exit codes (1 only for "not a registered worktree", 0 for all three usable
+# outcomes), the #3548 sentinel back-fill on both preserve and reset, and the
+# reset's target being the same reference the verdict was reached against
+# (#8287). The reset still goes through the #6334 rescue guard — the port calls
+# the very implementation `lib/worktree-race-rescue.sh` delegates to, with this
+# shell's own PIDs passed so its liveness probe (#7463) does not count the
+# invoker as a foreign holder.
+#
+# NO DAEMON: the predicate is answered here instead, in one PHYSICAL comparison
+# (is this directory its own git toplevel?), and the answer is always "preserve"
+# — the arm never resets and never back-fills the sentinel without the binary.
+# Both losses are in the safe direction: a stale worktree left alone, and a
+# worktree cleanup tooling refuses to remove, rather than one it removes
+# wrongly. That is why this delegation is safe where slice 1's always-taken lock
+# delegation was not (#8226): this arm is reached only by a re-invocation
+# against a directory that already exists.
+# requires-daemon: worktree-existing optional  #8195 slice 12 — without it the registration answer comes from the one-line physical check below and the verdict is always "preserve": no drift report, no sentinel back-fill and no stale-worktree reset, which is the pre-#6257 / pre-#3548 / pre-#3389 behaviour for that host. Nothing here creates or deletes anything.
+_worktree_existing() {
+    local _q="" _t
+    [[ "$JSON_OUTPUT" != "true" ]] || _q="--quiet"
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]] && "$_WT_DAEMON_BIN" worktree-existing --help >/dev/null 2>&1; then
+        # shellcheck disable=SC2086  # $_q is a fixed literal flag or empty
+        "$_WT_DAEMON_BIN" worktree-existing --worktree "$WORKTREE_PATH" \
+            --repo "$WORKTREE_REPO_ROOT" --issue "$ISSUE_NUMBER" --branch "$BRANCH_NAME" \
+            --default-branch "$DEFAULT_BRANCH" --base-ref "$BASE_REF" \
+            --base-display "$BASE_DISPLAY" --base-branch "${BASE_BRANCH:-}" \
+            --ignore-pid "$$" --ignore-pid "${BASHPID:-$$}" $_q
+        return $?
+    fi
+    _t="$(cd "$WORKTREE_PATH" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)" || _t=""
+    [[ -n "$_t" ]] && [[ "$(cd "$_t" 2>/dev/null && pwd -P)" == "$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P)" ]] && return 0
+    print_error "Worktree directory exists but is not the top level of a git worktree, and no loom-daemon with a 'worktree-existing' subcommand could be resolved to diagnose it: $WORKTREE_PATH"
+    return 1
 }
 
 # Shared preamble for the `loom_exec_script_helper` verbs below (`remove`, the
@@ -701,21 +781,39 @@ _worktree_sparse() {
     fi
 }
 
-# Function to fetch latest changes from the default branch
-# Uses fetch-only approach to avoid conflicts with worktrees that have the
-# default branch checked out. Relies on the global DEFAULT_BRANCH (resolved via
-# loom_default_branch before this is called).
-fetch_latest_main() {
-    # `--` ends option parsing (#9106); loom_default_branch has already refused
-    # an unsafe $DEFAULT_BRANCH before this function can be reached.
-    local quiet=""
-    [[ "$JSON_OUTPUT" == "true" ]] && quiet=1
-    [[ -n "$quiet" ]] || print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
-    if git fetch origin -- "$DEFAULT_BRANCH" 2>/dev/null; then
-        [[ -n "$quiet" ]] || print_success "Fetched latest origin/$DEFAULT_BRANCH"
-    else
-        [[ -n "$quiet" ]] || print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
+# Base-ref preparation: the `origin/$DEFAULT_BRANCH` fetch and the `--base`
+# stacked-PR resolution (#3729). Ported WHOLE to `loom-daemon worktree-base`
+# (#8195 slice 13, epic #7810) - they were one decision (which ref a new branch
+# starts from) with one ordering constraint. The verb prints `TOKEN<TAB>text`
+# records replayed through this script's own print_* helpers; BASE_REF /
+# BASE_DISPLAY are data records, JSON is a complete --json failure document
+# (now built by serde_json; the retired shell spliced $BASE_BRANCH in by hand).
+# Without a usable daemon the default-branch fetch degrades to one best-effort
+# `git fetch`, but --base REFUSES (exit 2, nothing touched): un-stacking a child
+# onto the default branch silently is the failure the block existed to prevent.
+# requires-daemon: worktree-base optional  #8195 slice 13 - without it only the default-branch fetch runs (silently); a plain `worktree.sh <N>` is unaffected and --base refuses with exit 2 before touching anything
+_worktree_base() {
+    local _l _m _out _rc=0 _q=""
+    [[ "$JSON_OUTPUT" != "true" ]] || _q="--quiet"
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]] && "$_WT_DAEMON_BIN" worktree-base --help >/dev/null 2>&1; then
+        # shellcheck disable=SC2086  # $_q is a fixed literal flag or empty
+        _out="$("$_WT_DAEMON_BIN" worktree-base --default-branch="$DEFAULT_BRANCH" --base-branch="${BASE_BRANCH:-}" $_q)" || _rc=$?
+        while IFS=$'\t' read -r _l _m; do
+            case "$_l" in
+                INFO) print_info "$_m" ;;  SUCCESS) print_success "$_m" ;;
+                WARNING) print_warning "$_m" ;;  ERROR) print_error "$_m" ;;
+                PLAIN) echo "$_m" ;;  JSON) echo "$_m" >&3 ;;
+                BASE_REF) BASE_REF="$_m" ;;  BASE_DISPLAY) BASE_DISPLAY="$_m" ;;
+            esac
+        done <<<"$_out"
+        return "$_rc"
     fi
+    if [[ -n "$BASE_BRANCH" ]]; then
+        [[ "$JSON_OUTPUT" != "true" ]] || echo '{"success": false, "error": "base-requires-loom-daemon"}' >&3
+        print_error "--base needs 'loom-daemon worktree-base' (#8195 slice 13), and ${_WT_DAEMON_BIN:-no resolvable loom-daemon} cannot run it. Install or update loom-daemon, or re-run without --base."
+        return 2
+    fi
+    git fetch origin -- "$DEFAULT_BRANCH" 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------
@@ -1419,44 +1517,13 @@ fi
 # result and returns non-zero on an unsafe name, which lands in the arm above
 # (check_branch_name has already printed the precise refusal to stderr).
 
-# Fetch latest changes from origin/$DEFAULT_BRANCH before creating the worktree
-# Uses fetch-only to avoid conflicts with worktrees that have it checked out
-fetch_latest_main
-
-# ─── Base-branch resolution (#3729, stacked-PR v1) ──────────────────────────
-# By default a new feature branch is created from origin/$DEFAULT_BRANCH. When
-# --base <branch> is passed (e.g. `--base feature/issue-<parent>` from
-# /loom:sweep --depends-on), resolve a ref for that base and use it instead so
-# the child branch stacks on top of the parent's branch. Prefer the pushed
-# origin/<base>, fall back to a local <base>. Hard-fail if neither resolves —
-# an explicit base that can't be found is worse than silently branching off
-# main (which would un-stack the child).
+# Fetch origin/$DEFAULT_BRANCH (fetch-only, so a worktree with it checked out is
+# not disturbed) and resolve the base ref: origin/$DEFAULT_BRANCH by default, or
+# the `--base <branch>` a stacked child builds on (#3729). Hard-fails rather than
+# silently un-stacking. See `_worktree_base` above.
 BASE_REF="origin/$DEFAULT_BRANCH"
 BASE_DISPLAY="$DEFAULT_BRANCH"
-if [[ -n "$BASE_BRANCH" ]]; then
-    # #9106: --base names a branch that reaches `git fetch` as a bare operand.
-    # Refuse an unsafe name outright — a `--base --upload-pack=/tmp/x` would
-    # otherwise be handed straight to git as a switch.
-    check_branch_name "$BASE_BRANCH" "--base branch" || {
-        [[ "$JSON_OUTPUT" == "true" ]] && echo '{"success": false, "error": "unsafe-base-branch-name", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
-        exit 1
-    }
-    git fetch origin -- "$BASE_BRANCH" 2>/dev/null || true
-    if git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
-        BASE_REF="origin/$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
-    elif git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-        BASE_REF="$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
-    else
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"success": false, "error": "base-branch-not-found", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
-        else
-            print_error "Requested --base '$BASE_BRANCH' not found as origin/$BASE_BRANCH or a local branch."
-            echo "  Ensure the parent sweep has created/pushed feature/issue-<parent> before stacking a child on it."
-        fi
-        exit 1
-    fi
-    [[ "$JSON_OUTPUT" == "true" ]] || print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
-fi
+_worktree_base || exit $?
 
 # Determine branch name
 if [[ -n "$CUSTOM_BRANCH" ]]; then
@@ -1548,183 +1615,63 @@ if [[ -d "$WORKTREE_PATH" ]]; then
 
     print_warning "Worktree already exists at: $WORKTREE_PATH"
 
-    # Check if it's registered with git
-    if git worktree list | grep -q "$WORKTREE_PATH"; then
-        # The working-tree reading comes FIRST now (#8287): both the drift check
-        # below and the staleness reference after it consume it, and the
-        # reference also needs that check's `git fetch origin $BRANCH_NAME` to
-        # have run so `origin/$BRANCH_NAME` is the branch's real pushed tip
-        # rather than whatever this worktree last saw.
-        local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
-
-        # #6257: this "worktree directory + branch already registered with
-        # git" fast path is a completely different code path from the
-        # "local branch exists, no worktree dir yet" reuse path below
-        # (#6095/#6100) — that fix's upstream-tracking correction never ran
-        # here, so a worktree left with stale HEAD and/or wrong upstream
-        # tracking was silently "preserved" (below) and handed straight to a
-        # Judge/Doctor session with no signal that it no longer matched the
-        # branch's actual pushed tip. Correct/report drift against the
-        # branch's OWN upstream (not just BASE_REF) before deciding whether to
-        # preserve.
-        #
-        # The two code paths now share ONE implementation (#8195 slice 9) —
-        # see _worktree_upstream_check above. $local_uncommitted is the
-        # reading taken just above, passed rather than re-read so the
-        # remediation hint agrees with the preserve/reset decision below.
-        _worktree_upstream_check registered-worktree "$WORKTREE_PATH" "$local_uncommitted"
-
-        # #8287: the staleness reference — and therefore the reset target below
-        # — is origin/$BRANCH_NAME whenever that ref exists AND has not already
-        # landed as a merged PR (the #5657 skip); otherwise it is
-        # BASE_REF/BASE_DISPLAY exactly as before, which for a stacked child
-        # (--base) is the parent branch rather than the default branch (#3729).
-        # Judging staleness purely against the base resets a worktree onto main
-        # while a live origin/$BRANCH_NAME still carries the PR's only commits,
-        # handing the next session an EMPTY branch to force-push over the real
-        # PR (the #8147/#8190 incident). `loom-daemon worktree-stale-ref` owns
-        # that decision — the landed half of it is the ONE branch_landed ladder
-        # (#8470), not a second bash copy of it — and reports the ahead/behind
-        # counts measured against whichever reference it chose, so the two
-        # cannot fall out of step. See loom-daemon/src/worktree_cli/stale_ref.rs.
-        #
-        # The first two assignments are the pre-#8287 reading (BASE_REF and the
-        # counts measured against it), and the `|| echo` arm re-serves them: a
-        # host with no loom-daemon, or one predating this subcommand (clap exit
-        # 2, whose usage blob is the only thing 2>/dev/null suppresses — this
-        # port itself writes nothing to stderr), behaves exactly as before.
-        #
-        # requires-daemon: worktree-stale-ref optional  #8287/#8354 — without it the staleness reference stays BASE_REF, i.e. the pre-#8287 behaviour: a worktree whose local branch sits at the base is judged stale and reset there. A reinstated defect, not a new one, and the reset it feeds is still gated by loom_worktree_reset_or_rescue (#6334), which re-derives commits-ahead itself and refuses rather than discarding.
-        stale_ref="$BASE_REF" stale_display="$BASE_DISPLAY" local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "$BASE_REF..HEAD" 2>/dev/null || echo 0) local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$BASE_REF" 2>/dev/null || echo 0)
-        [[ -z "${_WT_DAEMON_BIN:-}" ]] || read -r stale_ref stale_display local_commits_ahead local_commits_behind <<< "$("$_WT_DAEMON_BIN" worktree-stale-ref --worktree "$WORKTREE_PATH" --branch "$BRANCH_NAME" --default-branch "$DEFAULT_BRANCH" --base-ref "$BASE_REF" --base-display "$BASE_DISPLAY" 2>/dev/null || echo "$stale_ref $stale_display $local_commits_ahead $local_commits_behind")"
-
-        if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
-            # Worktree has real work - preserve it
-            # Back-fill/refresh the Loom sentinel so a resumed worktree that
-            # lost its marker stays cleanup-eligible (#3548).
-            write_loom_sentinel "$WORKTREE_PATH"
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_info "Worktree is registered with git"
-                if [[ "$local_commits_ahead" -gt 0 ]]; then
-                    print_info "Worktree has $local_commits_ahead commit(s) ahead of $stale_display - preserving existing work"
-                elif [[ -n "$local_uncommitted" ]]; then
-                    print_info "Worktree has uncommitted changes - preserving existing work"
-                fi
-                echo ""
-                print_info "To use this worktree: cd $WORKTREE_PATH"
-            fi
-            exit 0
-        else
-            # Stale worktree: no commits ahead, no uncommitted changes
-            # Reset in place instead of removing (avoids CWD corruption)
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $stale_display, no uncommitted changes)"
-                print_info "Resetting worktree in place to $stale_display..."
-            fi
-
-            # Back-fill/refresh the Loom sentinel on both reset outcomes: the
-            # worktree remains usable either way, so keep it cleanup-eligible
-            # (#3548).
-            write_loom_sentinel "$WORKTREE_PATH"
-            # #6334: re-check commits-ahead and tracked-diff state immediately
-            # before the destructive reset rather than trusting the
-            # point-in-time check above — a second builder (or any other
-            # process) can have landed new commits or foreign uncommitted
-            # tracked changes into this worktree in the interim. Rescue/refuse
-            # instead of silently discarding them (see lib/worktree-race-rescue.sh
-            # for the full design decision).
-            #
-            # The target is $stale_ref, not $BASE_REF (#8287) — same reference
-            # the staleness verdict above was reached against. The fetch stays
-            # keyed on the base branch: when $stale_ref IS origin/$BRANCH_NAME
-            # its own remote was already fetched by the drift check above, and
-            # refreshing the base too is harmless.
-            # `--` ends option parsing (#9106); both candidate operands were
-            # already gated by check_branch_name above.
-            if git -C "$WORKTREE_PATH" fetch origin -- "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
-               loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Stale worktree reset to $stale_display"
-                    echo ""
-                    print_info "To use this worktree: cd $WORKTREE_PATH"
-                fi
-                exit 0
-            else
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_warning "Could not reset stale worktree (continuing to use as-is)"
-                    echo ""
-                    print_info "To use this worktree: cd $WORKTREE_PATH"
-                fi
-                exit 0
-            fi
-        fi
-    else
-        print_error "Directory exists but is not a registered worktree"
-        echo ""
-        print_info "To fix this:"
-        echo "  1. Remove the directory: rm -rf $WORKTREE_PATH"
-        echo "  2. Run again: pnpm worktree $ISSUE_NUMBER"
-        exit 1
-    fi
+    # The whole arm from here down — the registration probe, the upstream/drift
+    # check, the preserve-vs-reset verdict, the #3548 sentinel back-fill and the
+    # stale-worktree reset behind its #6334 rescue guard — is
+    # `loom-daemon worktree-existing` (#8195 slice 12). Exit 0 = the worktree is
+    # usable (preserved, reset, or reset-refused-and-left-alone, the three
+    # outcomes this arm always reported as 0); non-zero = do not hand it over.
+    # See `_worktree_existing` above and loom-daemon/src/worktree_cli/existing.rs.
+    # rjwalters/kicad-tools#5783: uncommitted changes are the actual
+    # co-occupancy hazard -- two same-host sweeps once edited the same
+    # uncommitted file here at once, and one's edit leaked into the other's
+    # PR. Before `_worktree_existing` hands such a tree back (it always
+    # preserves one with uncommitted changes), `loom-daemon lease co-occupancy`
+    # refuses (exit 1) when the issue carries 2+ simultaneously fresh sweep
+    # leases; WORKTREE_ALLOW_SHARED_LEASE=1 overrides. Only exit 1 refuses -- a
+    # read failure, a timeout, or a daemon predating the subcommand (clap exit
+    # 2) all fail OPEN, as #8553's check-issue call above does. The `.git`
+    # probe keeps `git status` from walking up into the parent checkout.
+    # shellcheck disable=SC2086  # $_ljson is intentionally unquoted: omits the flag when empty
+    # requires-daemon: lease optional   kicad-tools#5783 fails open on a daemon predating `lease co-occupancy`
+    [[ -z "${_WT_DAEMON_BIN:-}" || ! -e "$WORKTREE_PATH/.git" || -z "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]] || { _ljson=""; _lrc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ljson="--json"; "$_WT_DAEMON_BIN" lease co-occupancy "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ljson >&3 || _lrc=$?; [[ "$_lrc" -eq 1 ]] && exit 1; }
+    _worktree_existing || exit 1
+    # #9111: under --json the port is --quiet, so the success document for the
+    # preserve and both stale-reset outcomes is emitted here — the same key set
+    # as the --sparse/--full fast path (sparse.rs JSON_TEMPLATE), which already
+    # exited, so $SPARSE_MODE/$CONE_JSON are their not-sparse defaults.
+    [[ "$JSON_OUTPUT" != "true" ]] || echo '{"success": true, "worktreePath": "'"$(cd "$WORKTREE_PATH" && pwd)"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
+    exit 0
 fi
+
+# --- Pre-creation claim probe (#9453 Phase 1) ----------------------------
+# Reached only on the CREATE path (the reuse arm above already exited),
+# before `git worktree add` below. `loom-daemon forge check-claim
+# --force-claim` aggregates the four claim signals; --force-claim because
+# this script's caller has ALWAYS already claimed by the time it runs
+# (builder.md: claim, then create worktree), so the issue legitimately
+# carries the caller's own `loom:building` label, lease, and possibly
+# branch -- the only leg that still means "do not build a duplicate" is
+# OPEN_PR, the one leg --force-claim can never override. Only exit 0
+# (blocked; its reason token went to >&3, its explanation to stderr)
+# refuses; a read failure, an old daemon, or any other code fails OPEN,
+# exactly like the #8553/#5783 guards above. A caller refused here adopts
+# the existing PR (create-pr.sh) or stands down -- never a suffix branch.
+# requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
+# shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
+[[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" --force-claim >&3 && exit 1 || true
 
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_warning "Branch '$BRANCH_NAME' already exists - reusing it (for a fresh branch instead, pass a custom name: ./.loom/scripts/worktree.sh $ISSUE_NUMBER <custom-branch-name>)"
-    fi
-
-    # #6095: a pre-existing local branch can be carrying a stale or wrong
-    # upstream (e.g. left tracking origin/$DEFAULT_BRANCH from whatever
-    # created it, rather than its own PR branch) — and unlike the sibling
-    # "no local branch, but origin/$BRANCH_NAME exists" path just below
-    # (#4823), this reuse path never touched tracking at all, so the wrong
-    # upstream persisted across every subsequent worktree.sh invocation. A
-    # later `git pull --ff-only` in the reused worktree then silently
-    # fast-forwards the branch onto the WRONG upstream's tip instead of
-    # the branch's own remote history (observed on #6086/PR #6093: local
-    # feature/issue-6086 tracked origin/main, and a --ff-only pull moved it
-    # to main's tip). If origin has a branch of the same name, (re)point the
-    # local branch's upstream at it before handing the branch to `git
-    # worktree add`. If origin has no branch of this name (never pushed),
-    # leave tracking as-is — do not fabricate an upstream that doesn't exist.
-    #
-    # Shares its implementation with the registered-worktree fast path above
-    # since #8195 slice 9 — see _worktree_upstream_check. cwd is the main
-    # workspace here, which is what $WORKTREE_REPO_ROOT holds.
-    _worktree_upstream_check local-branch "$WORKTREE_REPO_ROOT"
-
-    # #8280: the sibling arm below refuses an already-LANDED branch via the
-    # shared `branch_landed` primitive (#5657/#7812) before reusing it, and
-    # warns when the reused branch lacks the base ref's history. This arm did
-    # neither, so a stale local feature/issue-N left from an earlier slice was
-    # reused in SILENCE — yielding a worktree tens of commits behind the base,
-    # on a merged PR's branch, and a PR that re-proposed already-merged code
-    # with no CI. A surviving local ref is the normal state on a host that
-    # built the previous slice, which is exactly the partial-increment case
-    # #5657 was written for.
-    #
-    # Unlike the sibling arm, this one cannot silently fall through to a fresh
-    # branch on `landed` — the name is already taken locally — so it refuses
-    # outright and names the fix. `unknown` (forge outage, or the tree check
-    # unavailable) keeps today's fail-open-to-reuse behaviour, same as the
-    # sibling arm — a forge outage must never block worktree creation.
-    #
-    # The extra SHA guard below excludes the degenerate case `branch_landed`'s
-    # own ancestry rung cannot tell apart from a real landing: a branch tip
-    # that is IDENTICAL to origin/$DEFAULT_BRANCH's current tip is trivially
-    # its own ancestor, which is exactly the state of a brand-new local branch
-    # that has not yet carried any work (worktree.sh's own default creation
-    # path, and test-worktree-json-purity.sh's branch-reuse/auto-recovery
-    # fixtures). Refusing THAT reuse would break the ordinary re-run case; a
-    # branch tip that differs from the current default tip is never this
-    # degenerate case, whichever rung answered.
-    branch_landed "$BRANCH_NAME" "$DEFAULT_BRANCH"
-    if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]] && [[ "$(git rev-parse "$BRANCH_NAME" 2>/dev/null)" != "$(git rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null)" ]]; then
-        if [[ "$JSON_OUTPUT" == "true" ]]; then echo '{"success": false, "error": "branch-already-landed", "issueNumber": '"$ISSUE_NUMBER"', "branch": "'"$BRANCH_NAME"'", "prNumber": '"${BRANCH_LANDED_PR_NUMBER:-null}"'}' >&3; else print_error "Local branch '$BRANCH_NAME' has already landed on $BASE_DISPLAY${BRANCH_LANDED_PR_NUMBER:+ (already-merged PR #$BRANCH_LANDED_PR_NUMBER)} - refusing to reuse it. Delete it and re-run: git branch -D $BRANCH_NAME && ./.loom/scripts/worktree.sh $ISSUE_NUMBER"; fi
-        exit 1
-    fi
-    if [[ "$JSON_OUTPUT" != "true" ]] && ! git merge-base --is-ancestor "$BASE_REF" "$BRANCH_NAME" 2>/dev/null; then print_warning "Branch '$BRANCH_NAME' has diverged from $BASE_DISPLAY (does not contain all of its history) - reusing it as-is; rebase or delete it if that is not what you want"; fi
+    # The whole arm — the reuse warning, the #6095/#6100 upstream-tracking
+    # correction, the #8280 already-landed refusal and the base-ref divergence
+    # warning, in that order — is `loom-daemon worktree-branch-reuse` (#8195
+    # slice 14). Exit 0 = reuse this branch; a refusal has already printed its
+    # message (or written its --json document to fd 3) and exits 1 from inside
+    # the wrapper. cwd is the main workspace here, which is what
+    # $WORKTREE_REPO_ROOT holds. See `_worktree_branch_reuse` above and
+    # loom-daemon/src/worktree_cli/branch_reuse.rs.
+    _worktree_branch_reuse
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else

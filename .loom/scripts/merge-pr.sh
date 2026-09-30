@@ -578,24 +578,20 @@ if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
   fi
   _WT_ABS="$(cd "$WORKTREE_PATH_OVERRIDE" 2>/dev/null && pwd -P)" || \
     error "--worktree-path could not be resolved: $WORKTREE_PATH_OVERRIDE"
-  # Verify the path is actually a worktree of this repo. Each porcelain stanza
-  # begins with a literal `worktree ` prefix (9 chars) followed by the
-  # unquoted, unescaped absolute path — which may contain spaces. Parse the
-  # path with substr($0, 10), NOT $2/whitespace-split (which truncates at the
-  # first space). Caveat: a path containing a literal newline would still break
-  # this line-oriented parse; `--porcelain -z` (NUL-delimited) would be needed
-  # for full robustness, but spaces are the realistic failure mode (#3717).
-  if ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-       awk -v p="$_WT_ABS" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
-    error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"
-  fi
-  WORKTREE_PATH_OVERRIDE="$_WT_ABS"
-  unset _WT_ABS
-
-  # Warn if combined with --no-cleanup-worktree (no-op wins).
-  if [[ "$CLEANUP_WORKTREE" == "false" ]]; then
-    warning "--worktree-path was supplied but --no-cleanup-worktree wins; no cleanup will occur"
-  fi
+  # Verify the path is actually a worktree of this repo (#8191 slice):
+  # `loom-daemon merge-pr worktree-contains` shares the porcelain parser
+  # worktree-primary/worktree-branch-for/worktree-find-by-branch already use
+  # (loom-daemon/src/merge_pr/worktrees.rs), which fixed this same family's
+  # #3717 space-in-path truncation. Exit 0 = registered, 1 = parsed and NOT
+  # registered, anything else = the check did not run at all (missing/older
+  # daemon) -- WARN and still merge, but DECLINE the override cleanup and keep
+  # the worktree: a guard that did not run must refuse the removal rather than
+  # wave it through (the #3710 rule; never lean on `git worktree remove` to
+  # refuse an unverified path). Skipped cleanup is always recoverable.
+  _WTC_RC=0; git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr worktree-contains --path "$_WT_ABS" 2>/dev/null || _WTC_RC=$?
+  if [[ $_WTC_RC -eq 1 ]]; then error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"; elif [[ $_WTC_RC -ne 0 ]]; then warning "--worktree-path's registered-worktree check (#8191 slice) did not run — 'merge-pr worktree-contains' exited $_WTC_RC (a loom-daemon predating this slice has no such verb). The merge still proceeds, but $_WT_ABS is left untouched and worktree cleanup is skipped: an unverified path is never removed. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; elif [[ "$CLEANUP_WORKTREE" == "false" ]]; then warning "--worktree-path was supplied but --no-cleanup-worktree wins; no cleanup will occur"; fi
+  if [[ $_WTC_RC -eq 0 ]]; then WORKTREE_PATH_OVERRIDE="$_WT_ABS"; else WORKTREE_PATH_OVERRIDE=""; CLEANUP_WORKTREE=false; fi
+  unset _WTC_RC _WT_ABS
 fi
 
 # Fetch PR state — UNCACHED (#8550). $GH may be the `gh-cached` wrapper, whose
@@ -922,12 +918,13 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard — the last refuses only the post-merge worktree removal, never the merge) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains — the last three decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, and worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
 # #8191's post-merge porcelain lookups (`merge-pr worktree-primary` /
-# `worktree-branch-for` / `worktree-find-by-branch`, see _mp_worktree), and it is
+# `worktree-branch-for` / `worktree-find-by-branch`, see _mp_worktree, plus the
+# --worktree-path parse-time `worktree-contains` check), and it is
 # deliberately NOT raised to their landing version. Raising it refuses the MERGE
 # on every host one release behind — the 2026-09-18 incident above — whereas a
 # daemon missing only those leaf verbs declines post-merge CLEANUP: the two
@@ -939,6 +936,7 @@ _check_loom_pr_label
 # which is the one a refused MERGE should name.
 # requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
 # requires-daemon: notify-cleared-blockers optional   #9102 — the post-merge close-triggered loom:blocked re-check; a daemon lacking the verb exits non-zero, `_notify_cleared_blockers` prints one warning and the merge proceeds. A delayed notice, never a failed merge: the next sweep's `check-stale-blocked` pre-wave pass reports the same stale block.
+# requires-daemon: record-rework optional   #9444 — the two in-sweep rework markers this script emits (a `rebase` when it syncs a base that moved, a `merge_conflict` when it refuses a PR that genuinely conflicts). Both calls are `>/dev/null 2>&1 || true`: a daemon lacking the verb records nothing and the merge is byte-for-byte unaffected. Pure telemetry — the cost of a missing marker is one under-reported environmental rework in `sweep.outcome`'s `rework_events`, never a merge that did or did not happen.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -1107,23 +1105,9 @@ _check_required_check_freshness
 PARTIAL_OPEN_BEFORE_MERGE=""
 PARTIAL_CONFLICT_ISSUES=""
 
-# Strips Markdown fenced code blocks (``` ... ```) from stdin, one line at a
-# time: a fence-open/-close toggle drops everything between the fences
-# (inclusive of the fence markers themselves). Used so a `Part of #N` shown as
-# example/quoted text inside a fenced block reads as documentation, never a
-# live declaration (#5234).
-_strip_fenced_code_blocks() {
-  # Retained only for any out-of-tree caller; the analysis below no longer
-  # uses it (loom-daemon strips fences itself, identically).
-  awk '
-    /^[[:space:]]*```/ { infence = !infence; next }
-    !infence { print }
-  '
-}
-
 # Closing-reference / partial-increment analysis, ported to Rust (#8191).
 #
-# These five predicates decide whether merging would close an issue this PR
+# These predicates decide whether merging would close an issue this PR
 # only declared itself a PART OF. Their whole bug history is about what a
 # stacked grep/sed/awk pipeline accidentally matched -- #5234 (a backticked
 # hypothetical mention read as a declaration, reopening a correctly closed
@@ -1190,45 +1174,6 @@ _mp_refs() {
 # reference, and get reopened right after a correct close.
 _partial_increment_refs() {
   printf '%s\n' "$1" | _mp_refs partial-increment-refs
-}
-
-# Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text
-# read from stdin, one per line, deduped. The regex is deliberately the same one
-# forge_pr_close_targets() uses on its Gitea branch (the canonical keyword set,
-# with `\b` guarding against substring traps like `Discloses #N`).
-#
-# Why a text regex and not only the authoritative GraphQL
-# `closingIssuesReferences`: that field is GraphQL-only, and the incident this
-# guard exists for happened while GraphQL quota was exhausted (the PR was even
-# created via raw REST for that reason). A quota-free text signal is the one that
-# still works in exactly the conditions where this bug bites.
-_closing_refs_stdin() {
-  _mp_refs closing-refs
-}
-
-# Same, for text passed as $1 (the PR body, historically the only source).
-_body_closing_refs() {
-  printf '%s\n' "$1" | _mp_refs closing-refs
-}
-
-# The literal offending snippets ("close #N", "Fixes #N", …) that reference
-# issue $2 with a closing keyword inside the text $1, rendered for a warning as
-# `snippet", "snippet`. Empty when the text carries no such reference — which is
-# how the caller tells WHICH source (body vs. commit messages) is at fault.
-_closing_ref_snippets() {
-  printf '%s\n' "$1" | _mp_refs closing-ref-snippets --issue "$2"
-}
-
-# The literal declaration text (`Part of #N` / `Contributes to #N`) that
-# _partial_increment_refs read as authoritative for issue $2 inside text $1,
-# rendered the same way _closing_ref_snippets renders the closing-keyword side
-# (`snippet", "snippet`) — so the pre-merge warning can show an operator BOTH
-# sides of the conflict and judge for themselves whether the declaration was
-# real (AC #4, #5234). Runs the identical fenced-block/inline-code-span
-# stripping as _partial_increment_refs so the quoted snippet always matches
-# what was actually matched, never a code-block artifact.
-_partial_increment_ref_snippets() {
-  printf '%s\n' "$1" | _mp_refs partial-increment-ref-snippets --issue "$2"
 }
 
 # Every commit message of this PR, concatenated (#4595). merge-pr.sh squash-
@@ -2003,12 +1948,25 @@ _wait_for_checks_then_sync_merge() {
     [[ "$attempt1_rc" -ne 0 ]] && fetch_rc="$attempt2_rc"
 
     if [[ "$fetch_rc" -ne 0 ]]; then
-      if [[ "$attempt1_rc" -eq "$FORGE_CHECK_RUNS_RC_NOT_FOUND" && "$attempt2_rc" -eq "$FORGE_CHECK_RUNS_RC_NOT_FOUND" ]]; then
-        not_found_streak=$(( not_found_streak + 1 ))
-      else
-        not_found_streak=0
+      # The confirmed-404-streak classification, ported to Rust (#6389, #8191
+      # slice): `loom-daemon merge-pr check-runs-streak` is a pure function of
+      # both attempts' return codes and the running streak — see
+      # loom-daemon/src/merge_pr/check_runs_streak.rs. Always exits 0 with one
+      # `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line; anything
+      # else (missing/older binary) degrades to PENDING with the streak reset
+      # to 0 — the pre-#6389 behaviour, so a guard fault can only cost time
+      # via the ordinary LOOM_AUTO_MERGE_TIMEOUT ceiling below, never
+      # misclassify a transient blip as the persistent condition that skips
+      # waiting altogether.
+      local _crs_out _crs_sentinel _crs_verdict _crs_streak
+      _crs_out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr check-runs-streak --attempt1-rc "$attempt1_rc" --attempt2-rc "$attempt2_rc" --streak "$not_found_streak" --threshold "$LOOM_CHECK_RUNS_404_STREAK" --not-found-rc "$FORGE_CHECK_RUNS_RC_NOT_FOUND" 2>/dev/null)" || _crs_out=""
+      read -r _crs_sentinel _crs_verdict _crs_streak <<< "$_crs_out"
+      if [[ "$_crs_sentinel" != "LOOM-CHECK-RUNS-STREAK" ]]; then
+        warning "The persistent-404 streak classification (#6389, #8191 slice) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr check-runs-streak' printed no recognized decision (a loom-daemon predating this slice has no such verb). Treating this iteration as still-pending with the streak reset — a guard fault here can only cost time, never skip the wait. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+        _crs_verdict="PENDING"; _crs_streak=0
       fi
-      if [[ "$not_found_streak" -ge "$LOOM_CHECK_RUNS_404_STREAK" ]]; then
+      not_found_streak="${_crs_streak:-0}"
+      if [[ "$_crs_verdict" == "PROCEED" ]]; then
         info "PR #$PR_NUMBER: check-runs API unavailable for this repo (no checks configured); proceeding to synchronous merge"
         return 0
       fi
@@ -2315,7 +2273,15 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
     merge)
       info "PR #$PR_NUMBER: $_MSM_REASON"
       ;;
-    refuse-conflict)
+    # #9444: a CORROBORATED conflict — the forge said `mergeable=false` and the
+    # local `git merge-tree` check agreed — is the `merge_conflict` rework
+    # event, and the one acceptance criterion this writer exists to satisfy.
+    # The `*` arm below is deliberately NOT marked: it refuses because the
+    # cached state could not be corroborated, which is "nobody could tell",
+    # not "this branch conflicts", and marking it would inflate the
+    # environmental bucket with unanswered checks. Emitted on this line
+    # because `error` exits, and inline because the file is ratcheted.
+    refuse-conflict) "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind merge_conflict --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "$_MSM_REASON" >/dev/null 2>&1 || true
       error "PR #$PR_NUMBER has merge conflicts — resolve before merging ($_MSM_REASON)"
       ;;
     *)
@@ -2412,7 +2378,15 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
 
       # The sync just pushed to the head branch: re-read it, or the retry
       # below re-gates on a SHA the forge has already superseded (#8164).
-      _refresh_precondition_sha
+      #
+      # …and mark it (#9444). This is the canonical "main moved under the
+      # work" event: the base advanced, so the branch had to be synced before
+      # it could merge. `--duration-sec` is the settle wait we just slept —
+      # the only part of this rework that is measured here; the forge-side
+      # merge that produced the new head is not. Appended to the line above
+      # rather than given its own so the file does not grow (it is
+      # ratcheted); `|| true` because a marker may never fail a merge.
+      _refresh_precondition_sha; "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind rebase --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "base branch was modified; synced before merge retry $MERGE_ATTEMPT/$MAX_MERGE_RETRIES" --duration-sec "$MERGE_RETRY_DELAY" >/dev/null 2>&1 || true
 
       # Increase delay for next attempt (exponential backoff)
       MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
@@ -2970,6 +2944,44 @@ _issue_is_closed_for_cleanup() {
   return 1
 }
 
+# _worktree_cleanup_decide <kind: default|discovered|judge-pr> <path>
+#
+# The #6694/#6264 remove-vs-preserve decision, now shared verbatim across
+# worktree cleanup's three call sites (the Loom-convention path, the porcelain
+# discovery fallback, and a co-existing Judge/Doctor review worktree) instead
+# of tripled: `loom-daemon merge-pr worktree-preserve` (Rust,
+# loom-daemon/src/merge_pr/worktree_preserve.rs — #8191 slice). Only the two
+# already-run checks it needs (_issue_is_closed_for_cleanup, immediately
+# above, and the shared branch_has_landed primitive, #7812) and the
+# _remove_loom_worktree mutation stay here — the two-input decision plus its
+# message text moved. Fails toward PRESERVE on any guard fault (missing/older
+# daemon, an unrecognized first line) — the same fail-unsafe-to-preserve
+# direction _issue_is_closed_for_cleanup already takes just above, because a
+# guessed REMOVE risks the #5031 worktree data-loss class this whole pass
+# exists to avoid, while a skipped cleanup is always recoverable later.
+_worktree_cleanup_decide() {
+  local kind="$1" path="$2" flags=()
+  if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+    flags+=(--preserve-check)
+    ! branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA" || flags+=(--landed)
+  fi
+  local out rc=0
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr worktree-preserve --kind "$kind" --path "$path" --repo-root "$REPO_ROOT" --pr "$PR_NUMBER" --branch "$PR_BRANCH" --issue-num "${ISSUE_NUM:-}" "${flags[@]+"${flags[@]}"}" --landed-verdict "${BRANCH_LANDED_VERDICT:-}" --landed-evidence "${BRANCH_LANDED_EVIDENCE:-}" 2>/dev/null)" || rc=$?
+  local action="${out%%$'\n'*}"
+  if [[ $rc -ne 0 || ( "$action" != "REMOVE" && "$action" != "PRESERVE" ) ]]; then
+    warning "Worktree cleanup's #6694/#6264 remove-vs-preserve decision for $path did not run — 'loom-daemon merge-pr worktree-preserve' exited $rc without a recognized verdict (a loom-daemon predating #8191's slice has no such verb). Preserving rather than guessing REMOVE: a skipped cleanup is always recoverable (loom-clean, the daemon's reaper, or a future merge), an incorrectly removed worktree is not. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+    return 0
+  fi
+  local lines="" level text
+  [[ "$out" != *$'\n'* ]] || lines="${out#*$'\n'}"
+  while IFS=$'\t' read -r level text; do
+    [[ -n "$level" ]] || continue
+    case "$level" in WARNING) warning "$text" ;; *) info "$text" ;; esac
+  done <<< "$lines"
+  [[ "$action" == "REMOVE" ]] && _remove_loom_worktree "$path"
+  return 0
+}
+
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1) — local branch left in place"
@@ -3007,28 +3019,9 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # Close-target-aware gate (#4186): ISSUE_NUM is only set when
       # PR_BRANCH matched the feature/issue-<N> convention above. When it's
       # unset (the pr-<N> path) this check is skipped entirely — unchanged
-      # behavior.
-      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        # #6694: the issue-close gate above says "preserve", but that is only
-        # correct while the worktree/branch might still be needed. When the
-        # branch has already LANDED (#7812 — forge PR state, tree equality,
-        # or ancestry), every change on it made it into the default branch —
-        # the worktree holds nothing unmerged regardless of whether the ISSUE
-        # itself ever closes. Without this
-        # check, a programme issue intentionally designed to accumulate
-        # `Part of #N` increments forever (every merge non-closing by
-        # design) would preserve this worktree/branch indefinitely, since
-        # _issue_is_closed_for_cleanup never flips true for it.
-        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the worktree holds nothing unmerged; removing it (#6694)"
-          _remove_loom_worktree "$DEFAULT_WT_PATH"
-        else
-          warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DEFAULT_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-        fi
-      else
-        _remove_loom_worktree "$DEFAULT_WT_PATH"
-      fi
+      # behavior. See _worktree_cleanup_decide above for the #6694 landed-
+      # branch override this now shares with the two call sites below.
+      _worktree_cleanup_decide default "$DEFAULT_WT_PATH"
     else
       # Discovery fallback (warn-only): the Loom-convention path is missing,
       # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
@@ -3049,23 +3042,10 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
         elif [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
           # Rare case: Loom-managed worktree at a non-standard path. The
           # sentinel says it's safe to remove — unless the close-target-aware
-          # gate (#4186) says preserve.
-          if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-            # #6694: see the matching comment at the default-path call site
-            # above — reuse the landed check so a never-closing programme
-            # issue does not preserve this non-standard-path worktree forever
-            # either.
-            if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-              info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the discovered worktree holds nothing unmerged; removing it (#6694)"
-              _remove_loom_worktree "$DISCOVERED_WT"
-            else
-              warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-              info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DISCOVERED_WT\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-            fi
-          else
-            info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
-            _remove_loom_worktree "$DISCOVERED_WT"
-          fi
+          # gate (#4186), or the #6694 landed-branch override
+          # _worktree_cleanup_decide shares with the default-path call site
+          # above, says preserve.
+          _worktree_cleanup_decide discovered "$DISCOVERED_WT"
         else
           warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
           warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
@@ -3094,22 +3074,9 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # (loom-daemon's #5939 periodic backstop) own PR-number+path keyed
     # eligibility, which is likewise branch-state-independent.
     if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
-      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        # #6694: see the matching comment at the default-path call site
-        # above — reuse the landed check so a never-closing programme issue
-        # does not preserve this Judge/Doctor review worktree forever
-        # either.
-        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the Judge/Doctor review worktree holds nothing unmerged; removing it (#6694)"
-          _remove_loom_worktree "$JUDGE_PR_WT_PATH"
-        else
-          warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$JUDGE_PR_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-        fi
-      else
-        info "Found co-existing Judge/Doctor review worktree at $JUDGE_PR_WT_PATH (PR #$PR_NUMBER, alongside issue-$ISSUE_NUM handling above) — removing (#6264)"
-        _remove_loom_worktree "$JUDGE_PR_WT_PATH"
-      fi
+      # See the matching comment at the default-path call site above — the
+      # same #4186/#6694 decision, shared via _worktree_cleanup_decide.
+      _worktree_cleanup_decide judge-pr "$JUDGE_PR_WT_PATH"
     fi
     # Local-branch delete (#4100): the default-convention path, the
     # discovered-Loom-managed-non-standard-path, and the no-worktree-at-all

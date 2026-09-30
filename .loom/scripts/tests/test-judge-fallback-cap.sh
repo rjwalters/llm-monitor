@@ -134,6 +134,28 @@ chmod +x "$STUB_DIR/gh"
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 
+# #9537: the guard asks `loom-daemon forge is-fleet`. Pin the daemon to stubs
+# so the result never depends on whichever binary this machine has installed.
+# Default: an OLD daemon without the verb (clap-style exit 2), which makes the
+# guard use its built-in default-family fallback.
+cat > "$STUB_DIR/daemon-old" <<'EOS'
+#!/usr/bin/env bash
+echo "error: unrecognized subcommand '$2'" >&2
+exit 2
+EOS
+# A NEW daemon whose roster is: writer loom-fleet-dispatch, reader loom-fleet-reader-1.
+cat > "$STUB_DIR/daemon-new" <<'EOS'
+#!/usr/bin/env bash
+[[ "$1 $2" == "forge is-fleet" ]] || exit 2
+case "$3" in
+  app/loom-fleet-dispatch) echo writer; exit 0 ;;
+  app/loom-fleet-reader-1) echo reader; exit 0 ;;
+  *) exit 1 ;;
+esac
+EOS
+chmod +x "$STUB_DIR/daemon-old" "$STUB_DIR/daemon-new"
+export LOOM_DAEMON_BIN="$STUB_DIR/daemon-old"
+
 # ISO-8601 timestamp N hours before now-ish (macOS `date -v` first, GNU
 # `date -d` fallback — mirrors judge-fallback-guard.sh's own dual-path idiom,
 # using the REAL `date` binary, which is intentionally not stubbed here).
@@ -408,6 +430,44 @@ EOF
 run_guard 113 --cap 3
 assert_eq "11" "$RC" "(k2) app/loom-fleet-dispatch past bot-check, cap reached -> exit 11 (not 10)"
 assert_eq "SKIP" "$(get_field "$OUT" DECISION)" "(k2) DECISION=SKIP via lifetime cap, not bot-author path"
+
+# (k3) #9537: with a daemon that knows the roster, a READER identity's PR (its
+#      history re-attributed by an App rename) is Loom's own -> EVALUATE.
+reset_state
+cat > "$STUB_DIR/pr-114.json" <<'EOF'
+{"author":{"is_bot":true,"login":"app/loom-fleet-reader-1"},"headRefOid":"e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"}
+EOF
+LOOM_DAEMON_BIN="$STUB_DIR/daemon-new" run_guard 114
+assert_eq "0" "$RC" "(k3) roster reader app/loom-fleet-reader-1 -> NOT skipped"
+assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(k3) DECISION=EVALUATE for a roster reader"
+
+# (k4) A daemon that knows the verb answers not-ours for an unrelated bot ->
+#      bot-author SKIP, and its exit 1 is final (the fallback pattern is NOT
+#      consulted after a definite answer).
+reset_state
+cat > "$STUB_DIR/pr-115.json" <<'EOF'
+{"author":{"is_bot":true,"login":"app/renovate"},"headRefOid":"f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"}
+EOF
+LOOM_DAEMON_BIN="$STUB_DIR/daemon-new" run_guard 115
+assert_eq "10" "$RC" "(k4) daemon answers not-fleet for app/renovate -> exit 10"
+
+# (k5) An old daemon (no is-fleet verb): the fallback accepts a numbered pool
+#      App -- the #6982 regression the old exact match reintroduced for -1/-2.
+reset_state
+cat > "$STUB_DIR/pr-116.json" <<'EOF'
+{"author":{"is_bot":true,"login":"app/loom-fleet-dispatch-2"},"headRefOid":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"}
+EOF
+run_guard 116
+assert_eq "0" "$RC" "(k5) old daemon, app/loom-fleet-dispatch-2 -> fallback accepts it"
+assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(k5) DECISION=EVALUATE via the default-family fallback"
+
+# (k6) ...but the fallback is exact, never a prefix.
+reset_state
+cat > "$STUB_DIR/pr-117.json" <<'EOF'
+{"author":{"is_bot":true,"login":"app/loom-fleet-dispatch-evil"},"headRefOid":"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"}
+EOF
+run_guard 117
+assert_eq "10" "$RC" "(k6) app/loom-fleet-dispatch-evil -> bot-author SKIP, exit 10"
 
 # --- Summary -------------------------------------------------------------
 echo ""

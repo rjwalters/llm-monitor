@@ -173,30 +173,23 @@ back_date_file() { # <file> <seconds_ago>
 # on the test host) or file a real forge issue. Listed BEFORE "$@" so the
 # dedicated recovery cases in section 30+ can re-enable both, pointing
 # LOOM_WATCHDOG_RECOVER_CMD at a recorder stub.
-run_watchdog() {
+run_watchdog() { run_watchdog_with_args "" "$@"; }
+run_watchdog_with_args() { # <watchdog-flag-or-empty> [KEY=VAL...]
+    local flag="$1"; shift
     : > "$OUT"
     env LOOM_WATCHDOG_IPC_PROBE=0 LOOM_PID_FILE= LOOM_WORKSPACE= LOOM_MACHINE_CHECKOUT= \
         LOOM_WATCHDOG_AUTO_RECOVER=0 LOOM_WATCHDOG_ESCALATE=0 \
         LOOM_WATCHDOG_RECOVERY_STATE="$WORKDIR/.watchdog-recovery-state" \
         "$@" LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
         LOOM_SOCKET_PATH="$WORKDIR/loom-daemon.sock" \
-        LOOM_DAEMON_LAUNCHD=0 bash "$WATCHDOG" > "$OUT" 2>&1
+        LOOM_DAEMON_LAUNCHD=0 bash "$WATCHDOG" ${flag:+"$flag"} > "$OUT" 2>&1
     RC=$?
 }
 
 # As run_watchdog, but with --verbose so the OK/skip diagnostics (which the
 # non-verbose report() deliberately suppresses on stderr but always writes to the
 # log) are asserted from the same log the operator would read.
-run_watchdog_verbose() {
-    : > "$OUT"
-    env LOOM_WATCHDOG_IPC_PROBE=0 LOOM_PID_FILE= LOOM_WORKSPACE= LOOM_MACHINE_CHECKOUT= \
-        LOOM_WATCHDOG_AUTO_RECOVER=0 LOOM_WATCHDOG_ESCALATE=0 \
-        LOOM_WATCHDOG_RECOVERY_STATE="$WORKDIR/.watchdog-recovery-state" \
-        "$@" LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
-        LOOM_SOCKET_PATH="$WORKDIR/loom-daemon.sock" \
-        LOOM_DAEMON_LAUNCHD=0 bash "$WATCHDOG" --verbose > "$OUT" 2>&1
-    RC=$?
-}
+run_watchdog_verbose() { run_watchdog_with_args --verbose "$@"; }
 
 # #5118: the supervisor-gate cases (8/9/10/10a/10b) drive a STUBBED
 # launchctl/systemctl and assert on the OUT-OF-BAND branch alone, so they pin
@@ -218,12 +211,12 @@ log_hasi() { grep -qi "$1" "$WDLOG" 2>/dev/null; }
 # substitution pipe (which would otherwise block the caller for the full sleep).
 sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 
-# A dead pid we own, already killed and synchronously reaped (used for the
-# "confirmed down" pid-file fixtures below). Sets $DEAD_PID and tracks it via
-# bg_proc_track for the EXIT/INT/TERM trap. The sleep must be OUR OWN child,
-# not a $(sleeper) capture: inside a command substitution the subshell exits
-# immediately and orphans the sleep to PID 1, whose SIGCHLD reaping the
-# watchdog tick below can RACE. An orphan killed there stays a zombie —
+# A dead pid we own, already exited and synchronously reaped (used for the
+# "confirmed down" pid-file fixtures below). Sets $DEAD_PID. No `kill` is
+# sent (#9562): the child must be OUR OWN, not a $(sleeper) capture: inside a
+# command substitution the subshell exits immediately and orphans the sleep
+# to PID 1, whose SIGCHLD reaping the watchdog tick below can RACE. An
+# orphan killed there stays a zombie —
 # still answering `kill -0`, the watchdog's liveness signal, with a young
 # etime — until PID 1 gets around to reaping it. A tick that read the pid
 # file inside that window classified the daemon ALIVE inside the 90s startup
@@ -232,14 +225,28 @@ sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 # That is precisely the "#6272 branch-3 skipped when repo-scoped exists"
 # pair of failures (expected rc=1, got rc=0 + zero filings) PR #9261's CI
 # hit once and a re-run of the same head did not: a fixture race, not a
-# behaviour change. As a real child, `wait` reaps the kill SYNCHRONOUSLY, so
+# behaviour change. As a real child, `wait` reaps it SYNCHRONOUSLY, so
 # the pid is gone from the process table before the pid file is written and
 # no tick can observe it alive.
+#
+# The child EXITS ON ITS OWN; it is never signalled. It used to be a
+# `sleep 60 &` that was immediately `kill`ed, and that SIGTERM reliably landed
+# in the forked child BEFORE it exec'd `sleep` -- while it was still a copy of
+# this shell carrying the suite's INT/TERM trap (strace on Ubuntu/bash 5.2:
+# `clone() = N` then `kill(N, SIGTERM)` 0.4 ms later, no execve in between).
+# That pre-exec delivery went one of two ways, both bad:
+#   - the signal was lost across the execve (the live `sleep 60` showed no
+#     pending or caught TERM in /proc/<pid>/status), so it ran to completion and the `wait` below blocked for the full 60s. That is
+#     the ten ~60s stalls (~600 of the 638s) in the CI step -- one per call.
+#   - the copied trap RAN in the child: `bg_proc_reap; rm -rf "$WORKDIR";
+#     exit 1`, killing every tracked sleeper and deleting the suite's WORKDIR
+#     mid-run, so every later case failed on missing files.
+# A child that just exits has no signal to lose and no trap to run. It is not
+# bg_proc_track'ed either: once reaped its pid is free for reuse, and the EXIT
+# trap's reap would then `kill` whatever unrelated process inherited it.
 spawn_dead_pid() {
-    sleep 60 >/dev/null 2>&1 &
+    : &
     DEAD_PID=$!
-    bg_proc_track "$DEAD_PID"
-    kill "$DEAD_PID" 2>/dev/null
     wait "$DEAD_PID" 2>/dev/null
 }
 
@@ -469,16 +476,10 @@ echo "$live_pid" > "$WORKDIR/.daemon.pid"
 run_watchdog
 kill "$live_pid" 2>/dev/null || true
 assert_rc 1 "$RC" "marker absent + daemon alive: exits 1 (state mismatch, crash protection disarmed)"
-if log_hasi "mismatch"; then
-    pass "marker absent + daemon alive: WARN reports the state mismatch"
-else
-    fail "marker absent + daemon alive: missing the state-mismatch WARN"
-fi
-if log_has DIVERGENCE; then
-    fail "marker absent + daemon alive: should be a WARN, not a DIVERGENCE"
-else
-    pass "marker absent + daemon alive: reported as WARN, not DIVERGENCE"
-fi
+if log_hasi "mismatch"; then pass "marker absent + daemon alive: WARN reports the state mismatch"
+else fail "marker absent + daemon alive: missing the state-mismatch WARN"; fi
+if log_has DIVERGENCE; then fail "marker absent + daemon alive: should be a WARN, not a DIVERGENCE"
+else pass "marker absent + daemon alive: reported as WARN, not DIVERGENCE"; fi
 rm -f "$WORKDIR/.daemon.pid"
 
 # ===================================================================
@@ -551,7 +552,15 @@ rm -rf "$PS_STUB3B"
 # 4. Intent present, daemon DEAD ⇒ DIVERGENCE (expected but not running).
 #    This IS the #4011 outage, reproduced.
 # ===================================================================
-spawn_dead_pid; dead_pid=$DEAD_PID
+# Fixture guard first: spawn_dead_pid must return at once with a pid that is
+# already gone, and must leave $WORKDIR standing. The signalled-sleep version
+# it replaced failed both ways (60s stall, or the trap deleting $WORKDIR).
+t0=$SECONDS; spawn_dead_pid; dead_pid=$DEAD_PID
+if (( SECONDS - t0 < 5 )) && ! kill -0 "$dead_pid" 2>/dev/null && [[ -d "$WORKDIR" ]]; then
+    pass "spawn_dead_pid fixture: returns at once, pid gone, WORKDIR intact"
+else
+    fail "spawn_dead_pid fixture: took $((SECONDS - t0))s, pid alive=$(kill -0 "$dead_pid" 2>/dev/null && echo yes || echo no), WORKDIR exists=$([[ -d "$WORKDIR" ]] && echo yes || echo no)"
+fi
 echo "$dead_pid" > "$WORKDIR/pidC"
 write_marker "$WORKDIR/pidC" 60
 printf 'x\n' > "$HEARTBEAT"
@@ -2696,6 +2705,28 @@ retired "#7508/#7834: the scan locates each heredoc body rather than passing vac
     "there is no opener to locate; the differential either matches the exact bytes or fails" \
     "the two differentials above assert an exact 1314/1415-byte match, which cannot pass vacuously: there is no pattern to stop matching, only bytes to differ."
 
+
+# ===================================================================
+# 56. #9588: an OPERATOR-STOP record (`<marker>.stopped`, written when a
+#     `restart --drain --then-exit` / `fleet drain` is accepted) is a
+#     deliberate stop: no recovery, exit 0 — even with auto-recovery ON and a
+#     stale marker still present (loom-worker-2, 2026-09-30: drained, exited,
+#     revived 60s later). `control` is the same dead-daemon state WITHOUT the
+#     record, proving the exit 0 is the record's doing.
+# ===================================================================
+LOG56="$WORKDIR/rec56.log" STOPPED="$MARKER.stopped"
+for variant in moved-aside stale-marker control; do
+    rm -f "$MARKER" "$STOPPED" "$WDLOG" "$LOG56" "$WORKDIR/.watchdog-recovery-state"
+    if [[ "$variant" != moved-aside ]]; then write_marker "$WORKDIR/pid56-dead" 60; fi
+    if [[ "$variant" != control ]]; then echo 'operator_stop_reason=then-exit' > "$STOPPED"; fi
+    REC56="$(make_recover_stub noop "$LOG56")"
+    run_watchdog LOOM_WATCHDOG_AUTO_RECOVER=1 LOOM_WATCHDOG_RECOVER_CMD="$REC56"
+    rm -rf "$(dirname "$REC56")"
+    if [[ "$variant" == control ]]; then verdict="rc=$RC"; [[ "$RC" -ne 0 ]] && ! log_hasi 'operator stop recorded' && verdict=not-deliberate
+    else verdict="rc=$RC"; [[ "$RC" -eq 0 && ! -s "$LOG56" ]] && log_hasi 'operator stop recorded' && verdict=deliberate; fi
+    [[ "$verdict" == *deliberate ]] && pass "#9588 $variant: $verdict stop (no recovery unless unrecorded)" || fail "#9588 $variant: $verdict ($(cat "$WDLOG" "$LOG56" 2>/dev/null))"
+done
+rm -f "$MARKER" "$STOPPED"
 
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed, $TESTS_RETIRED retired"
