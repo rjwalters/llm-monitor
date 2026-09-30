@@ -2479,19 +2479,23 @@ class OAuthPoller: ObservableObject {
         if home.allowsHomeRead,
            let live = try? CodexAuth.load(path: CodexAuth.authPath(inHome: home.readableHome)),
            let storedAccountId = storedAccountId {
-            if codexHomeConflicts(with: credential, reportedAccountId: live.accountId) {
+            // Read alongside the bearer — same `auth.json`, no extra credential
+            // touch — so a legacy-vs-workspace id mismatch (where the ids alone
+            // prove nothing) still has an email to fall back to below.
+            let liveEmail = CodexAuth.email(inHome: home.readableHome)
+            if codexHomeConflicts(with: credential, reportedAccountId: live.accountId, homeEmail: liveEmail) {
                 // Same belt-and-braces guard as tier 1, reached whenever tier 1
                 // itself didn't run (capability gap, no RPC) but the local
                 // `auth.json` still contradicts the registration. Reported here
                 // rather than left to fall through, for the same reason as
                 // tier 1's own conflict branch.
-                noteCodexIdentityConflict(credential, homeAccountId: live.accountId, homeEmail: nil)
+                noteCodexIdentityConflict(credential, homeAccountId: live.accountId, homeEmail: liveEmail)
                 // #147: same re-attribution as tier 1. No snapshot is in hand
                 // here (only the auth.json bearer was read, not used yet), so
                 // the adopted row picks up fresh numbers on its own next poll
                 // rather than triggering a second network round-trip inline.
                 adoptDriftedIdentity(
-                    homeAccountId: live.accountId, homeEmail: nil,
+                    homeAccountId: live.accountId, homeEmail: liveEmail,
                     home: (CodexAuth.authPath(inHome: home.readableHome) as NSString).deletingLastPathComponent,
                     snapshot: nil
                 )
@@ -2791,12 +2795,42 @@ class OAuthPoller: ObservableObject {
     }
 
     /// Same guard for tier 2, where `auth.json` carries an account id rather
-    /// than an email. Both sides are the ChatGPT `account_id`, so a mismatch is
-    /// as conclusive as the email one.
-    private func codexHomeConflicts(with credential: OAuthCredential, reportedAccountId: String?) -> Bool {
-        guard let stored = credential.accountId,
-              Self.accountIdsComparable(stored: stored, reported: reportedAccountId) else { return false }
-        return Self.identitiesConflict(reportedAccountId, stored)
+    /// than an email. `homeEmail` is read from the same `auth.json` tier 2
+    /// already reads (`CodexAuth.email(inHome:)`) — no extra credential touch.
+    /// The decision itself is `codexHomeConflicts(storedAccountId:...)` below;
+    /// this wrapper only supplies the DB-backed `storedEmail(for:)` lookup that
+    /// keeps the decision a pure function.
+    private func codexHomeConflicts(
+        with credential: OAuthCredential, reportedAccountId: String?, homeEmail: String?
+    ) -> Bool {
+        guard let stored = credential.accountId else { return false }
+        return Self.codexHomeConflicts(
+            storedAccountId: stored, storedEmail: storedEmail(for: stored),
+            reportedAccountId: reportedAccountId, reportedEmail: homeEmail
+        )
+    }
+
+    /// The pure decision `codexHomeConflicts(with:reportedAccountId:homeEmail:)`
+    /// reduces to — factored out so the self-test can pin it directly without a
+    /// poller or a database, the same reason `codexHomeDrift` is `static`.
+    ///
+    /// Both sides are the ChatGPT `account_id`, so a mismatch is as conclusive
+    /// as the email one — but only when the ids are the same *kind* (see
+    /// `accountIdsComparable`). When they are not — a legacy `user-…` row read
+    /// against a current workspace-id home, say — the ids prove nothing either
+    /// way, so this falls back to the same email check tier 1 uses, rather than
+    /// declaring "no conflict" outright. Without that fallback a legacy-keyed
+    /// row whose home has since been re-logged-in as a **different** person
+    /// would poll straight through: the ids never match, `accountIdsComparable`
+    /// says don't compare, and nothing else on this path checks identity.
+    nonisolated static func codexHomeConflicts(
+        storedAccountId: String, storedEmail: String?, reportedAccountId: String?, reportedEmail: String?
+    ) -> Bool {
+        guard !storedAccountId.isEmpty else { return false }
+        if accountIdsComparable(stored: storedAccountId, reported: reportedAccountId) {
+            return identitiesConflict(reportedAccountId, storedAccountId)
+        }
+        return identitiesConflict(reportedEmail, storedEmail)
     }
 
     /// Whether a stored account id and one a home reports are the **same kind
@@ -2805,7 +2839,8 @@ class OAuthPoller: ObservableObject {
     /// `tokens.account_id`, current ones carry the *workspace* account id (a
     /// UUID). One person's row keyed on the first can never equal a current
     /// login's second, so comparing them manufactures a drift that is not
-    /// there: robb-pro's r.j.walters row after the 2.1.0 upgrade. When the kinds
+    /// there — seen after a 2.1.0 upgrade re-registered a home whose
+    /// `auth.json` still carried the legacy id shape. When the kinds
     /// differ (or the stored id was minted locally) the ids prove nothing, and
     /// the email decides instead.
     nonisolated static func accountIdsComparable(stored: String, reported: String?) -> Bool {

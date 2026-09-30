@@ -97,6 +97,7 @@ enum SelfTest {
         testCodexProvisionIdentityConflict()
         testCodexHomeIdentityGuard()
         testCodexIdentityDriftReporting()
+        testCodexTier2GuardEmailFallback()
         testDriftVocabularySharedWithCodexList()
         testCodexDriftDetailMessage()
         testCodexIdentityConflictSetsAndClearsDriftedState()
@@ -2325,7 +2326,8 @@ enum SelfTest {
             "a stale email on the row is not drift while the stable account id still agrees"
         )
         // A legacy `user-…` row id and a current workspace id are different
-        // kinds of id: never compared, so the email decides (robb-pro, 2.1.0).
+        // kinds of id: never compared, so the email decides (seen after a
+        // 2.1.0 upgrade re-registered a home still carrying the legacy id shape).
         expectEqual(
             OAuthPoller.codexHomeDrift(registeredAccountId: "user-mhkatluAF9", registeredEmail: "rj@example.com",
                                        homeAccountId: "54fbe3c7-1111-4222-8333-444455556666", homeEmail: "rj@example.com"),
@@ -2348,6 +2350,65 @@ enum SelfTest {
                && OAuthPoller.accountIdsComparable(stored: "user-aaa", reported: "user-bbb")
                && !OAuthPoller.accountIdsComparable(stored: "openai-6f1c2f7e-0000-4a00-8000-000000000000", reported: "user-bbb"),
                "id comparability: same kind only; locally minted ids never compare")
+    }
+
+    /// The tier-2 poll guard (`codexHomeConflicts`, distinct from `codex
+    /// list`'s `codexHomeDrift` above) must not go silent on a legacy-vs-
+    /// workspace id mismatch: when the ids are different kinds and so prove
+    /// nothing, it has to fall back to email, exactly like `codexHomeDrift`
+    /// does — otherwise a legacy-keyed row whose home has since been
+    /// re-logged-in as a different person polls straight through and that
+    /// person's usage lands silently in the old row.
+    private static func testCodexTier2GuardEmailFallback() {
+        // Same kind of id, and they differ — conclusive on its own, no email
+        // needed to decide.
+        expect(
+            OAuthPoller.codexHomeConflicts(
+                storedAccountId: "user-aaa", storedEmail: "a@example.com",
+                reportedAccountId: "user-bbb", reportedEmail: "a@example.com"
+            ),
+            "same-kind ids that differ are a conflict regardless of email"
+        )
+        // Different kinds (legacy vs. workspace): ids prove nothing, so the
+        // matching email means no conflict.
+        expect(
+            !OAuthPoller.codexHomeConflicts(
+                storedAccountId: "user-mhkatluAF9", storedEmail: "a@example.com",
+                reportedAccountId: "54fbe3c7-1111-4222-8333-444455556666", reportedEmail: "a@example.com"
+            ),
+            "legacy vs. workspace id, same email -> stable (the upgrade-time regression)"
+        )
+        // Different kinds, and the email disagrees too -> a different person
+        // is now logged into this home. Must be caught, not waved through.
+        expect(
+            OAuthPoller.codexHomeConflicts(
+                storedAccountId: "user-mhkatluAF9", storedEmail: "a@example.com",
+                reportedAccountId: "54fbe3c7-1111-4222-8333-444455556666", reportedEmail: "b@example.com"
+            ),
+            "legacy vs. workspace id, different email -> conflict, so another person's usage is never adopted silently"
+        )
+        // Neither side has an email on top of incomparable ids: absence
+        // proves nothing, so this stays permissive, matching tier 1's rule.
+        expect(
+            !OAuthPoller.codexHomeConflicts(
+                storedAccountId: "user-mhkatluAF9", storedEmail: nil,
+                reportedAccountId: "54fbe3c7-1111-4222-8333-444455556666", reportedEmail: nil
+            ),
+            "incomparable ids with no email on either side stay permissive, like tier 1's absence rule"
+        )
+        // A locally minted id is never compared, so this also falls to email.
+        expect(
+            OAuthPoller.codexHomeConflicts(
+                storedAccountId: "openai-6f1c2f7e-0000-4a00-8000-000000000000", storedEmail: "a@example.com",
+                reportedAccountId: "user-bbb", reportedEmail: "b@example.com"
+            ),
+            "a locally minted stored id still falls back to email when it disagrees"
+        )
+        expect(
+            !OAuthPoller.codexHomeConflicts(storedAccountId: "", storedEmail: "a@example.com",
+                                             reportedAccountId: "user-bbb", reportedEmail: "b@example.com"),
+            "an empty stored id has nothing to guard, same as tier 1"
+        )
     }
 
     /// The popover's drift badge and `codex list`'s `drift` column must never
