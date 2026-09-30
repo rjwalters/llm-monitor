@@ -253,7 +253,8 @@ A sweep began work on an issue.
   "started_at": "2026-07-30T12:00:00Z",
   "model": "opus",
   "effort": "high",
-  "runtime": "claude"
+  "runtime": "claude",
+  "story_points": 5
 }
 ```
 
@@ -263,6 +264,16 @@ A sweep began work on an issue.
 `SweepInfo::runtime` records — and is what lets a consumer say *which agent*
 is working the sweep. Omitted when the dispatch did not name one; never
 defaulted to `"claude"`.
+
+`story_points` (Issue #9432, epic #9429) is the Curator's *a priori* size
+estimate for the issue — the numeric value of its single `points:*` label, one
+of `1`/`2`/`3`/`5`/`8`/`13` — carried here so a consumer can weigh the work
+**in flight**, not only once it terminates. Same source and same contract as
+[`sweep.outcome`'s own `story_points`](#story_points--the-curators-size-estimate-issue-9432);
+it rides the `sweep.global.dispatch` event, resolved from the label list the
+dispatch path's #4444 park-label guard already read (**no** extra forge round
+trip). **Omitted, never `0`**, for an unsized issue, a defective points label
+set, a skipped label read, and every PR-set dispatch (which claims no issue).
 
 ### `sweep.identity`
 
@@ -487,6 +498,7 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "doctor_cycles": 0,
   "judge_verdicts": [{ "attempt": 1, "verdict": "pass" }],
   "complexity": "routine",
+  "story_points": 5,
   "tokens_status": "measured"
 }
 ```
@@ -503,7 +515,8 @@ is the latest (`pr_number`). A single-model, single-PR sweep collapses to one
 `pr_number`, `pr_numbers`, `tokens_in`, `tokens_out`, `lines_added`,
 `lines_deleted`, `tokens_by_model`, `tokens_unattributed`, `failure_class`,
 `models_used`, `doctor_cycles`, `judge_verdicts`, `complexity`,
-`tokens_status`, and `tokens_status_reason` are omitted when empty/unset.
+`story_points`, `tokens_status`, and `tokens_status_reason` are omitted when
+empty/unset.
 `config` is a map — not fixed fields — so operator-tunable knobs can be
 captured without a schema bump. `disposition` (Issue #9441) is the one recent
 addition that is **never** omitted — see its own section below.
@@ -708,6 +721,46 @@ denominator; one that coerces a missing `complexity` to `"routine"` conflates
 
 None of the five is added to the public redaction allowlist, for the same
 reason as the work-output fields above.
+
+#### `story_points` — the Curator's size estimate (Issue #9432)
+
+The one thing every actual on this record could not be compared against: an
+*a priori* size. `story_points` is the numeric value of the issue's single
+`points:*` label (`1`/`2`/`3`/`5`/`8`/`13`, the vocabulary
+`defaults/docs/story-points.md` defines and the Curator applies at curation
+time, epic #9429). With it on the record, "story points landed per day" (#9433)
+and the estimate-vs-actual calibration loop (#9434) are a `GROUP BY` over this
+journal instead of a join against the forge.
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `story_points` | integer (`1` \| `2` \| `3` \| `5` \| `8` \| `13`) | The `points:*` label in the label list the **same** REST read that sources `complexity` and the disposition end state already returns (`sweep_registry::outcome_journal::complexity_signal`), folded by `crate::story_points`. | **No extra forge round trip** — that read's `--jq` projection already includes `labels`, and using it is what makes the estimate provably about the same issue as `complexity`. The paired `sweep.started` record carries the same field resolved at *dispatch* time, from the label list the #4444 park-label guard already read. |
+
+**Additive** (no `schema_version` bump — not a new record kind), and **absent is
+never a measured zero**, the same contract the fields above follow. Four
+distinct situations all omit the key:
+
+| situation | why not a number |
+|---|---|
+| no `points:*` label | The issue was never sized — a pre-epic issue, an operator-filed issue, an uncurated issue. `0` would claim a Curator sized it at nothing, and would drag every mean estimate toward zero. |
+| one label, out of vocabulary (`points:21`, `points:xl`) | A curation defect. Folding it onto the nearest legal bucket would invent an estimate nobody made; it is logged at `warn` and omitted. |
+| **more than one** `points:*` label | There is no correct answer, so the daemon does not pick one. Enforced daemon-side (the guard #9431 leaves to this phase): the conflict is logged **loudly** — naming the issue and every offending label — and the key is omitted. First/last/largest/newest would each publish a number no human assigned. |
+| the read failed, timed out, or was skipped | Same fail-open contract as `complexity`: `skip_label_flip`, the fleet rate-limit breaker, or any read failure yields no labels at all, hence no size. |
+
+The label vocabulary is shared with the older `<!-- loom:points=<N> -->` body
+marker (#9056) via `crate::points_marker::POINTS_VALUES`, so the label family
+and the marker can never disagree about what a legal size is. Points are stored
+in **labels**, not the body (adjudicated on #9431): labels are server-side
+filterable and already fetched, so this phase introduced **no** new labels
+connection at all — and where a future one is added, it caps `labels(first:)` at
+the vocabulary size (`crate::story_points::POINTS_LABEL_PAGE_CAP`) so the cost
+stays flat as an issue's label count grows.
+
+**OTLP.** Both records export it as the numeric attribute `loom.story_points`
+(absent when the field is), so a backend can `sum()` assigned points per window
+and join them to `loom.tokens_in` / `loom.lines_added` /
+`loom.total_duration_sec` on the same record. Not added to the public
+redaction allowlist, for the same reason as the fields above.
 
 #### `disposition` — what the sweep actually DID (Issue #9441)
 
@@ -1511,7 +1564,7 @@ Tokens, providers and pools (Issues #8908, #8931):
 |---|---|---|---|
 | `loom.pool.account_marks` | delta `Sum` | `{account}`; labels `provider`, `reason` | one per account mark the daemon writes, at the seam that writes it: sweep and role-tick Codex terminal feedback (`provider=codex`), API-key pool bad marks (`provider` = the pool namespace, e.g. `zai`), and the Claude insta-crash exhaustion mark (`claude`). `reason` ∈ `rate_limited`, `exhausted`, `session_limit`, `model_credits`, `credential`, `transient`. No point when no mark is written (a native credential failure, a Codex `SUCCESS`/`TIMEOUT`, a failed write) |
 | `loom.pool.hold` span | own root trace (derived from `loom.pool.hold.pool` + hold start) | `loom.pool.hold.pool` (16-hex SHA-256 prefix of the pool directory — the pool's identity, never its path), `loom.pool.hold.post_mortem` (`true` when a real token-selection death armed it), `loom.pool.hold.accounts` | one work-finder pool dispatch hold, from arming to clearing. A hold still armed when the daemon stops emits no span |
-| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (uncached input, like `loom.tokens.input`), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
+| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
 
 **Usage spans: scope, sources, and how to total them (#9204, #9303).**
 
