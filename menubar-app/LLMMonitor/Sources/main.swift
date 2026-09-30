@@ -25,7 +25,9 @@ class PopoverHeightManager: ObservableObject {
     /// space. Recompute it whenever a column width there changes — the two
     /// Session %/Weekly % columns grew by 16pt each in #220 to carry the
     /// even-burn mark beside the raw percentage, taking 818 to 850.
-    static let popoverWidth: CGFloat = 850
+    // An immutable constant, read by `SummaryColumns.tableWidth` outside the
+    // main actor, so it carries no isolation.
+    nonisolated static let popoverWidth: CGFloat = 850
     static let minHeight: CGFloat = 200
     static let maxHeight: CGFloat = 800
 
@@ -39,7 +41,16 @@ class PopoverHeightManager: ObservableObject {
     static let setupHeight: CGFloat = 360
 
     @Published var currentHeight: CGFloat = PopoverHeightManager.minHeight
+    /// The table's width for the columns actually shown (#227) — narrower than
+    /// `popoverWidth` when a provider-specific column is hidden.
+    @Published var currentWidth: CGFloat = PopoverHeightManager.popoverWidth
     weak var popover: NSPopover?
+
+    /// Recompute the width from the providers now visible in the table.
+    func setVisibleProviders(_ providers: Set<AccountProvider>) {
+        let w = SummaryColumns.tableWidth(among: providers)
+        if w != currentWidth { currentWidth = w }
+    }
 
     /// Content-fitted popover height for `rowCount` account rows, clamped to
     /// [minHeight, maxHeight]. With no rows (setup/empty/error state) a fixed
@@ -55,7 +66,7 @@ class PopoverHeightManager: ObservableObject {
     func update(rowCount: Int) {
         let h = fittedHeight(rowCount: rowCount)
         if h != currentHeight { currentHeight = h }
-        popover?.contentSize = NSSize(width: Self.popoverWidth, height: h)
+        popover?.contentSize = NSSize(width: currentWidth, height: h)
     }
 }
 
@@ -171,7 +182,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        popover?.contentSize = NSSize(width: PopoverHeightManager.popoverWidth, height: heightManager.fittedHeight(rowCount: usageStore.accounts.count))
+        heightManager.setVisibleProviders(Set(usageStore.accounts.map(\.provider)))
+        popover?.contentSize = NSSize(width: heightManager.currentWidth, height: heightManager.fittedHeight(rowCount: usageStore.accounts.count))
         // .semitransient keeps the popover open while user interacts with other
         // windows in this app (e.g. multiple chart windows launched from rows).
         popover?.behavior = .semitransient

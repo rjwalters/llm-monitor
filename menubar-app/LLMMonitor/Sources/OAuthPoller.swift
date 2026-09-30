@@ -1801,9 +1801,9 @@ class OAuthPoller: ObservableObject {
         + "`llm-monitor codex add --home <path>` (or `llm-monitor codex provision <label>`)."
 
     /// What to tell someone whose freshly-imported account cannot survive the
-    /// next launch (#194). One literal, shared by `codex import` and the
-    /// popover's "Import Codex Account", so the CLI and the UI cannot describe
-    /// the same trap two different ways.
+    /// next launch (#194). Printed by `codex import`; the popover no longer
+    /// offers a credential import (#226 replaced it with CODEX_HOME
+    /// registration, which stores nothing and so cannot strand).
     nonisolated static let importWillStrandWarning =
         "This host has more than one OpenAI account and none of them is registered to a "
         + "CODEX_HOME of its own, so no Codex home can speak for this one. Its stored token is "

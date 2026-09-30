@@ -82,6 +82,9 @@ enum SelfTest {
         testClaudeTokenFileScanning()
         testClaudeTokenTargetAndAccountsEnv()
         testClaudeAccountRekey()
+        #if os(macOS)
+        testProviderColumnVisibility()
+        #endif
         testCodexAuthParsing()
         testCodexAppServerFraming()
         testCodexAppServerEnvelopeDecoding()
@@ -719,6 +722,26 @@ enum SelfTest {
     /// The wire contract, mapped onto the shared model: windows filed by
     /// duration, a null secondary window left nil, identity picked up from the
     /// same response, and per-model sub-limits landing in `named`.
+    #if os(macOS)
+    /// #227: the Anthropic-only columns disappear, and the popover narrows by
+    /// exactly their widths, when no visible provider uses them.
+    private static func testProviderColumnVisibility() {
+        let full = PopoverHeightManager.popoverWidth
+        for providers: Set<AccountProvider> in [[.anthropic], [.anthropic, .openai, .zai]] {
+            expect(SummaryColumns.shows(.premium, among: providers) && SummaryColumns.shows(.extra, among: providers),
+                   "a table with a Claude account shows Premium and Extra (\(providers.map(\.rawValue).sorted()))")
+            expectEqual(SummaryColumns.tableWidth(among: providers), full, "…at full width")
+        }
+        let noClaude: Set<AccountProvider> = [.openai, .zai]
+        expect(!SummaryColumns.shows(.premium, among: noClaude) && !SummaryColumns.shows(.extra, among: noClaude),
+               "an all-Codex/z.ai table hides both Anthropic-only columns")
+        expectEqual(SummaryColumns.tableWidth(among: noClaude), full - SummaryColumns.fable - SummaryColumns.extra,
+                    "the popover narrows by exactly the hidden columns' widths")
+        expectEqual(SummaryColumns.tableWidth(among: []), full - SummaryColumns.fable - SummaryColumns.extra,
+                    "an empty table has no provider to show them for")
+    }
+    #endif
+
     // MARK: Claude token files (chezmoi / Loom pool)
 
     /// A syntactically valid, obviously fake token (never a real one).

@@ -115,7 +115,7 @@ struct RollTokenView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Roll Token").font(.headline)
+            Text("Roll Claude Token").font(.headline)
             Text(account.displayName).font(.caption).foregroundColor(.secondary)
             Label(lastRolledLabel, systemImage: "clock.arrow.circlepath")
                 .font(.caption2).foregroundColor(.secondary)
@@ -281,7 +281,7 @@ enum RollTokenWindowController {
         if #available(macOS 13.0, *) { hostingController.sizingOptions = [.preferredContentSize] }
 
         window = NSWindow(contentViewController: hostingController)
-        window.title = "Roll Token — \(account.displayName)"
+        window.title = "Roll Claude Token — \(account.displayName)"
         window.styleMask = [.titled, .closable]
         window.setContentSize(NSSize(width: 380, height: 560))
         window.center()

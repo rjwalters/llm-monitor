@@ -481,7 +481,7 @@ struct UsageChartWindow: View {
                         .foregroundColor(.secondary)
                     Text("No usage history yet")
                         .font(.headline)
-                    Text("Visit claude.ai/settings/usage periodically\nto build up history data")
+                    Text("History builds up as LLM Monitor polls this account.\nCheck back after a few poll cycles.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -930,7 +930,7 @@ struct UsageChartWindow: View {
                 }
             }
         } message: {
-            Text("This will delete all usage history for this account. Visit claude.ai/settings/usage to collect new data.")
+            Text("This will delete all usage history for this account. New history builds up from the next poll.")
         }
     }
 
