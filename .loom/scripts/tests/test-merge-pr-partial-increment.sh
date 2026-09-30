@@ -58,10 +58,11 @@ MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 # the reading that closes an unfinished issue.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-# The post-merge reset's decision is `loom-daemon merge-pr partial-reset`
-# and the pre-merge conflict guard's is `merge-pr partial-conflict` (#8191
-# slices), so the same binary must carry both verbs too.
-loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset" "merge-pr partial-conflict"
+# The post-merge reset's decision is `loom-daemon merge-pr partial-reset`, the
+# pre-merge conflict guard's is `merge-pr partial-conflict`, and the pass's two
+# audit-comment BODIES are `merge-pr partial-comment` (#8191 slices), so the
+# same binary must carry all three verbs too.
+loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset" "merge-pr partial-conflict" "merge-pr partial-comment"
 
 # Colors
 RED='\033[0;31m'
@@ -993,6 +994,84 @@ assert_not_contains "$(read_log)" "issue edit 777" \
 assert_contains "$reopen_fail_err" "Could not reopen issue #777 after its premature auto-close" \
   "#8191: failed reopen of #777 -> warns with the manual reopen command"
 
+# T31 (#8191): the two audit-comment BODIES moved to `loom-daemon merge-pr
+# partial-comment`. A daemon that cannot render one must NOT post an empty
+# comment over the explanation -- the failure mode a bare `comment="$(... ||
+# true)"` would have produced -- and must not disturb the mutations the comment
+# merely describes. The label swap has already happened by then; only the note
+# is lost, and it is lost loudly.
+reset_log
+fake_no_comment="$STUB_DIR/fake-loom-daemon-no-partial-comment"
+cat > "$fake_no_comment" <<'FAKEDAEMON'
+#!/usr/bin/env bash
+# Answers `partial-reset` (so the pass reaches the SWAP) but not
+# `partial-comment` -- the exact version skew a half-rolled host has.
+if [[ "${1:-}" == "merge-pr" && "${2:-}" == "partial-comment" ]]; then
+  echo "error: unrecognized subcommand 'partial-comment'" >&2
+  exit 2
+fi
+exec "$LOOM_TEST_REAL_DAEMON" "$@"
+FAKEDAEMON
+chmod +x "$fake_no_comment"
+saved_bin="${LOOM_DAEMON_BIN:-}"
+export LOOM_TEST_REAL_DAEMON="$saved_bin"
+export LOOM_DAEMON_BIN="$fake_no_comment"
+PARTIAL_OPEN_BEFORE_MERGE=""
+PARTIAL_CONFLICT_ISSUES=""
+PR_JSON='{"body":"Part of #123"}'
+run_capturing_stderr _reset_partial_increment_labels
+no_comment_err="$(read_stderr)"
+no_comment_log="$(read_log)"
+export LOOM_DAEMON_BIN="$saved_bin"
+assert_contains "$no_comment_log" "issue edit 123 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
+  "#8191: a daemon without 'merge-pr partial-comment' still performs the label swap (the comment is the only casualty)"
+assert_not_contains "$no_comment_log" "issue comment 123" \
+  "#8191: ...and posts NO comment at all, rather than an empty one over the audit trail"
+assert_contains "$no_comment_err" "was NOT posted" \
+  "#8191: the skipped audit comment is reported, not swallowed"
+
+# T32 (#8191): on the happy path the posted body is the one the daemon
+# rendered, in both arms of its single conditional -- the plain swap, and the
+# swap that follows a #4569 reopen.
+reset_log
+PARTIAL_OPEN_BEFORE_MERGE=""
+PARTIAL_CONFLICT_ISSUES=""
+PR_JSON='{"body":"Part of #123"}'
+_reset_partial_increment_labels 2>/dev/null
+plain_comment_log="$(read_log)"
+assert_contains "$plain_comment_log" "## Partial Increment Merged" \
+  "#8191: the plain swap posts the daemon-rendered partial-increment body"
+assert_contains "$plain_comment_log" "*Reset by merge-pr.sh (#3667) at " \
+  "#8191: ...with its attribution sign-off intact"
+assert_not_contains "$plain_comment_log" "**Reopened** this issue" \
+  "#8191: ...and without the reopen bullet, which nothing reopened"
+assert_not_contains "$plain_comment_log" "LOOM-MERGE-PR-COMMENT" \
+  "#8191: the protocol sentinel is stripped before the body is posted"
+# ...and the sentinel's TERMINATING NEWLINE goes with it. Asserting only the
+# sentinel's absence would still pass if the strip removed the marker but left
+# its newline, which would post a body whose first line is blank. `--body` is
+# immediately followed by the heading in the stub's `echo "$*"` transcript only
+# when nothing was left behind. This is the half of the `${out#…$nl}` /
+# `[[ … == "…$nl"* ]]` pair that a wrong ANSI-C quote breaks off-Linux (see the
+# `$nl` note in merge-pr.sh) -- on bash 3.2 a literal `$'\n'` in those patterns
+# fails the match outright, which T31's "posts NO comment" assertion would read
+# as healthy; this one would not.
+assert_contains "$plain_comment_log" "--body ## Partial Increment Merged" \
+  "#8191: the body starts AT the heading -- the sentinel's newline is stripped too, not left as a blank first line"
+
+reset_log
+PARTIAL_OPEN_BEFORE_MERGE="777"
+PARTIAL_CONFLICT_ISSUES="777"
+PR_JSON='{"body":"Verify, then close #777.\n\nContributes to #777"}'
+run_capturing_stderr _reset_partial_increment_labels
+reopen_comment_log="$(read_log)"
+assert_contains "$reopen_comment_log" "## Premature Auto-Close Reverted" \
+  "#8191: the reopen posts the daemon-rendered premature-close body"
+assert_contains "$reopen_comment_log" "instead of \`close #777\`" \
+  "#8191: ...naming the offending issue in the advice it gives the Builder"
+assert_contains "$reopen_comment_log" "- **Reopened** this issue" \
+  "#8191: the follow-on swap's body leads with the reopen bullet"
+
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""
 echo "Testing merge-pr.sh source guards..."
@@ -1022,7 +1101,16 @@ assert_contains "$src" "_check_partial_increment_close_conflict || true" \
   "merge-pr.sh invokes the #4569 conflict guard BEFORE either merge path"
 assert_contains "$src" 'forge_gh_reopen_issue_rl_safe "$REPO_NWO" "$issue_num"' \
   "merge-pr.sh reverts a premature auto-close via the rate-limit-safe reopen wrapper (#4856)"
-assert_contains "$src" 'forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment"' \
+# The BODY argument is no longer a `$comment` local: both bodies are
+# `loom-daemon merge-pr partial-comment` since #8191's slice, so the third
+# argument is now the daemon's output with its sentinel stripped. The assertion
+# is narrowed to the part that is still this file's responsibility — that the
+# post goes through the #4856 wrapper, repo-scoped and issue-scoped — and the
+# body itself is asserted behaviourally by T31/T32 below and byte-for-byte by
+# loom-daemon/tests/merge_pr_partial_comment_differential.rs. This is a
+# narrowing of an existing assertion, not a retirement: nothing it used to
+# forbid is now allowed.
+assert_contains "$src" 'forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num"' \
   "merge-pr.sh posts the partial-increment / premature-close comments via the rate-limit-safe wrapper (#4856)"
 retired "merge-pr.sh's source contains the closing-keyword alternation" \
     "the GitHub closing-keyword set (and its \\b guard, which is what stops 'Discloses #N' matching) must not drift from the one forge_pr_close_targets uses" \

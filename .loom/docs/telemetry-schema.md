@@ -1562,7 +1562,11 @@ id and the tick span as its parent. Its attributes are `loom.issue`,
 `error`) and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason it
 was counted under), plus `loom.repo`/`loom.repo.visibility` (Issue #9222) when
 the admitting workspace's forge slug has already been resolved by the
-collector — omitted, never a local path, on a cache miss. A `pr_open` refusal
+collector — omitted, never a local path, on a cache miss — and the candidate's
+queue position (Issue #9669): `loom.queue.candidate_rank` (1-indexed position
+in the tick's shaped pass-2 candidate order) and `loom.queue.total_candidates`
+(that order's length), present only when the tick recorded a plan order naming
+this admission; a single-workspace tick records none. A `pr_open` refusal
 in a locked repo also carries that repo's `lockout.*` weight (Issue #9674;
 see the disposition span's table below). Its status is
 `error` only for `error`.
@@ -1594,10 +1598,14 @@ tick; otherwise a root of its own. Attributes:
 | `loom.issue` | the issue number |
 | `loom.queue.disposition` | the `QueueDisposition` wire name (`deferred_saturation`, `parked`, `workspace_halted`, `host_class_refused`, …) |
 | `loom.queue.state` | `running` / `ready` / `blocked` |
-| `loom.queue.rank` | 1-based dispatch-order rank; absent on a `left_queue` span (the row is no longer ranked) |
+| `loom.queue.rank` | 1-based dispatch-order rank over every row the tick ranked; absent on a `left_queue` span (the row is no longer ranked) |
+| `loom.queue.candidate_rank` | 1-based queue position at the sampled tick (Issue #9669): the dispatch-plan `position` in the shaped pass-2 candidate order when the row has one, else the comparator `rank` — a blocked row's would-be position once unblocked. Absent on a `left_queue` span |
+| `loom.queue.total_candidates` | the sampled tick's ready-queue row count — the denominator of `loom.queue.candidate_rank` (Issue #9669). Absent on a `left_queue` span |
+| `loom.queue.priority_score` | the comparator keys that placed the row, as one compact JSON object in comparator order, e.g. `{"operator_priority":false,"main_red_fix":false,"workspace_priority":100,…}` (Issue #9669). The comparator is lexicographic over named keys — there is no numeric score — so this is the weight itself, taken from the row's plan annotation; absent without one |
 | `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
-| `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the closed `PARK_LABELS ∪ SKIP_LABELS` vocabulary — a repo-configured extra skip label or a hard-exclusion rule name outside that set is never exported |
+| `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the row's closed vocabulary — `PARK_LABELS ∪ SKIP_LABELS` for `parked`, `hard_exclusion::HARD_EXCLUSION_LABELS` (e.g. `external`) for `hard_exclusion` (#9672) — so a span names which rule declined the issue. A repo-configured extra skip label, a rule name outside that set, or any other detail text is never exported |
+| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker` (#9673). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
 | `loom.pr_number` | only for `open_pr`, parsed from the row's structured detail |
 | `lockout.frozen_candidates_count` | only for `open_pr` (Issue #9674): how many ready issues in this repo the #4123 open-PR guard is currently blocking (`pr-open-skip`) — the repo's frozen backlog |
 | `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
@@ -1620,6 +1628,13 @@ delta counter. The single-workspace work-finder loop records no per-issue
 queue rows at all (`workspace #N` placeholders never resolve to a slug), so it
 has nothing to export here — the same limitation `queue.snapshot` and the
 forge stage-dwell sampler already document.
+
+Queue-bottleneck forensics (Issue #9669): the position attributes isolate
+high-priority waits — e.g. issues sitting at the top of a tick's queue while
+blocked, `WHERE queue.candidate_rank <= 5 AND
+loom.queue.disposition IN ('parked','workspace_halted')`, versus the backlog
+tail (`candidate_rank` past the head). `total_candidates` reads the rank
+against the tick's whole ready queue.
 
 **Mapping an operator's plain-English question to a disposition**: see
 [`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)'s
@@ -1865,7 +1880,7 @@ appears and are not refreshed.
 |---|---|---|
 | `estimate` | object | the estimate as emitted: `estimate_id`, `kind`, `heuristic`, `loom` (required), `repo`, `repo_id`, `issue`, `pr_number`, `as_of`, `stage`, `age_sec`, `p25_sec`/`p50_sec`/`p75_sec` (absent on a refusal), `samples_min`, `no_estimate_reason`, `stage_quartiles[]` |
 | `loom` | object | the observing daemon's provenance (required) |
-| `score` | object | `outcome` (`landed`, `finished`, `abandoned`), `actual_at`, `lead_sec`, `error_sec` (`actual − p50`), `abs_error_sec`, `covered` (`p25 ≤ actual ≤ p75`), `below_p25`, `above_p75`, `pinball_loss_sec`, `horizon_bucket`, `age_bucket`, `stage_at_estimate`, `samples_min`, `stages_actual[]`, `rework_rounds_actual` |
+| `score` | object | `outcome` (`started` (#9326), `landed`, `finished`, `abandoned`), `actual_at`, `lead_sec`, `error_sec` (`actual − p50`), `abs_error_sec`, `covered` (`p25 ≤ actual ≤ p75`), `below_p25`, `above_p75`, `pinball_loss_sec`, `horizon_bucket`, `age_bucket`, `stage_at_estimate`, `samples_min`, `stages_actual[]`, `rework_rounds_actual` |
 | `outcome_source` | string | `bus` (in-sweep merge), `pulls_read` (the PR's merge time), `issues_read` (the issue's close state), `sweep_terminal` |
 | `outcome_resolution_sec` | integer? | how late the resolution may be |
 | `result` | string? | `finish`: the sweep's terminal class, `exited` or `crashed` |
