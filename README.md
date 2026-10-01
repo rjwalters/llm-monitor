@@ -804,6 +804,17 @@ OpenAI wire contract; prints only derived numbers, never identity fields).
 installed binary (opt-in: it needs a logged-in Codex home).
 Run `llm-monitor selftest --help` for details.
 
+A couple of checks spawn the CLI itself (the `accounts push` channel is tested
+end to end against a stub `ssh`). Those are skipped unless the running
+executable *is* the CLI — i.e. it was started as `llm-monitor selftest`. If you
+host the suite from your own harness binary instead, point
+`LLM_MONITOR_CLI=/path/to/llm-monitor` at the real CLI to run them; without it
+they are reported as skipped rather than re-executing a binary that cannot
+answer `accounts import`. `LLM_MONITOR_SELFTEST_DEPTH` is the matching
+tripwire — it is set in the spawned child's environment, and `selftest` refuses
+to start when it is already present, so the suite can never recursively invoke
+itself.
+
 Edits to `accounts.env` / `accounts.local.env` are picked up automatically
 while the daemon runs. A sample systemd user unit is provided at
 `scripts/llm-monitor.service`.
@@ -864,6 +875,14 @@ llm-monitor accounts pull robb-studio
   On `exit 127` (command not found), reach for `--remote-bin <absolute path>`:
   a non-interactive `ssh HOST <command>` shell doesn't source the profile that
   puts `~/.local/bin` on `PATH`.
+- **No time limit, by default.** A host is given as long as it needs: a
+  fleet-sized bundle over a slow link is slow, and cutting one off mid-delivery
+  would leave that host half-converged. Set
+  `LLM_MONITOR_SUBPROCESS_TIMEOUT_SECS=<seconds>` to put a ceiling on each ssh
+  child for an unattended run — a host still going at the deadline is killed
+  (SIGTERM, then SIGKILL) and reported as a per-host timeout, and the remaining
+  hosts are still attempted. A non-positive or unparseable value means no
+  ceiling, so a mistyped backstop can never fail a push on its own.
 
 `export` / `import` remain the building blocks `push`/`pull` are made of, and
 are still the right tool when there is no ssh path between two hosts:

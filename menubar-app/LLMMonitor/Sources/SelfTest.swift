@@ -24,6 +24,19 @@ enum SelfTest {
     private nonisolated(unsafe) static var checks = 0
 
     static func main(_ arguments: [String] = []) -> Never {
+        // Before anything else, including --help: a process that got here from
+        // a selftest stub must not run the suite again. See `reentryGuardEnvKey`.
+        if isReentrantInvocation() {
+            FileHandle.standardError.write(Data("""
+                selftest: refusing to run — \(reentryGuardEnvKey) is set, so this process was \
+                spawned by a selftest stub rather than by an operator. Running the suite from \
+                here is the unbounded recursion of #234. Unset \(reentryGuardEnvKey) to run it \
+                normally.
+
+                """.utf8))
+            exit(1)
+        }
+
         failures = []
         checks = 0
 
@@ -169,6 +182,9 @@ enum SelfTest {
         testAccountSyncExportHasUniqueEmailsAndNoOpenAI()
         testAccountImportCreatesMissingDatabase()
         testAccountSyncRemoteArgsAndCommands()
+        testSelfTestCLIResolutionRefusesNonCLIHost()
+        testSelfTestReentryGuardRefusesNestedRun()
+        testRunProcessTimeoutKillsWedgedChildAndItsDrains()
         testAccountSyncPushStreamsBundleWithoutWritingAFile()
         testAccountSyncPushDryRunSendsNoBundle()
         testAccountSyncPushReportsPerHostFailure()
@@ -204,6 +220,92 @@ enum SelfTest {
         }
         FileHandle.standardError.write(Data("selftest: \(failures.count)/\(checks) check(s) failed\n".utf8))
         exit(1)
+    }
+
+    // MARK: - Re-entering this suite from a child process (#234)
+
+    /// Exported by every stub in this file that re-execs the CLI, and refused by
+    /// `main` when it is already set.
+    ///
+    /// **Why a guard is needed at all.** The `accounts push` check below stands a
+    /// stub `ssh` in for the network and then has it run the *real* destination
+    /// command, `accounts import -`, so the channel is exercised end to end. That
+    /// only works if the executable hosting this suite is the CLI that dispatches
+    /// `accounts`. When it is not, the argument is ignored and the child runs the
+    /// **whole suite** again — reaching this same check, spawning another child,
+    /// each level blocked on the one below it. A standalone harness whose
+    /// `main.swift` was nothing but `SelfTest.main(…)` did exactly that: a
+    /// ~600-deep process chain that sat for 19 hours, held 5.6 GB of RSS, pushed
+    /// swap to 28 GB, and left ~600 scratch directories behind — a hung process
+    /// never runs `withSelfTestTempDir`'s cleanup `defer`.
+    ///
+    /// `resolveCLIBinary` keeps that host from being re-exec'd in the first
+    /// place. This is the independent backstop that bounds the chain at depth 2
+    /// for whatever host comes next, and it is deliberately the cruder of the
+    /// two: the child refuses before it runs a single check, so it cannot be
+    /// reasoned wrong by a future test that spawns something new.
+    static let reentryGuardEnvKey = "LLM_MONITOR_SELFTEST_DEPTH"
+
+    /// True when this process was started by a selftest stub. Any non-empty
+    /// value counts — the variable's *presence* is the signal, not a depth to be
+    /// incremented and compared against a limit.
+    static func isReentrantInvocation(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        AppPaths.environment("SELFTEST_DEPTH", in: environment) != nil
+    }
+
+    /// The `llm-monitor` CLI a check may re-exec, or nil when the running
+    /// executable is not it.
+    ///
+    /// `Bundle.main.executablePath` alone is not enough, and trusting it was the
+    /// bug: it answers *what is running*, not *does what is running understand
+    /// `accounts import`* — and an `isExecutableFile` check on it is satisfied by
+    /// any host binary whatsoever. Two things can answer the real question:
+    ///
+    /// * `LLM_MONITOR_CLI`, an explicit path — how a harness that is *not* the
+    ///   CLI can still run these checks: by naming the CLI it built.
+    /// * Otherwise the running executable, but only when argv shows it was
+    ///   dispatched as `<cli> selftest` — the exact condition both entry points
+    ///   switch on (`main.swift`, `HeadlessMain.swift`), so the fact that proves
+    ///   this process is the CLI is the same fact that proves `accounts` is
+    ///   dispatchable.
+    ///
+    /// nil means **skip the check**, never fail it: a host that cannot spawn the
+    /// CLI has nothing to say about the push channel either way.
+    static func resolveCLIBinary(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        processArguments: [String] = CommandLine.arguments,
+        bundleExecutablePath: String? = Bundle.main.executablePath,
+        fileManager: FileManager = .default
+    ) -> String? {
+        if let override = AppPaths.environment("CLI", in: environment)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            // A broken override is a configuration mistake worth skipping on,
+            // never something to paper over by falling back to the running
+            // executable — that fallback is precisely what #234 was.
+            return fileManager.isExecutableFile(atPath: override) ? override : nil
+        }
+        guard processArguments.dropFirst().first == "selftest",
+              let path = bundleExecutablePath,
+              fileManager.isExecutableFile(atPath: path) else { return nil }
+        return path
+    }
+
+    /// Wall-clock ceiling handed to every `accounts push|pull` check's fan-out.
+    /// Generous on purpose: this is a hang backstop, not a performance
+    /// assertion — the children are shell stubs plus one debug-build
+    /// `accounts import`, and a loaded CI box is allowed to be slow.
+    private static let remoteSyncCheckTimeoutSeconds = 120
+
+    /// What every `accounts push|pull` check passes as the fan-out's
+    /// environment: the stub `ssh` to run, plus the ceiling above so a wedged
+    /// child fails a check instead of hanging the suite forever.
+    private static func remoteSyncTestEnvironment(ssh: String) -> [String: String] {
+        [
+            AccountSyncRemote.sshOverrideEnvKey: ssh,
+            AccountSyncRemote.processTimeoutEnvKey: "\(remoteSyncCheckTimeoutSeconds)",
+        ]
     }
 
     // MARK: - Assertions
@@ -6831,9 +6933,18 @@ enum SelfTest {
     /// stdin it was handed, so this also covers the fresh-host import path from
     /// the outside.
     private static func testAccountSyncPushStreamsBundleWithoutWritingAFile() {
-        guard let selfBinary = Bundle.main.executablePath,
-              FileManager.default.isExecutableFile(atPath: selfBinary) else {
-            // Nothing to spawn (e.g. an embedded host) — skip rather than fail.
+        // `resolveCLIBinary`, not `Bundle.main.executablePath`: the stub below
+        // re-execs this path with `accounts import`, so what is needed is a
+        // binary that *dispatches* `accounts`, not merely one that is
+        // executable. An embedded app host and a standalone selftest harness
+        // both pass the old check and neither can answer — the second one by
+        // re-running this very suite (#234).
+        guard let cli = resolveCLIBinary() else {
+            print("""
+                selftest: skipping the accounts-push channel check — this process is not the \
+                llm-monitor CLI, so there is nothing that would answer `accounts import` \
+                (point LLM_MONITOR_CLI at the built CLI to run it anyway)
+                """)
             return
         }
         withSelfTestTempDir("push") { dir in
@@ -6863,8 +6974,17 @@ enum SelfTest {
                     # Stub ssh: record the argv it was invoked with, then run the
                     # destination command locally against a scratch database with
                     # the piped bundle still on stdin.
+                    #
+                    # The guard export is the #234 backstop, exported on its own
+                    # line rather than as a `VAR=1 exec …` prefix (POSIX leaves
+                    # assignments to the `exec` special builtin ambiguous): if
+                    # this binary turns out not to dispatch `accounts` after all,
+                    # the child refuses to run the suite a second time instead of
+                    # re-entering it and spawning a child of its own.
+                    \(reentryGuardEnvKey)=1
+                    export \(reentryGuardEnvKey)
                     printf '%s\\n' "$*" > \(argvFile)
-                    exec "\(selfBinary)" accounts import - --db "\(destDB)"
+                    exec "\(cli)" accounts import - --db "\(destDB)"
                     """)
 
                 var info: [String] = []
@@ -6872,7 +6992,7 @@ enum SelfTest {
                 let options = try AccountSyncRemote.parseArgs(["worker1", "--db", sourceDB], verb: .push)
                 let status = AccountSyncRemote.runPush(
                     options,
-                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    environment: remoteSyncTestEnvironment(ssh: ssh),
                     output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
                 )
 
@@ -6920,6 +7040,197 @@ enum SelfTest {
         }
     }
 
+    /// The guard that decides whether the push check above may re-exec this
+    /// process at all. Every case here is a host shape that satisfies the old
+    /// `isExecutableFile`-only check, which is why that check could not be the
+    /// one asked (#234).
+    private static func testSelfTestCLIResolutionRefusesNonCLIHost() {
+        withSelfTestTempDir("cli-resolve") { dir in
+            do {
+                // Stands in for any executable at all — the point is that being
+                // executable says nothing about dispatching `accounts`.
+                let host = try writeStub(in: dir, name: "host-binary", body: "#!/bin/sh\nexit 0\n")
+
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: [:], processArguments: [host, "selftest"],
+                        bundleExecutablePath: host),
+                    host,
+                    "the real CLI — argv proves `<cli> selftest` dispatch — is re-exec'able")
+
+                // The incident's shape: a standalone harness whose `main.swift`
+                // is only `SelfTest.main(Array(CommandLine.arguments.dropFirst(1)))`,
+                // so argv never carries the `selftest` subcommand.
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: [:], processArguments: [host],
+                        bundleExecutablePath: host),
+                    nil,
+                    "a standalone selftest harness is not re-exec'd — this is the #234 recursion")
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: [:], processArguments: [host, "--db", "/tmp/copy.db"],
+                        bundleExecutablePath: host),
+                    nil,
+                    "…nor is one invoked with the suite's own options")
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: [:], processArguments: [host, "accounts", "push", "worker1"],
+                        bundleExecutablePath: host),
+                    nil,
+                    "…nor a CLI running some other subcommand, which never reaches this suite")
+
+                // An embedded host (the macOS app bundle): nothing to spawn.
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: [:], processArguments: [host, "selftest"],
+                        bundleExecutablePath: nil),
+                    nil,
+                    "a host with no executable path at all resolves to nil rather than trapping")
+
+                // The explicit escape hatch, and the reason a harness is not
+                // simply locked out: it can name the CLI it built.
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: ["LLM_MONITOR_CLI": host], processArguments: [host],
+                        bundleExecutablePath: nil),
+                    host,
+                    "LLM_MONITOR_CLI lets a non-CLI harness run the push check against a real CLI")
+                expectEqual(
+                    resolveCLIBinary(
+                        environment: ["LLM_MONITOR_CLI": dir.appendingPathComponent("nope").path],
+                        processArguments: [host, "selftest"],
+                        bundleExecutablePath: host),
+                    nil,
+                    "a broken override skips rather than silently falling back to the running binary")
+            } catch {
+                checks += 1
+                failures.append("CLI resolution test threw: \(error)")
+            }
+        }
+    }
+
+    /// The backstop under that guard: even if some future stub re-execs a host
+    /// that *does* re-enter this suite, the child must refuse before running a
+    /// single check. Asserted both as the pure rule and end-to-end against the
+    /// real binary, because the value of this guard is entirely in the second
+    /// one — a process chain that cannot form.
+    private static func testSelfTestReentryGuardRefusesNestedRun() {
+        expect(!isReentrantInvocation(environment: [:]),
+               "an ordinary environment is not a re-entry")
+        expect(!isReentrantInvocation(environment: [reentryGuardEnvKey: ""]),
+               "an empty value is not a re-entry (an exported-but-unset variable)")
+        expect(isReentrantInvocation(environment: [reentryGuardEnvKey: "1"]),
+               "the guard variable's presence is the signal")
+        expect(isReentrantInvocation(environment: [reentryGuardEnvKey: "anything"]),
+               "…whatever its value — it is not a depth to compare against a limit")
+
+        guard let cli = resolveCLIBinary() else {
+            print("selftest: skipping the nested-run refusal check — this process is not the "
+                  + "llm-monitor CLI (set LLM_MONITOR_CLI to point at it)")
+            return
+        }
+
+        withSelfTestTempDir("reentry") { dir in
+            do {
+                // Exactly what a stub does on the path that broke: export the
+                // guard, then hand the CLI a subcommand. Here it is `selftest`
+                // itself, i.e. the worst case the guard exists for.
+                let stub = try writeStub(in: dir, name: "nested", body: """
+                    #!/bin/sh
+                    \(reentryGuardEnvKey)=1
+                    export \(reentryGuardEnvKey)
+                    exec "\(cli)" selftest
+                    """)
+
+                let started = Date()
+                let result = try AccountSyncRemote.runProcess(
+                    executable: stub, arguments: [], timeout: 60)
+                let elapsed = Date().timeIntervalSince(started)
+                let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
+                let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+
+                expect(!result.timedOut,
+                       "the nested run refuses on its own — it does not have to be killed "
+                           + "(took \(String(format: "%.1f", elapsed))s)")
+                expect(result.status != 0,
+                       "a nested run exits non-zero; status was \(result.status)")
+                expect(stderr.contains(reentryGuardEnvKey),
+                       "the refusal names the variable an operator has to unset; stderr was: \(stderr)")
+                expect(stderr.lowercased().contains("refusing"),
+                       "…and says plainly that it refused; stderr was: \(stderr)")
+                expect(!stdout.contains("check(s) passed"),
+                       "the nested process ran no checks at all; stdout was: \(stdout)")
+            } catch {
+                checks += 1
+                failures.append("re-entry guard test threw: \(error)")
+            }
+        }
+    }
+
+    /// The last line of defence, independent of both guards above: a child that
+    /// never exits must fail a check instead of hanging the suite.
+    ///
+    /// The stub leaves a **grandchild** holding the inherited stdout/stderr, so
+    /// killing the child does not close the pipes. That is the shape of #234's
+    /// chain — every level held its parent's pipes — and it is what makes the
+    /// unbounded `PipeDrain.waitForEOF()` outlive the kill, so a timeout that
+    /// only bounded the process wait would not have been a timeout at all.
+    private static func testRunProcessTimeoutKillsWedgedChildAndItsDrains() {
+        expectEqual(AccountSyncRemote.resolveProcessTimeout(environment: [:]), nil,
+                    "no override means unbounded — the production default, since a slow fleet "
+                        + "push must not be guillotined")
+        expectEqual(AccountSyncRemote.resolveProcessTimeout(
+            environment: [AccountSyncRemote.processTimeoutEnvKey: "12.5"]), 12.5,
+                    "a fractional override parses")
+        expectEqual(AccountSyncRemote.resolveProcessTimeout(
+            environment: [AccountSyncRemote.processTimeoutEnvKey: "0"]), nil,
+                    "zero is unbounded, not an instant kill")
+        expectEqual(AccountSyncRemote.resolveProcessTimeout(
+            environment: [AccountSyncRemote.processTimeoutEnvKey: "soon"]), nil,
+                    "a garbage override falls back to unbounded rather than failing the push")
+
+        expect(AccountSyncRemote.failureDescription(
+            AccountSyncRemote.RemoteResult(status: 0, stdout: Data(), stderr: Data(), timedOut: true))
+            != nil,
+               "a timed-out child is a failure even when its status reads as 0 — a SIGTERM "
+                   + "handler must not be able to report success for work it never finished")
+
+        withSelfTestTempDir("timeout") { dir in
+            do {
+                let stub = try writeStub(in: dir, name: "wedged", body: """
+                    #!/bin/sh
+                    # The background sleep inherits this stub's stdout/stderr, so
+                    # both pipes stay open after the stub itself is killed.
+                    sleep 10 &
+                    sleep 10
+                    """)
+
+                let started = Date()
+                let result = try AccountSyncRemote.runProcess(
+                    executable: stub, arguments: [], input: Data("ignored".utf8), timeout: 1)
+                let elapsed = Date().timeIntervalSince(started)
+
+                expect(result.timedOut, "a child that outlives the deadline is reported as timed out")
+                expect(result.status != 0,
+                       "a killed child never reads as a success; status was \(result.status)")
+                // 1s deadline + 0.5s SIGTERM grace + the bounded drain wait, all
+                // well inside the stub's 10s sleep. Reaching here at all is most
+                // of the point: before the timeout existed this call never
+                // returned.
+                expect(elapsed < 9,
+                       "runProcess returns on its own deadline, not the child's "
+                           + "(took \(String(format: "%.1f", elapsed))s)")
+                expect(AccountSyncRemote.failureDescription(result)?.contains("timed out") == true,
+                       "the reported reason names the timeout, not the signal it died of; "
+                           + "saw: \(AccountSyncRemote.failureDescription(result) ?? "nil")")
+            } catch {
+                checks += 1
+                failures.append("runProcess timeout test threw: \(error)")
+            }
+        }
+    }
+
     /// `--dry-run` must not put a credential on the wire for a mere preview: it
     /// probes reachability (and that `claude-monitor` resolves on the far
     /// side's non-interactive PATH) and sends nothing.
@@ -6951,7 +7262,7 @@ enum SelfTest {
                     ["worker1", "worker2", "--dry-run", "--db", dbPath], verb: .push)
                 let status = AccountSyncRemote.runPush(
                     options,
-                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    environment: remoteSyncTestEnvironment(ssh: ssh),
                     output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
                 )
 
@@ -7012,7 +7323,7 @@ enum SelfTest {
                     ["unreachable", "worker2", "--db", dbPath], verb: .push)
                 let status = AccountSyncRemote.runPush(
                     options,
-                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    environment: remoteSyncTestEnvironment(ssh: ssh),
                     output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
                 )
 
@@ -7098,7 +7409,7 @@ enum SelfTest {
                     ["worker1", "worker2", "--db", dbPath], verb: .push)
                 let status = AccountSyncRemote.runPush(
                     options,
-                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    environment: remoteSyncTestEnvironment(ssh: ssh),
                     output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
                 )
 
@@ -7153,7 +7464,7 @@ enum SelfTest {
                 let options = try AccountSyncRemote.parseArgs(["robb-studio", "--db", dbPath], verb: .pull)
                 let status = AccountSyncRemote.runPull(
                     options,
-                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    environment: remoteSyncTestEnvironment(ssh: ssh),
                     output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
                 )
 
@@ -7191,7 +7502,7 @@ enum SelfTest {
                 let options = try AccountSyncRemote.parseArgs(["worker1", "--db", dbPath], verb: .pull)
                 let status = AccountSyncRemote.runPull(
                     options,
-                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    environment: remoteSyncTestEnvironment(ssh: ssh),
                     output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
                 )
 

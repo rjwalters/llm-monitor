@@ -1,4 +1,12 @@
 import Foundation
+// `kill` / `SIGKILL` are POSIX, not Foundation: Linux's
+// swift-corelibs-foundation does not re-export them, so the platform module has
+// to be imported explicitly for the headless build.
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// `llm-monitor accounts push|pull` — ssh fan-out built on the existing
 /// `AccountSync` export/import plumbing (#188).
@@ -200,6 +208,39 @@ enum AccountSyncRemote {
         return nil
     }
 
+    // MARK: - Subprocess timeout
+
+    /// Wall-clock ceiling on a single ssh child, in seconds.
+    ///
+    /// **Unset means unbounded, and that is the production default on purpose.**
+    /// A fleet-sized bundle over a slow link legitimately takes as long as it
+    /// takes, and guillotining a half-delivered push at a number nobody chose
+    /// would turn a slow host into a corrupted one. The flip side is that a child
+    /// which never exits wedges the caller forever — tolerable for an operator
+    /// watching a terminal, *not* tolerable for `selftest`, where it showed up as
+    /// a 600-deep process chain that sat for 19 hours and took the host's swap
+    /// with it (#234). So this is the seam that bounds it: the suite sets the
+    /// override, the fleet does not.
+    static let processTimeoutEnvKey = "LLM_MONITOR_SUBPROCESS_TIMEOUT_SECS"
+
+    /// How long a killed child's pipes get to reach EOF before the drains are
+    /// abandoned. Needed because a *grandchild* inherits the same write ends, so
+    /// reaping the direct child does not necessarily close them.
+    static let drainGraceAfterTimeout: TimeInterval = 2
+
+    /// Parses `processTimeoutEnvKey`; nil (unbounded) for an absent, unparseable,
+    /// or non-positive value. A garbage value is deliberately *not* an error —
+    /// this is a backstop, and failing a push over a mistyped backstop would be
+    /// worse than running without one.
+    static func resolveProcessTimeout(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> TimeInterval? {
+        guard let raw = AppPaths.environment("SUBPROCESS_TIMEOUT_SECS", in: environment)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              let seconds = TimeInterval(raw), seconds > 0 else { return nil }
+        return seconds
+    }
+
     // MARK: - Output sink
 
     /// Where progress lines go. Defaulted to stdout/stderr; `selftest` swaps in
@@ -230,7 +271,19 @@ enum AccountSyncRemote {
         /// questions: a fast-failing ssh reports *why* it failed in its own exit
         /// code, and the broken pipe is merely the downstream symptom.
         var inputWriteFailed: Bool = false
+        /// True when the child outlived `runProcess`'s timeout and was killed.
+        /// Its own exit status then says only how it died (signal 9), so this is
+        /// the field that carries *why* — and `stdout`/`stderr` are whatever had
+        /// arrived by then, which is why a caller must not read them as complete.
+        var timedOut: Bool = false
     }
+
+    /// Sentinel status for a child still reported as running after SIGKILL —
+    /// `Process.terminationStatus` is only defined once the process has exited,
+    /// so it is never read in that state. `timedOut` is the field that matters
+    /// here; this merely keeps the status non-zero so no caller mistakes a
+    /// killed child for a successful one.
+    static let killedStatus: Int32 = -1
 
     /// Runs `executable arguments…`, optionally feeding `input` to its stdin,
     /// and returns both captured streams plus the exit status.
@@ -241,8 +294,18 @@ enum AccountSyncRemote {
     /// refused connection, a missing remote binary) is likewise survivable: the
     /// EPIPE is reported in `RemoteResult.inputWriteFailed` instead of killing
     /// this process, and the child's own status and stderr are still collected.
+    ///
+    /// `timeout` (nil = unbounded, the production default — see
+    /// `processTimeoutEnvKey`) bounds the whole wait: a child still running at
+    /// the deadline takes SIGTERM, then SIGKILL, and the result comes back with
+    /// `timedOut` set and whatever output had arrived. `Thread.sleep` is the
+    /// right wait here, unlike the `Task.sleep` the poll-path spawners use: both
+    /// CLI entry points dispatch `accounts` synchronously on the process's
+    /// initial thread (see this file's header), so there is no cooperative-pool
+    /// thread to starve.
     static func runProcess(
-        executable: String, arguments: [String], input: Data? = nil
+        executable: String, arguments: [String], input: Data? = nil,
+        timeout: TimeInterval? = nil
     ) throws -> RemoteResult {
         // SIGPIPE's default disposition kills the **whole process**, which on a
         // fan-out means the first fast-failing host takes every remaining host
@@ -295,12 +358,47 @@ enum AccountSyncRemote {
             try? inPipe.fileHandleForWriting.close()
         }
 
-        let out = outDrain.waitForEOF()
-        let err = errDrain.waitForEOF()
-        process.waitUntilExit()
+        var timedOut = false
+        if let timeout = timeout {
+            let deadline = Date().addingTimeInterval(timeout)
+            while process.isRunning {
+                if Date() >= deadline {
+                    timedOut = true
+                    process.terminate()
+                    Thread.sleep(forTimeInterval: 0.5)
+                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+
+        let out: Data
+        let err: Data
+        if timedOut {
+            // Bounded, because killing the child is not enough on its own: a
+            // grandchild holds the inherited write ends, so these pipes can
+            // outlive the process we just killed and the unbounded wait below
+            // would hang exactly where the timeout was supposed to help.
+            out = outDrain.waitForEOF(timeout: drainGraceAfterTimeout).data
+            err = errDrain.waitForEOF(timeout: drainGraceAfterTimeout).data
+            // SIGKILL cannot be refused, so this is a short reap, not a wait on
+            // the child's own cooperation — and `waitUntilExit()` is avoided
+            // precisely because a pathological child must not be able to pin it.
+            let reapDeadline = Date().addingTimeInterval(1)
+            while process.isRunning, Date() < reapDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        } else {
+            out = outDrain.waitForEOF()
+            err = errDrain.waitForEOF()
+            process.waitUntilExit()
+        }
+
         return RemoteResult(
-            status: process.terminationStatus, stdout: out, stderr: err,
-            inputWriteFailed: inputWriteFailed
+            status: process.isRunning ? killedStatus : process.terminationStatus,
+            stdout: out, stderr: err,
+            inputWriteFailed: inputWriteFailed, timedOut: timedOut
         )
     }
 
@@ -320,8 +418,10 @@ enum AccountSyncRemote {
             return 1
         }
 
+        let timeout = resolveProcessTimeout(environment: environment)
+
         if options.dryRun {
-            return probeHosts(options, verb: .push, ssh: ssh, output: output)
+            return probeHosts(options, verb: .push, ssh: ssh, timeout: timeout, output: output)
         }
 
         let bundle: AccountSync.ExportBundle
@@ -349,7 +449,8 @@ enum AccountSyncRemote {
                 let result = try runProcess(
                     executable: ssh,
                     arguments: sshArguments(host: host, sshOptions: options.sshOptions, remoteCommand: remoteCommand),
-                    input: data
+                    input: data,
+                    timeout: timeout
                 )
                 // Stream fidelity is preserved across the hop: what the
                 // destination said on stdout stays on stdout here (it is the
@@ -390,8 +491,10 @@ enum AccountSyncRemote {
             return 1
         }
 
+        let timeout = resolveProcessTimeout(environment: environment)
+
         if options.dryRun {
-            return probeHosts(options, verb: .pull, ssh: ssh, output: output)
+            return probeHosts(options, verb: .pull, ssh: ssh, timeout: timeout, output: output)
         }
 
         let result: RemoteResult
@@ -402,16 +505,20 @@ enum AccountSyncRemote {
                     host: host,
                     sshOptions: options.sshOptions,
                     remoteCommand: remoteExportCommand(remoteBinary: options.remoteBinary)
-                )
+                ),
+                timeout: timeout
             )
         } catch {
             output.error("Error: could not launch ssh: \(error.localizedDescription)")
             return 1
         }
 
-        guard result.status == 0 else {
+        // `failureDescription` rather than a bare status check, so a child that
+        // was killed on the timeout is reported as such instead of having its
+        // truncated stdout handed to the decoder below.
+        if let reason = failureDescription(result) {
             output.relay(result.stderr, host: host, asError: true)
-            output.error("Error: \(host): remote export failed (\(exitDescription(result.status)))")
+            output.error("Error: \(host): remote export failed (\(reason))")
             return 1
         }
 
@@ -476,23 +583,26 @@ enum AccountSyncRemote {
     /// actually on this host's non-interactive PATH", which is the failure that
     /// bites a fan-out in practice. No bundle is produced and nothing is
     /// written on either side.
-    private static func probeHosts(_ options: Options, verb: Verb, ssh: String, output: Output) -> Int32 {
+    private static func probeHosts(
+        _ options: Options, verb: Verb, ssh: String, timeout: TimeInterval? = nil, output: Output
+    ) -> Int32 {
         let command = remoteProbeCommand(remoteBinary: options.remoteBinary)
         var failed: [String] = []
         for host in options.hosts {
             do {
                 let result = try runProcess(
                     executable: ssh,
-                    arguments: sshArguments(host: host, sshOptions: options.sshOptions, remoteCommand: command)
+                    arguments: sshArguments(host: host, sshOptions: options.sshOptions, remoteCommand: command),
+                    timeout: timeout
                 )
-                if result.status == 0 {
+                if let reason = failureDescription(result) {
+                    failed.append(host)
+                    output.relay(result.stderr, host: host, asError: true)
+                    output.error("\(host): FAILED (\(reason))")
+                } else {
                     let version = String(data: result.stdout, encoding: .utf8)?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     output.info("\(host): OK — \(options.remoteBinary) \(version.isEmpty ? "(no version reported)" : version)")
-                } else {
-                    failed.append(host)
-                    output.relay(result.stderr, host: host, asError: true)
-                    output.error("\(host): FAILED (\(exitDescription(result.status)))")
                 }
             } catch {
                 failed.append(host)
@@ -527,6 +637,12 @@ enum AccountSyncRemote {
     /// the remote command stopped reading early, so nothing can be assumed to
     /// have landed.
     static func failureDescription(_ result: RemoteResult) -> String? {
+        // Ahead of the status, because a killed child's status says only how it
+        // died — and a child that handled SIGTERM and exited 0 would otherwise
+        // read as a success that never finished.
+        if result.timedOut {
+            return "timed out and was killed (raise or unset \(processTimeoutEnvKey))"
+        }
         if result.status != 0 { return exitDescription(result.status) }
         if result.inputWriteFailed {
             return "the remote command stopped reading before the whole bundle was sent"

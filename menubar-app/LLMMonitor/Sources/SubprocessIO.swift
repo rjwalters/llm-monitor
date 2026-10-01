@@ -168,6 +168,31 @@ final class PipeDrain: @unchecked Sendable {
         return buffer
     }
 
+    /// Bounded, **synchronous** variant of `waitForEOF()`, for a caller that has
+    /// a deadline and no `async` context to await `finishAndClose` from.
+    ///
+    /// Needed because killing a wedged child is not by itself enough to make the
+    /// unbounded `waitForEOF()` return: a *grandchild* inherits the same pipe
+    /// write ends, so the fd stays open after the direct child is reaped and the
+    /// drain never sees EOF. That is exactly the shape of #234's runaway chain —
+    /// every level held its parent's pipes — so the one caller with a timeout
+    /// (`AccountSyncRemote.runProcess`) must be able to give up on the drain too,
+    /// not merely on the child.
+    ///
+    /// Returns everything read so far either way; `timedOut` says which happened,
+    /// so a caller can report "the child was killed and its output is partial"
+    /// rather than silently presenting a truncated stream as complete. The fd is
+    /// deliberately **not** closed on timeout, for the reason spelled out in
+    /// `finishAndClose` below: closing an fd another thread is blocked reading is
+    /// undefined behaviour, so a stuck drain keeps ownership of it and the fd is
+    /// released when that thread finally returns.
+    func waitForEOF(timeout: TimeInterval) -> (data: Data, timedOut: Bool) {
+        let timedOut = finished.wait(timeout: .now() + timeout) == .timedOut
+        lock.lock()
+        defer { lock.unlock() }
+        return (buffer, timedOut)
+    }
+
     /// Bounded wait, then release the fd — the teardown form for a caller that
     /// has already killed the child and must not be pinned by a pathological one.
     ///
