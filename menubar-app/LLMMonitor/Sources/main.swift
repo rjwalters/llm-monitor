@@ -198,6 +198,20 @@ struct LLMMonitorApp: App {
         Settings {
             EmptyView()
         }
+        .suppressedAtLaunch()
+    }
+}
+
+extension Scene {
+    /// The `Settings` scene above is only a placeholder the `App` lifecycle
+    /// requires; without this, recent macOS presents it at launch as an empty
+    /// window the user has to close.
+    func suppressedAtLaunch() -> some Scene {
+        if #available(macOS 15.0, *) {
+            return defaultLaunchBehavior(.suppressed)
+        } else {
+            return self
+        }
     }
 }
 
