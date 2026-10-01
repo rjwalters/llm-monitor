@@ -421,7 +421,7 @@ else
   ASK_MARKER="<!-- champion:epic-completion-ask -->"
   printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$ASK_MARKER" \
     '.comments[] | select(.body | contains($m))' >/dev/null || {
-    gh issue comment "$EPIC_NUMBER" --body "$ASK_MARKER
+    ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$ASK_MARKER
 **Champion: This Epic Looks Complete — Close?**
 
 Every child found for this epic is closed (via: $EPIC_CHILD_SOURCES), so its structural Phase 1/2/3 criteria are no longer meaningful to re-run. $UNCERTAINTY
@@ -615,10 +615,10 @@ if [ "$EXISTING_COUNT" -gt 0 ]; then
     --jq --arg m "$STANDDOWN_MARKER" '[.comments[] | select(.body | contains($m))] | length')
   if [ "$ALREADY_COMMENTED" -eq 0 ]; then
     ISSUE_LIST=$(printf '%s\n' "$EXISTING_PHASE_ISSUES" | jq -r '.[] | "- #\(.number) (\(.state)): \(.title)"')
-    gh issue comment "$EPIC_NUMBER" --body "$STANDDOWN_MARKER
-**Champion: Phase $PHASE Issues Already Exist — Skipping Creation**
+    ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$STANDDOWN_MARKER
+**Champion: Phase $PHASE Issues Already Exist — Skipping**
 
-Found $EXISTING_COUNT existing issue(s) already covering phase $PHASE (matched by canonical phase form, e.g. \`$PHASE_MARKER\` or an equivalent letter-form marker — #6967):
+Found $EXISTING_COUNT existing issue(s) covering phase $PHASE (canonical form: \`$PHASE_MARKER\` or letter-form — #6967):
 
 $ISSUE_LIST
 
@@ -696,7 +696,7 @@ EOF
 
 ```bash
 # Add comment tracking Phase 1 creation
-gh issue comment <epic-number> --body "**Champion: Epic Approved**
+./.loom/scripts/post-comment.sh <epic-number> --body "**Champion: Epic Approved**
 
 Phase 1 issues created and awaiting individual approval:
 - #<issue-1>: <title>
@@ -740,10 +740,10 @@ is a judgement call about shape, never a self-clearing dependency wait, so
 
 ```bash
 ESCALATE_MARKER="<!-- champion:epic-escalated -->"
-gh issue comment <number> --body "$ESCALATE_MARKER
+./.loom/scripts/post-comment.sh <number> --body "$ESCALATE_MARKER
 **Champion: Escalating to Operator — Epic Rejected Repeatedly Without Revision**
 
-This epic has been evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS posted rejection(s) plus $SKIP_STREAK silent skip(s) of an unchanged epic), but has not been revised to address it. Re-running an identical evaluation each cycle changes nothing, and skipping it silently forever would leave it invisible; escalating is the only move that makes progress.
+Evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS rejections plus $SKIP_STREAK silent skips of an unchanged epic), but has not been revised to address it. Re-running an identical evaluation each cycle changes nothing, and skipping it silently forever would leave it invisible; escalating is the only move that makes progress.
 
 **Recurring findings:**
 - [Criterion that failed, repeated across rejections]: [Specific reason]
@@ -776,7 +776,7 @@ feedback and keep the `loom:epic` label.
 # Both markers are load-bearing: $VERDICT_MARKER makes the next cycle skip
 # silently; the skip tally (seeded at 0) is what that silent skip increments, so
 # the epic still escalates on schedule while staying quiet.
-gh issue comment <number> --body "$VERDICT_MARKER
+./.loom/scripts/post-comment.sh <number> --body "$VERDICT_MARKER
 <!-- champion:epic-unrevised-skips:$BODY_HASH:0 -->
 **Champion Review: Epic Needs Revision**
 
@@ -936,7 +936,7 @@ else
       # changed), or no prior marker exists for this phase at all (first-ever
       # status comment). Post as before, with the marker embedded so the next
       # unchanged pass can detect the match.
-      gh issue comment "$EPIC_NUMBER" --body "**Champion: Phase progress update**
+      ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "**Champion: Phase progress update**
 
 Phase $PHASE: $CLOSED_COUNT closed / $((OPEN_COUNT + CLOSED_COUNT)) total — not yet complete.
 

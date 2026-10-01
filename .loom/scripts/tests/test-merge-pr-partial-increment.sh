@@ -244,6 +244,16 @@ if [[ "$1" == "api" ]]; then
       if [[ -f "$canned" ]]; then cat "$canned"; else echo '[]'; fi
       exit 0
       ;;
+    */comments)
+      # #9774: a POST to the comments endpoint is the daemon chokepoint's
+      # shape (forge comment -> gh api --input -). This suite's subject is
+      # the partial-increment flow over the gh ladder, and LOOM_DAEMON_SELF_BIN
+      # is pinned to the real binary above — so fail the daemon's POST here
+      # and let forge_gh_comment_rl_safe fall back to the recorded `issue
+      # comment` shape. A silent exit 0 would succeed without recording
+      # anything, which is exactly what the assertions below must not allow.
+      exit 1
+      ;;
   esac
 
   num="${path##*/}"

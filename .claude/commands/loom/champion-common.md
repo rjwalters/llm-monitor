@@ -442,12 +442,10 @@ else
       # Budget exhausted: this unchanged state has now been observed
       # LOOM_MAX_UNCHANGED_EPIC_BLOCK_EVALS times without the epic being
       # closed/promoted — escalate instead of tallying again.
-      gh issue comment "$DEPENDENT_ISSUE" --body "$EPIC_BLOCK_MARKER
+      ./.loom/scripts/post-comment.sh "$DEPENDENT_ISSUE" --body "$EPIC_BLOCK_MARKER
 **Champion: Escalating — Blocked on an Epic That Appears Complete**
 
-\`$BLOCKER_REPO#$BLOCKER_NUM\` still carries \`loom:epic\` and is still open,
-but $CLOSED_COUNT of its \`loom:epic-phase\` children are closed and none are
-open — and this state has now been observed unchanged across $NEXT_STREAK
+\`$BLOCKER_REPO#$BLOCKER_NUM\` still carries \`loom:epic\`, open, with $CLOSED_COUNT of its \`loom:epic-phase\` children closed and none open — observed unchanged across $NEXT_STREAK
 evaluations. This is not a live blocker; it needs an operator to close or
 promote \`$BLOCKER_REPO#$BLOCKER_NUM\`.
 
@@ -472,7 +470,7 @@ Blocked by $BLOCKER_REPO#$BLOCKER_NUM
   else
     # First time seeing this exact fingerprint: flag it, but do not keep
     # gating on it — this is the mechanism AC #1/#2 (#5211) ask for.
-    gh issue comment "$DEPENDENT_ISSUE" --body "$EPIC_BLOCK_MARKER
+    ./.loom/scripts/post-comment.sh "$DEPENDENT_ISSUE" --body "$EPIC_BLOCK_MARKER
 <!-- champion:epic-block-streak:$FINGERPRINT:1 -->
 **Champion: Epic Blocker Appears Complete — Not Treated as a Live Block**
 
@@ -494,7 +492,7 @@ closed/promoted.
     EPIC_FLAG_MARKER="<!-- champion:epic-appears-complete -->"
     if ! printf '%s\n' "$BLOCKER_JSON" | jq -e --arg m "$EPIC_FLAG_MARKER" \
          '.comments[] | select(.body | contains($m))' >/dev/null; then
-      gh issue comment "$BLOCKER_NUM" --repo "$BLOCKER_REPO" --body "$EPIC_FLAG_MARKER
+      ./.loom/scripts/post-comment.sh "$BLOCKER_NUM" --repo "$BLOCKER_REPO" --body "$EPIC_FLAG_MARKER
 **Champion: This Epic Appears Complete**
 
 All $CLOSED_COUNT \`loom:epic-phase\` children found for this epic are closed
