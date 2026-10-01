@@ -487,7 +487,13 @@ else
     GH="gh"
 fi
 
-REPO_NWO="$(forge_get_repo_nwo "$GH")" || error "Could not determine repository. Is 'gh' authenticated?"
+# #9548: the repo is vetted, not merely resolved. forge_get_repo_nwo asked
+# `gh repo view`, which prefers an `upstream` remote over `origin`, and nothing
+# checked that the answer was a repo this installation manages or can write.
+# loom_write_repo (lib/forge-helpers.sh, sourced above) returns origin only
+# when gh resolves there too, the repo is managed here, and the credential has
+# WRITE; otherwise the merge is refused before any read or write.
+REPO_NWO="$(loom_write_repo "${LOOM_REPO:-}")" || error "Merge refused (#9548): this checkout's repository is not one this installation may write to (reason above)."
 # Detect which merge strategy the target repo actually allows (#7754) --
 # previously every call site below hardcoded "squash", which fails outright
 # ("Squash merges are not allowed on this repository") on any repo that has
@@ -961,7 +967,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, stacked-children, version-policy, partial-reset, partial-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment renders two POST-merge audit comments and skips the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, check-runs-rollup, stacked-children, version-policy, partial-reset, partial-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment renders two POST-merge audit comments and skips the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -2053,14 +2059,19 @@ _wait_for_checks_then_sync_merge() {
     fi
     not_found_streak=0
 
-    # Failing (terminal non-success) and pending (not yet completed) check names.
-    local failing pending total_count
-    failing="$(echo "$runs_raw" | \
-      jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true)"
-    pending="$(echo "$runs_raw" | \
-      jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true)"
-    total_count="$(echo "$runs_raw" | jq -r '.total_count // 0' 2>/dev/null || echo 0)"
-    [[ "$total_count" =~ ^[0-9]+$ ]] || total_count=0
+    # Failing (terminal non-success) and pending (not yet completed) check
+    # names, and total_count: `loom-daemon merge-pr check-runs-rollup` (Rust,
+    # loom-daemon/src/merge_pr/check_runs_rollup.rs — #8191 slice), four
+    # NUL-terminated fields, sentinel LAST. It replaced three `jq … || true`
+    # filters that read an UNREADABLE payload as "nothing failing, nothing
+    # pending" — the shape this loop settles on. Fail direction: no sentinel
+    # (older/missing binary, or a payload outside forge_get_check_runs'
+    # contract) is read as STILL PENDING, so a fault costs time up to the
+    # deadline (exit 5, re-queue), never an unsettled merge. SELF_BIN first
+    # (#8134), like _mp_refs/_mp_worktree/mergeable-recheck.
+    local failing="" pending="" total_count=0 _crr="" _crr_bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}"
+    { IFS= read -r -d '' failing; IFS= read -r -d '' pending; IFS= read -r -d '' total_count; IFS= read -r -d '' _crr; } < <(printf '%s' "$runs_raw" | "$_crr_bin" merge-pr check-runs-rollup 2>/dev/null) || true
+    [[ "$_crr" == "LOOM-CHECK-RUNS-ROLLUP" ]] || { warning "PR #$PR_NUMBER: 'merge-pr check-runs-rollup' did not classify this poll's check-runs (missing/older loom-daemon, or a payload outside the forge contract); treating it as still pending. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "$_crr_bin" 2>/dev/null || true)")"; failing=""; pending="(unclassified check-runs rollup)"; total_count=0; }
     [[ "$total_count" -gt 0 ]] && observed_checks=true
 
     if [[ -n "$failing" ]]; then

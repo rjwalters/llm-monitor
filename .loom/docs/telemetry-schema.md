@@ -1605,7 +1605,7 @@ tick; otherwise a root of its own. Attributes:
 | `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
 | `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the row's closed vocabulary — `PARK_LABELS ∪ SKIP_LABELS` for `parked`, `hard_exclusion::HARD_EXCLUSION_LABELS` (e.g. `external`) for `hard_exclusion` (#9672) — so a span names which rule declined the issue. A repo-configured extra skip label, a rule name outside that set, or any other detail text is never exported |
-| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker` (#9673). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
+| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`, `write_scope` (#9673, #9548). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
 | `loom.pr_number` | only for `open_pr`, parsed from the row's structured detail |
 | `lockout.frozen_candidates_count` | only for `open_pr` (Issue #9674): how many ready issues in this repo the #4123 open-PR guard is currently blocking (`pr-open-skip`) — the repo's frozen backlog |
 | `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
@@ -1890,6 +1890,63 @@ planned**) and outcomes of refusals carry no error fields at all, so they are
 counted and never scored. A PR closed unmerged and a sweep that ended before
 any PR are not outcomes at all — the issue's own state decides, and until it
 closes those estimates stay pending.
+
+### `eta.snapshot`
+
+This host's **live** ETA estimate set (Issue #9329) — one row per
+`(repo, issue, kind)` it currently estimates. Envelopes carry
+`schema_version: 12`. **Native-HTTPS only**: the OTLP exporter never receives
+it, the mirror of `queue.snapshot` and the opposite of the OTLP-only
+`eta.estimate` / `eta.outcome` above.
+
+Two kinds, because they answer two questions. `eta.estimate` is an *event* —
+one estimate with its whole explanation, kept in SigNoz for accuracy scoring.
+`eta.snapshot` is a *state* — what this host believes right now, host-scoped
+and newest-wins (the `eta:<hostId>` key in the dashboard's `FleetState`
+Durable Object, like `queue:<hostId>`). It carries no explanation: the
+dashboard's "why this ETA?" fetches the full `eta-explanation/v1` record from
+SigNoz on demand by `estimate_id`, and the accuracy panel queries
+`eta.outcome` there. It is deliberately **not** folded into `queue.snapshot`
+either — that record is the work finder's ready queue, while `land` estimates
+cover building and in-review items that are not in it at all.
+
+The collector samples it on the `host.health` interval, immediately after the
+ETA pass, and **only when the estimate set has changed** since the previous
+snapshot. A tracker that stops estimating therefore shows up as an ageing
+`as_of`, never as a re-stamped copy. **No record at all** (never an empty
+one) in three cases: ETA is disabled (`autonomous.eta.enabled = false`), no
+HTTPS exporter is configured, or nothing is currently estimated — an empty
+snapshot would assert "this host estimates nothing", which is a different
+fact from "this host is not estimating".
+
+| Field | Type | Notes |
+|---|---|---|
+| `as_of` | RFC 3339 | the newest row's `as_of` — the freshness stamp |
+| `rows[]` | array | one row per `(repo, issue, kind)`, in that order, at most 200 |
+| `rows_truncated` | integer | rows dropped by the 200-row cap |
+
+Each row:
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | forge `owner/repo`, never a local path |
+| `visibility` | `public` / `private` | per row; missing or unknown decodes to `private` |
+| `issue` | integer | issue number |
+| `pr` | integer, optional | the PR the work is in, when one is known |
+| `kind` | string | `start`, `finish` or `land` |
+| `p25` / `p50` / `p75` | integer, optional | **remaining seconds** from `as_of`, not an instant. All three absent on a refusal |
+| `heuristic` | string | the heuristic that made it — always the kind's **`current`** one. A shadow candidate's estimate (#9328) is never shown as the ETA and never appears here |
+| `estimate_id` | string | the derived id of the `eta.estimate` record in SigNoz: the join key for "why this ETA?" |
+| `as_of` | RFC 3339 | the instant this estimate describes |
+| `stage` | string, optional | the stage the item was in (`ready_wait`, `sweep.curator`, …) |
+| `no_estimate_reason` | string, optional | why there is no estimate (`blocked`, `human_gated`, `insufficient_samples`, …), present exactly when the quantiles are absent |
+
+**Absent is never zero**, and a refusal is a row. An issue the model cannot
+estimate is carried with its `no_estimate_reason` and no quantiles: that it
+*cannot* be estimated, and why, is the answer — dropping the row would render
+as "no such issue" instead. No field carries forge free text (no title, no
+label text, no comment body): every value is an enum, a number, or a
+daemon-derived id.
 
 ### `tokens.snapshot`
 

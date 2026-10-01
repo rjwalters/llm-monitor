@@ -516,9 +516,14 @@ cmd_publish() {
     # `-F` (NOT `-f`) — only `-F/--field` applies gh's `@-` read-from-stdin
     # magic; `-f/--raw-field` would post the literal two characters `@-`
     # (#6320, the same trap fixed in sweep-lease-renew.sh).
-    local post_out
+    # #9548: POST only to a repo this installation manages and can write,
+    # named explicitly (loom_write_repo, forge-helpers.sh, sourced in the
+    # subshell since it turns on `set -e`), never via `{owner}/{repo}`, which
+    # gh expands from an `upstream` remote in preference to `origin`.
+    local post_out write_repo
+    write_repo="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "ERROR: not publishing a lease on issue #${issue}: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 2; }
     if ! post_out="$(printf '%s' "$lease_body" \
-        | gh api --method POST "repos/${repo_path}/issues/${issue}/comments" -F body=@- 2>&1)"; then
+        | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)"; then
         echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2
         echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
         exit 2
