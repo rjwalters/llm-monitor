@@ -455,32 +455,80 @@ func tokenStatusRank(_ status: TokenStatus) -> Int {
 
 /// Drag strip along the popover's bottom edge that sets a manual height
 /// (`PopoverHeightManager.dragChanged`); double-click returns to auto-fit.
-struct PopoverResizeHandle: View {
-    @ObservedObject var heightManager: PopoverHeightManager
-    @State private var isHovering = false
+///
+/// AppKit rather than SwiftUI: `onHover` + `NSCursor.push()` is overridden by
+/// the hosting view's own cursor handling in a (usually non-key) popover
+/// window, and a native tracking loop follows the mouse more tightly than a
+/// `DragGesture`.
+struct PopoverResizeHandle: NSViewRepresentable {
+    let heightManager: PopoverHeightManager
 
-    var body: some View {
-        Capsule()
-            .fill(Color.secondary.opacity(isHovering ? 0.6 : 0.3))
-            .frame(width: 36, height: 4)
-            .frame(maxWidth: .infinity)
-            .frame(height: 8)
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                isHovering = hovering
-                if hovering {
-                    NSCursor.resizeUpDown.push()
-                } else {
-                    NSCursor.pop()
-                }
+    func makeNSView(context: Context) -> ResizeHandleView {
+        let view = ResizeHandleView(heightManager: heightManager)
+        view.toolTip = "Drag to resize · double-click to fit"
+        return view
+    }
+
+    func updateNSView(_ nsView: ResizeHandleView, context: Context) {}
+}
+
+final class ResizeHandleView: NSView {
+    private let heightManager: PopoverHeightManager
+    private var isHighlighted = false {
+        didSet { if isHighlighted != oldValue { needsDisplay = true } }
+    }
+
+    init(heightManager: PopoverHeightManager) {
+        self.heightManager = heightManager
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        // `.activeAlways`: the popover's window is rarely key, and the default
+        // (key-window-only) tracking would never update the cursor.
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.cursorUpdate, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func cursorUpdate(with event: NSEvent) { NSCursor.resizeUpDown.set() }
+    override func mouseEntered(with event: NSEvent) {
+        isHighlighted = true
+        NSCursor.resizeUpDown.set()
+    }
+    override func mouseExited(with event: NSEvent) { isHighlighted = false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            heightManager.resetToFit()
+            return
+        }
+        heightManager.beginDrag()
+        window?.trackEvents(matching: [.leftMouseDragged, .leftMouseUp], timeout: .infinity, mode: .eventTracking) { event, stop in
+            guard let event else { return }
+            NSCursor.resizeUpDown.set()
+            if event.type == .leftMouseUp {
+                self.heightManager.endDrag()
+                stop.pointee = true
+            } else {
+                self.heightManager.drag()
             }
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { _ in heightManager.dragChanged() }
-                    .onEnded { _ in heightManager.dragEnded() }
-            )
-            .onTapGesture(count: 2) { heightManager.resetToFit() }
-            .help("Drag to resize · double-click to fit")
+        }
+        // Belt-and-braces if tracking ended without a mouse-up (e.g. window closed).
+        heightManager.endDrag()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let grip = NSRect(x: bounds.midX - 18, y: bounds.midY - 2, width: 36, height: 4)
+        NSColor.secondaryLabelColor.withAlphaComponent(isHighlighted ? 0.6 : 0.3).setFill()
+        NSBezierPath(roundedRect: grip, xRadius: 2, yRadius: 2).fill()
     }
 }
 
@@ -776,6 +824,8 @@ struct UsagePopoverView: View {
             // Overlaid on the footer's bottom padding so it adds no chrome height.
             if effectiveRowCount > 0 {
                 PopoverResizeHandle(heightManager: heightManager)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 8)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))

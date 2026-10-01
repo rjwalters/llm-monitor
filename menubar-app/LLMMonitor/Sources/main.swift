@@ -107,28 +107,40 @@ class PopoverHeightManager: ObservableObject {
     private func apply() {
         let size = NSSize(width: currentWidth, height: effectiveHeight(rowCount: rowCount))
         currentHeight = size.height
-        if popover?.contentSize != size { popover?.contentSize = size }
+        guard let popover, popover.contentSize != size else { return }
+        if dragStartHeight != nil {
+            // Mid-drag: apply each step instantly. `NSPopover` otherwise
+            // animates content-size changes, which lags behind the cursor.
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                context.allowsImplicitAnimation = false
+                popover.contentSize = size
+            }
+        } else {
+            popover.contentSize = size
+        }
     }
 
     // MARK: Manual resize
 
-    /// Drag progress is read from the screen-space mouse position rather than
-    /// the gesture's translation, because the view being dragged is resized
-    /// (and its coordinate space moved) by the drag itself.
-    func dragChanged() {
-        if dragStartHeight == nil {
-            dragStartHeight = currentHeight
-            dragStartMouseY = NSEvent.mouseLocation.y
-            // Content-size changes animate by default, which lags the cursor.
-            popover?.animates = false
-        }
+    /// Driven by `ResizeHandleView`'s mouse-tracking loop. Progress is read
+    /// from the screen-space mouse position, because the view being dragged is
+    /// resized (and its coordinate space moved) by the drag itself.
+    func beginDrag() {
+        dragStartHeight = currentHeight
+        dragStartMouseY = NSEvent.mouseLocation.y
+        popover?.animates = false
+    }
+
+    func drag() {
         guard let start = dragStartHeight else { return }
         // Screen y grows upward; the popover hangs down from the menu bar.
         userHeight = start + (dragStartMouseY - NSEvent.mouseLocation.y)
         apply()
     }
 
-    func dragEnded() {
+    func endDrag() {
+        guard dragStartHeight != nil else { return }
         dragStartHeight = nil
         popover?.animates = true
         let reachesContent = currentHeight >= Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight)
