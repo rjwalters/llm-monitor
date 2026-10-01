@@ -502,11 +502,6 @@ struct UsagePopoverView: View {
     /// Polls the pasteboard so the Copy/Paste toggle reflects clipboard contents.
     private let clipboardTimer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
-    /// Space available for the scrolling row list = popover height minus fixed chrome.
-    private var scrollViewMaxHeight: CGFloat {
-        heightManager.currentHeight - PopoverHeightManager.chromeHeight
-    }
-
     /// Row count used to size the popover. The setup/empty/error states show a
     /// guide instead of the table, so they size against zero rows.
     private var effectiveRowCount: Int {
@@ -728,7 +723,6 @@ struct UsagePopoverView: View {
                         }
                     }
                 }
-                .frame(maxHeight: scrollViewMaxHeight)
             }
 
             Divider()
@@ -775,7 +769,9 @@ struct UsagePopoverView: View {
             .padding(.horizontal)
             .padding(.vertical, 10)
         }
-        .frame(width: heightManager.currentWidth, height: heightManager.currentHeight)
+        // Fill whatever `popover.contentSize` is (set by `heightManager`), so a
+        // resize is a layout pass rather than a re-render of every row.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .bottom) {
             // Overlaid on the footer's bottom padding so it adds no chrome height.
             if effectiveRowCount > 0 {

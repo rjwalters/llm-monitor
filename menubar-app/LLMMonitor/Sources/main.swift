@@ -42,10 +42,13 @@ class PopoverHeightManager: ObservableObject {
     /// Height for the setup/empty/error state (no table rows to size against).
     static let setupHeight: CGFloat = 360
 
-    @Published var currentHeight: CGFloat = PopoverHeightManager.minHeight
+    // Neither size is `@Published`: `popover.contentSize` is the only thing that
+    // sizes the popover, and the SwiftUI content just fills it. Publishing them
+    // would re-render the whole table on every mouse-move of a resize drag.
+    private(set) var currentHeight: CGFloat = PopoverHeightManager.minHeight
     /// The table's width for the columns actually shown (#227) — narrower than
     /// `popoverWidth` when a provider-specific column is hidden.
-    @Published var currentWidth: CGFloat = PopoverHeightManager.popoverWidth
+    private(set) var currentWidth: CGFloat = PopoverHeightManager.popoverWidth
     weak var popover: NSPopover?
 
     private static let userHeightKey = "popoverUserHeight"
@@ -100,9 +103,9 @@ class PopoverHeightManager: ObservableObject {
     }
 
     private func apply() {
-        let h = effectiveHeight(rowCount: rowCount)
-        if h != currentHeight { currentHeight = h }
-        popover?.contentSize = NSSize(width: currentWidth, height: h)
+        let size = NSSize(width: currentWidth, height: effectiveHeight(rowCount: rowCount))
+        currentHeight = size.height
+        if popover?.contentSize != size { popover?.contentSize = size }
     }
 
     // MARK: Manual resize
@@ -264,11 +267,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // .semitransient keeps the popover open while user interacts with other
         // windows in this app (e.g. multiple chart windows launched from rows).
         popover?.behavior = .semitransient
-        popover?.contentViewController = NSHostingController(
+        let popoverHost = NSHostingController(
             rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, heightManager: heightManager, onAddAccount: { [weak self] in
                 self?.openAddAccountWindow()
             })
         )
+        // `heightManager` owns the popover's size; the hosting controller must
+        // not push the SwiftUI content's own preferred size back at it.
+        popoverHost.sizingOptions = []
+        popover?.contentViewController = popoverHost
         heightManager.popover = popover
         flog.info("Popover ready, starting poll timer", category: "App")
 
