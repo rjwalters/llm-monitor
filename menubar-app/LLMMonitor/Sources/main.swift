@@ -612,7 +612,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else if let button = statusItem?.button {
                 heightManager.update(rowCount: usageStore.accounts.count)
                 refreshAll()
+                // An accessory app isn't activated by a status-item click. While
+                // inactive, the frontmost app keeps the cursor (so the resize
+                // grip's cursor never shows) and mouse-drag events reach us only
+                // about once a second — a sample during a resize drag showed the
+                // main thread idle, waiting on events.
+                NSApp.activate(ignoringOtherApps: true)
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+                popover.contentViewController?.view.window?.makeKey()
             }
         }
     }
