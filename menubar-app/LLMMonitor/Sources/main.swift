@@ -52,10 +52,12 @@ class PopoverHeightManager: ObservableObject {
     weak var popover: NSPopover?
 
     private static let userHeightKey = "popoverUserHeight"
-    /// Height the user dragged the popover to, or nil to auto-fit. Only a
-    /// height *below* the content fit is kept: dragging to or past it returns
-    /// to auto-fit, so the popover keeps growing as accounts are added.
+    /// Height the user dragged the popover to, or nil to auto-fit (capped at
+    /// `maxHeight`). Dragging to or past the full content stores `showAllRows`
+    /// instead of a height, so the popover keeps growing as accounts are added.
     private var userHeight: CGFloat? = (UserDefaults.standard.object(forKey: PopoverHeightManager.userHeightKey) as? Double).map { CGFloat($0) }
+    /// Sentinel `userHeight`: as tall as the rows need, limited only by the screen.
+    private static let showAllRows: CGFloat = 100_000
     private var rowCount = 0
     private var dragStartHeight: CGFloat?
     private var dragStartMouseY: CGFloat = 0
@@ -130,7 +132,7 @@ class PopoverHeightManager: ObservableObject {
         dragStartHeight = nil
         popover?.animates = true
         let reachesContent = currentHeight >= Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight)
-        userHeight = reachesContent ? nil : currentHeight
+        userHeight = reachesContent ? Self.showAllRows : currentHeight
         persistUserHeight()
         apply()
     }
