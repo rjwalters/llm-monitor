@@ -53,11 +53,7 @@ enum SummaryColumns {
     static let radio: CGFloat = 30
     static let account: CGFloat = 150
     static let headroom: CGFloat = 80
-    /// Wide enough for the raw percentage *plus* the even-burn mark (#220,
-    /// e.g. `62% ◆48`). Widening this widens the popover — keep
-    /// `PopoverHeightManager.popoverWidth` in `main.swift` in step with the
-    /// column sum, which it matches exactly.
-    static let percent: CGFloat = 76
+    static let percent: CGFloat = 60
     static let fable: CGFloat = 66
     static let extra: CGFloat = 62
     static let reset: CGFloat = 80
@@ -79,48 +75,6 @@ enum SummaryColumns {
         PopoverHeightManager.popoverWidth
             - (shows(.premium, among: providers) ? 0 : fable)
             - (shows(.extra, among: providers) ? 0 : extra)
-    }
-}
-
-// MARK: - Even-burn mark vocabulary
-
-/// The one place the even-burn ("glide slope") mark's glyph and wording live
-/// (#220), so the popover cell, its tooltip, and the chart's reference-line
-/// legend cannot describe the same figure three different ways.
-///
-/// The figure itself is `RateLimitWindow.evenBurnPercent(at:)` in the portable
-/// core; this is presentation only. It is deliberately a *separate visual
-/// channel* from `PercentSeverity`'s three-band color palette — exactly as the
-/// #199 calibration dot is — because folding pace into severity would make
-/// "92% at hour 4.9" and "92% at hour 0.5" the same color, which is the very
-/// distinction this mark exists to show.
-enum EvenBurnMark {
-    /// Glyph borrowed from glideslope's CLI, where the same figure reads
-    /// `62% (◆ 48%)`.
-    static let symbol = "◆"
-
-    /// Compact cell suffix: the mark's glyph and its rounded percentage, with
-    /// no second `%` sign — the raw percentage it sits beside already carries
-    /// one, and the column has to stay narrow.
-    static func label(pace: Double) -> String {
-        "\(symbol)\(Int(pace.rounded()))"
-    }
-
-    /// Tooltip spelling out both halves of the reading: where an even burn
-    /// would be by now, and how far ahead of (or behind) it this window is.
-    /// Positive slack is banking — capacity that expires unused at the reset.
-    static func help(usedPercent: Double, pace: Double, slack: Double) -> String {
-        let rounded = Int(slack.rounded())
-        let verdict: String
-        if rounded > 0 {
-            verdict = "banking \(rounded) point(s) — this capacity expires unused at the reset"
-        } else if rounded < 0 {
-            verdict = "\(-rounded) point(s) ahead of budget — on this pace the window caps before it resets"
-        } else {
-            verdict = "exactly on pace"
-        }
-        return "\(symbol) \(Int(pace.rounded()))% of this window has elapsed; "
-            + "\(Int(usedPercent))% of it is used — \(verdict)."
     }
 }
 
@@ -1005,15 +959,6 @@ struct SummaryHeaderRow: View {
         columnHeading(for: .extra, neutralTitle: "Extra", visibleProviders: visibleProviders)
     }
 
-    /// Tooltip for the two percent columns. Sorting is still by raw percent
-    /// (#220 deliberately left ranking alone), so the tooltip says so rather
-    /// than letting the new mark imply the order changed with it.
-    private static func percentColumnTooltip(_ title: String) -> String {
-        "Percent of the window used. \(EvenBurnMark.symbol) marks how much of the window has "
-            + "elapsed — below it means banking capacity, above it means the window will cap "
-            + "before it resets. Click to sort by \(title) (raw percent)."
-    }
-
     var body: some View {
         HStack(spacing: 0) {
             Text("Bar")
@@ -1027,15 +972,13 @@ struct SummaryHeaderRow: View {
                            sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: "Session %", column: .sessionPercent,
                            width: SummaryColumns.percent, alignment: .trailing,
-                           sortBy: $sortBy, sortDir: $sortDir,
-                           tooltip: Self.percentColumnTooltip("Session %"))
+                           sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: "Sess Reset", column: .sessionReset,
                            width: SummaryColumns.reset, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: "Weekly %", column: .weeklyPercent,
                            width: SummaryColumns.percent, alignment: .trailing,
-                           sortBy: $sortBy, sortDir: $sortDir,
-                           tooltip: Self.percentColumnTooltip("Weekly %"))
+                           sortBy: $sortBy, sortDir: $sortDir)
             if SummaryColumns.shows(.premium, among: visibleProviders) {
                 SortableHeader(title: premiumHeading.title, column: .fablePercent,
                            width: SummaryColumns.fable, alignment: .trailing,
@@ -1231,14 +1174,8 @@ struct SummaryRow: View {
     /// stop being presented as current too.
     /// An absent identity (#135) is included on the same principle: it has no
     /// reading at all, and must never present one.
-    ///
-    /// The drifted/stale half of that gate is `AccountFreshness
-    /// .shouldSuppressPercent(isStale:tokenStatus:)` itself — called rather
-    /// than restated, so this row, the menu-bar badge, and the even-burn mark
-    /// (#220) can never drift onto three subtly different staleness rules.
     private var displayUsage: UsageRecord? {
-        let suppress = AccountFreshness.shouldSuppressPercent(isStale: isStale, tokenStatus: tokenStatus)
-        return (suppress || isAbsent) ? nil : usage
+        (isDrifted || isStale || isAbsent) ? nil : usage
     }
 
     /// Data age in seconds (nil if no usage data)
@@ -1385,7 +1322,7 @@ struct SummaryRow: View {
             // both cells render "—" rather than a misleading 0% / "now". A
             // drifted row reads `displayUsage` (nil), not `usage` — same "—"
             // rendering, for the same reason: don't present frozen numbers.
-            percentCell(displayUsage?.rateLimit.session)
+            percentText(displayUsage?.rateLimit.session?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
             Text(resetLabel(displayUsage?.rateLimit.session?.resetAt))
@@ -1394,7 +1331,7 @@ struct SummaryRow: View {
                 .lineLimit(1)
                 .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-            percentCell(displayUsage?.rateLimit.weekly)
+            percentText(displayUsage?.rateLimit.weekly?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
             if SummaryColumns.shows(.premium, among: visibleProviders) {
@@ -1525,34 +1462,11 @@ struct SummaryRow: View {
         return Color(nsColor: .systemRed)
     }
 
-    /// One rate-limit window's cell: the raw percentage used, plus the
-    /// elapsed-time-normalized even-burn mark beside it when the window's
-    /// position is knowable (#220).
-    ///
-    /// The mark is suppressed by construction rather than by a second rule:
-    /// the window comes from `displayUsage`, which is already nil whenever
-    /// `AccountFreshness.shouldSuppressPercent(isStale:tokenStatus:)` says the
-    /// percentage must not be presented as current (or the row is absent). A
-    /// stale reading is a floor, not a position — pairing a frozen percentage
-    /// with a live clock's pace would invent a deviation that never happened.
-    ///
-    /// The mark is also absent for a window with no reset or no length:
-    /// `evenBurnPercent(at:)` returns nil there, never 0, and this cell shows
-    /// nothing rather than an "on pace" ◆0.
     @ViewBuilder
-    private func percentCell(_ window: RateLimitWindow?) -> some View {
-        if let window = window {
-            let pct = window.usedPercent
-            HStack(spacing: 3) {
-                Text("\(Int(pct))%")
-                    .foregroundColor(PercentSeverity(percent: pct).color)
-                if let pace = window.evenBurnPercent(), let slack = window.slack() {
-                    Text(EvenBurnMark.label(pace: pace))
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                        .help(EvenBurnMark.help(usedPercent: pct, pace: pace, slack: slack))
-                }
-            }
+    private func percentText(_ value: Double?) -> some View {
+        if let pct = value {
+            Text("\(Int(pct))%")
+                .foregroundColor(PercentSeverity(percent: pct).color)
         } else {
             Text("—")
                 .foregroundColor(.secondary)

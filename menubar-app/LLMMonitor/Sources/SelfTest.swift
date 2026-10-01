@@ -76,7 +76,6 @@ enum SelfTest {
         testStalenessBackstop()
         testBadgePercentSuppression()
         testWindowKindDerivation()
-        testEvenBurnPosition()
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
         testProviderParsing()
@@ -599,115 +598,6 @@ enum SelfTest {
         expect(!labelled.isExhausted, "44% weekly is not exhausted")
         expect(RateLimitWindow(kind: .weekly, usedPercent: 12, status: "rejected").isExhausted,
                "a rejected window is exhausted regardless of percent")
-    }
-
-    /// The elapsed-time-normalized "even burn" position (#220) — what makes a
-    /// 5h window at hour 1 and a 7d window at day 3.5 comparable. Every case
-    /// where the position is *unknown* must yield nil, never 0: a 0 would
-    /// report a window that has not started as one being burned exactly on
-    /// pace, and `slack` would then read as a comfortable deficit.
-    private static func testEvenBurnPosition() {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-
-        // Mid-window: a 5h session window resetting in 1h is 80% elapsed.
-        let midSession = RateLimitWindow(
-            kind: .session,
-            usedPercent: 62,
-            resetAt: now.addingTimeInterval(3600)
-        )
-        guard let sessionPace = midSession.evenBurnPercent(at: now) else {
-            expect(false, "evenBurn: a 5h session window with a known reset must have a position")
-            return
-        }
-        expect(abs(sessionPace - 80) < 0.001,
-               "evenBurn: 5h window resetting in 1h is 80% elapsed, got \(sessionPace)")
-        guard let sessionSlack = midSession.slack(at: now) else {
-            expect(false, "evenBurn: slack must exist wherever the position does")
-            return
-        }
-        expect(abs(sessionSlack - 18) < 0.001,
-               "evenBurn: 80% pace against 62% used banks +18 points of slack, got \(sessionSlack)")
-
-        // A 7d weekly window at day 3.5 is 50% elapsed — the same 62% used is
-        // now *ahead* of budget, which is the whole point of the metric.
-        let midWeekly = RateLimitWindow(
-            kind: .weekly,
-            usedPercent: 62,
-            resetAt: now.addingTimeInterval(3.5 * 86400)
-        )
-        expect(midWeekly.evenBurnPercent(at: now).map { abs($0 - 50) < 0.001 } == true,
-               "evenBurn: 7d window resetting in 3.5d is 50% elapsed")
-        expect(midWeekly.slack(at: now).map { abs($0 - (-12)) < 0.001 } == true,
-               "evenBurn: 50% pace against 62% used is -12 points — ahead of budget")
-
-        // Reset already passed → nil. The window has rolled over, so this
-        // reading's phase says nothing about the current window.
-        let passed = RateLimitWindow(
-            kind: .session,
-            usedPercent: 91,
-            resetAt: now.addingTimeInterval(-60)
-        )
-        expect(passed.evenBurnPercent(at: now) == nil,
-               "evenBurn: a reset that already passed has no position")
-        expect(passed.slack(at: now) == nil,
-               "evenBurn: a reset that already passed has no slack")
-        let exactlyAtReset = RateLimitWindow(kind: .session, usedPercent: 91, resetAt: now)
-        expect(exactlyAtReset.evenBurnPercent(at: now) == nil,
-               "evenBurn: a reset landing exactly now has no position either")
-
-        // Missing reset → nil (a z.ai window with an idle, unreported
-        // `nextResetTime` is exactly this shape), even though the kind-labelled
-        // initializer supplied a duration.
-        let noReset = RateLimitWindow(kind: .weekly, usedPercent: 33)
-        expectEqual(noReset.durationSeconds, 7 * 86400, "evenBurn fixture: nominal duration is present")
-        expect(noReset.evenBurnPercent(at: now) == nil,
-               "evenBurn: no resetAt → no position (never 0)")
-        expect(noReset.slack(at: now) == nil,
-               "evenBurn: no resetAt → no slack (never the used percent negated)")
-
-        // Missing duration → nil. `.unknown` has no nominal duration, so a
-        // duration-derived window with no length lands here even with a reset.
-        let noDuration = RateLimitWindow(
-            usedPercent: 47,
-            durationSeconds: nil,
-            resetAt: now.addingTimeInterval(1800)
-        )
-        expectEqual(noDuration.durationSeconds, nil, "evenBurn fixture: duration really is absent")
-        expect(noDuration.evenBurnPercent(at: now) == nil,
-               "evenBurn: no durationSeconds → no position (never 0)")
-        expect(noDuration.slack(at: now) == nil,
-               "evenBurn: no durationSeconds → no slack")
-        expect(RateLimitWindow(usedPercent: 47, durationSeconds: 0,
-                               resetAt: now.addingTimeInterval(1800))
-                .evenBurnPercent(at: now) == nil,
-               "evenBurn: a zero-length window has no position (no division by zero)")
-
-        // Clamp, low end: a reset further out than one whole window (clock
-        // skew, or a provider reporting the *next* window's reset) must floor
-        // at 0, never go negative.
-        let skewed = RateLimitWindow(
-            kind: .session,
-            usedPercent: 5,
-            resetAt: now.addingTimeInterval(9 * 3600)
-        )
-        expectEqual(skewed.evenBurnPercent(at: now), 0,
-                    "evenBurn: a reset beyond one full window clamps to 0%")
-        expectEqual(skewed.slack(at: now), -5,
-                    "evenBurn: clamped-to-0 pace against 5% used is -5 points")
-
-        // Clamp, high end: a reset arriving within the current instant
-        // approaches 100 from below and never exceeds it.
-        let almostReset = RateLimitWindow(
-            kind: .weekly,
-            usedPercent: 99,
-            resetAt: now.addingTimeInterval(0.001)
-        )
-        guard let nearPace = almostReset.evenBurnPercent(at: now) else {
-            expect(false, "evenBurn: a window one millisecond from its reset still has a position")
-            return
-        }
-        expect(nearPace > 99.999 && nearPace <= 100,
-               "evenBurn: a window at its reset clamps at 100%, got \(nearPace)")
     }
 
     /// The exact shape the live-verified Codex probe returned: a *weekly*

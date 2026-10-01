@@ -24,12 +24,10 @@ extension CGFloat {
 class PopoverHeightManager: ObservableObject {
     /// Exactly the sum of `SummaryColumns`' widths plus its horizontal padding
     /// on both sides, so the summary table neither clips nor floats in empty
-    /// space. Recompute it whenever a column width there changes — the two
-    /// Session %/Weekly % columns grew by 16pt each in #220 to carry the
-    /// even-burn mark beside the raw percentage, taking 818 to 850.
+    /// space. Recompute it whenever a column width there changes.
     // An immutable constant, read by `SummaryColumns.tableWidth` outside the
     // main actor, so it carries no isolation.
-    nonisolated static let popoverWidth: CGFloat = 850
+    nonisolated static let popoverWidth: CGFloat = 818
     static let minHeight: CGFloat = 200
     static let maxHeight: CGFloat = 800
 

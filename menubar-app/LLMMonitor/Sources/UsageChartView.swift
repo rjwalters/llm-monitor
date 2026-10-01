@@ -30,23 +30,6 @@ struct TokenTrace: Identifiable {
     let isPrimary: Bool
 }
 
-/// One endpoint of one window instance's even-burn reference line (#220).
-///
-/// The reference is the straight line from (window start, 0%) to (reset, 100%)
-/// — i.e. the locus of `RateLimitWindow.evenBurnPercent(at:)` across the
-/// window, plotted on the chart's existing wall-clock x-axis. Two endpoints per
-/// window instance are enough because the figure is linear in time; `segment`
-/// keys them into one Charts series per instance so the line restarts at every
-/// reset instead of sloping back down across the rollover.
-struct EvenBurnReferencePoint: Identifiable {
-    let id = UUID()
-    /// Which window instance this endpoint belongs to — newest is 0, each
-    /// older instance one higher.
-    let segment: Int
-    let timestamp: Date
-    let percent: Double
-}
-
 /// One named sub-limit's overlay series (e.g. an OpenAI
 /// `additional_rate_limits[]` entry). Named by the provider — the label is
 /// used verbatim, never mapped to a fixed enum, since naming will churn.
@@ -69,14 +52,6 @@ struct UsageChartWindow: View {
     /// it were this account's own spend.
     let tokenDataIsHostTotal: Bool
     let calibrationDataPoints: [CalibrationDataPoint]
-    /// This account's current weekly rate-limit window, when it has one — the
-    /// only input the even-burn reference line needs (#220): its `resetAt` and
-    /// `durationSeconds` place every window instance on the time axis. Read
-    /// once by `ChartWindowController.showChart` rather than off `store` here,
-    /// matching how every other series on this window is handed in. Nil for an
-    /// account whose provider reports no weekly window (or none yet), and the
-    /// reference line is then simply not drawn.
-    let currentWeeklyWindow: RateLimitWindow?
     let store: UsageStore
     let oauthPoller: OAuthPoller?
     let otherAccountsData: [AccountTrace]  // Data for other accounts
@@ -199,61 +174,6 @@ struct UsageChartWindow: View {
         let startDate = dateForRangePosition(rangeStart)
         let endDate = dateForRangePosition(rangeEnd)
         return calibrationDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
-    }
-
-    /// Hard cap on how many window instances the even-burn reference tiles
-    /// back over. The visible domain is at most 7 days wide and the weekly
-    /// window is 7 days long, so two or three instances is the real answer;
-    /// this only guarantees that an implausibly short reported duration cannot
-    /// spin the loop.
-    private static let maxEvenBurnSegments = 16
-
-    /// Endpoints of the even-burn reference lines for every window instance
-    /// that intersects the visible range (#220).
-    ///
-    /// Window instances are tiled **backwards from the current window's own
-    /// reset** by its own duration — `resetAt - k·durationSeconds` — rather
-    /// than inferred from drops in the plotted series. The provider states both
-    /// numbers, so the reference line's geometry comes from the provider's
-    /// clock, not from this app's sampling of it: a reset that happened while
-    /// the app was closed still gets its line in the right place.
-    ///
-    /// Endpoints are emitted un-clipped (0% at each instance's start, 100% at
-    /// its reset) and the chart's own x-domain clips them, so the line is
-    /// exactly the locus of `RateLimitWindow.evenBurnPercent(at:)` with no
-    /// second copy of that formula living here.
-    ///
-    /// Empty — and therefore invisible — whenever the account has no weekly
-    /// window, no reset instant, or no duration. An unknown position is never
-    /// drawn as an on-pace one, the same rule the core helper follows.
-    var evenBurnReferencePoints: [EvenBurnReferencePoint] {
-        guard let weekly = currentWeeklyWindow,
-              let reset = weekly.resetAt,
-              let duration = weekly.durationSeconds,
-              duration > 0 else { return [] }
-
-        let visibleStart = dateForRangePosition(rangeStart)
-        let visibleEnd = dateForRangePosition(rangeEnd)
-        guard visibleEnd > visibleStart else { return [] }
-
-        var points: [EvenBurnReferencePoint] = []
-        var segment = 0
-        while segment < Self.maxEvenBurnSegments {
-            let instanceReset = reset.addingTimeInterval(-Double(segment) * duration)
-            // Entirely older than the visible range — nothing further back can
-            // intersect it either, so stop.
-            if instanceReset <= visibleStart { break }
-            let instanceStart = instanceReset.addingTimeInterval(-duration)
-            // Entirely newer than the visible range (a reset far in the
-            // future): skip it but keep walking back to the instances that do
-            // intersect.
-            if instanceStart < visibleEnd {
-                points.append(EvenBurnReferencePoint(segment: segment, timestamp: instanceStart, percent: 0))
-                points.append(EvenBurnReferencePoint(segment: segment, timestamp: instanceReset, percent: 100))
-            }
-            segment += 1
-        }
-        return points
     }
 
     /// Maximum `tokensPerPoint` value in the filtered range (for Y-axis
@@ -537,33 +457,8 @@ struct UsageChartWindow: View {
                             .foregroundColor(.secondary)
                     }
 
-                    // #220: what the dashed grey reference is. Shown only when
-                    // there is one to explain, so an account with no weekly
-                    // reset never advertises a line it isn't drawing.
-                    if chartMode == .percent && !evenBurnReferencePoints.isEmpty {
-                        Text("Dashed line: even burn — where usage would sit if the weekly window "
-                             + "were spent at a constant rate. Below it is banking; above it caps early.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
                     if chartMode == .percent {
                     Chart {
-                        // Even-burn reference per window instance (#220), drawn
-                        // first so every real trace sits on top of it. One
-                        // `series` per instance, so the line restarts at each
-                        // reset rather than sloping back across the rollover.
-                        ForEach(evenBurnReferencePoints) { point in
-                            LineMark(
-                                x: .value("Time", point.timestamp),
-                                y: .value("Usage %", point.percent),
-                                series: .value("EvenBurn", "evenburn-\(point.segment)")
-                            )
-                            .foregroundStyle(Color.secondary)
-                            .opacity(0.5)
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                        }
-
                         // Other accounts (rendered first so primary is on top)
                         if showOtherAccounts {
                             ForEach(filteredOtherAccounts) { trace in
@@ -1516,11 +1411,6 @@ enum ChartWindowController {
             tokenDataPoints: tokenDataPoints,
             tokenDataIsHostTotal: tokenDataIsHostTotal,
             calibrationDataPoints: calibrationDataPoints,
-            // #220: the even-burn reference needs only the current weekly
-            // window's own `resetAt`/`durationSeconds`. Read here (main actor,
-            // like every other load above) so the view itself stays a pure
-            // function of what it was handed.
-            currentWeeklyWindow: store.latestUsage[account.id]?.rateLimit.weekly,
             store: store,
             oauthPoller: oauthPoller,
             otherAccountsData: otherAccountsData,
