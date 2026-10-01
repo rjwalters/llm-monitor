@@ -293,11 +293,13 @@ fixes the audit surfaced — apply the ones the user approves.
 **Report where those fixes landed, not only that they were applied.** In a
 Loom-managed repo [[docs]] picks a destination up front — its "Loom-managed
 repo: land fixes where a sweep cannot take them" step: a commit in a dedicated
-worktree, a commit on an otherwise-clean current branch, or uncommitted plus an
-explicit quarantine warning. [[gitignore]] and [[links]] follow the identical
-ladder, so the same choice governs the rule fixes stage 1 applied and any link
-fixes made here. Carry that destination into this stage's line and into the
-final summary — a branch or worktree name when the fixes were committed,
+issue worktree, a commit on a `chore/repo-hygiene-<date>` branch plus a PR when
+the default branch is PR-protected, a commit on an otherwise-clean current
+branch, or uncommitted plus an explicit quarantine warning. [[gitignore]] and
+[[links]] point at that same canonical ladder, so the one choice governs the
+rule fixes stage 1 applied and any link fixes made here. Carry that destination
+into this stage's line and into the final summary — a branch or worktree name
+when the fixes were committed,
 `uncommitted, at risk` when they were not. In a repo that is not Loom-managed
 there is no destination to name and the line is exactly what it always was.
 
@@ -404,18 +406,19 @@ checkout are quarantined by the next sweep's `check-main-clean.sh --quarantine`
 (stash label `loom-quarantine: run=<sweep-id> issue=<N>`), so `2 fixed` can be
 true when it prints and false ten minutes later. The Docs stage therefore picks
 a destination up front — see [[docs]]' "Loom-managed repo: land fixes where a
-sweep cannot take them", which [[gitignore]] and [[links]] follow identically —
-and **the summary names that destination**:
+sweep cannot take them", the canonical copy [[gitignore]] and [[links]] point at
+— and **the summary names that destination**:
 
 | Where the fixes landed | Summary line |
 |---|---|
-| Committed in a dedicated worktree | `Docs: 2 fixed on feature/issue-448 (worktree .loom/worktrees/issue-448, a1b2c3d)` |
+| Committed in a dedicated issue worktree | `Docs: 2 fixed on feature/issue-448 (worktree .loom/worktrees/issue-448, a1b2c3d)` |
+| Committed on a hygiene branch (PR-protected default) | `Docs: 2 fixed on chore/repo-hygiene-2026-09-30 (worktree .loom/worktrees/repo-hygiene-2026-09-30, a1b2c3d) — main protected; push + PR offered` |
 | Committed on the current branch | `Docs: 2 fixed, committed on main (a1b2c3d)` |
 | Left uncommitted in the primary checkout | `Docs: 2 fixed — uncommitted, at risk` |
 | Not a Loom-managed repo | `Docs: 2 fixed (README table, CHANGELOG entry)` — unchanged |
 
 The same applies to the `Audit:` line when stage 1 applied gitignore rule fixes:
-name where those landed too, on the same three shapes.
+name where those landed too, on the same four shapes.
 
 The `uncommitted, at risk` row carries the warning [[docs]] prints, once, on its
 own line beneath the summary — it is the one arm where the run ends with work

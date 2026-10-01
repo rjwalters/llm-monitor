@@ -856,8 +856,18 @@ land within minutes rather than on the stated interval.
 
 For every PR report: **ecosystem**, **update type** (major vs minor/patch —
 majors flagged), **CI status**, **whether it's stale** (the manifest on the
-base branch already satisfies it — see the sub-step below), and what actually
+base branch already satisfies it — see the sub-step below), **whether another
+open PR supersedes it** (see "Sibling supersession" below), and what actually
 changed.
+
+Those two disqualifiers are **different findings with different actions**, and
+every PR lands in exactly one of three buckets:
+
+| Classification | Test | Action |
+|---|---|---|
+| **stale** | the base branch's manifests *and lockfiles* already satisfy every proposed change | drop from the pending tally; keep the count + evidence in the report; don't close it automatically |
+| **superseded by a sibling** | another **open** bot PR proposes a version at least as new for every dependency this one touches | propose **closing it with a cross-reference to the superseding PR** — never merge it |
+| **real** | neither of the above | propose for merge, subject to step 9 |
 
 Update type comes from the title/branch (`bump X from 1.2.3 to 2.0.0` →
 compare the leading version components) — confirm against the diff rather than
@@ -938,6 +948,54 @@ major bump that removes a *"Node.js 20 is deprecated"* annotation, with CI
 green on every matrix leg, is a much easier yes than "a major bump, seems
 risky."
 
+#### Sibling supersession — compare the open PRs against *each other*, not only the base
+
+The stale check compares each PR against the base branch. It cannot see the
+case where **another open PR already proposes a strictly newer version of the
+same dependency** — both PRs are ahead of the base, so neither is stale, yet
+merging both is guaranteed conflict for no gain and merging the older one first
+is strictly worse. A bot produces this routinely: it opens a PR, the upstream
+package releases again, and the next scan opens a second PR for the same
+dependency without closing the first.
+
+So after the per-PR pass, do one **cross-PR** pass: build the
+dependency → proposed-version map for every open PR and compare the maps.
+
+```bash
+# Per PR, the (dependency, new version) pairs it proposes — from the manifest
+# hunks, not the title, so grouped PRs are covered too. `gh pr diff` takes no
+# pathspec (`cobra.MaximumNArgs(1)`), so filtering to one file has to go
+# through the files API instead.
+for n in <PR numbers>; do
+  echo "== #$n"
+  gh api "repos/OWNER/REPO/pulls/$n/files" --paginate \
+    --jq '.[] | select(.filename == "package.json") | .patch'
+done
+```
+
+A PR is **superseded** when, for *every* dependency it touches, some other open
+PR proposes a version at least as new — i.e. it is wholly contained in that
+sibling. Use the ecosystem's version semantics for "newer", as in the stale
+check. Partial containment is **not** supersession: a PR that bumps `a` and `b`
+where a sibling only covers `b` is still real work, and closing it loses the
+`a` bump.
+
+Worked example from a four-PR npm queue, where neither PR was stale (the base
+lockfile held `wrangler` 4.120.1, below both):
+
+| PR | `wrangler` | `sharp` |
+|---|---|---|
+| #205 | `^4.139.0` | 0.35.2 → 0.35.4 |
+| #209 | `^4.136.1` | 0.35.2 → 0.35.4 |
+
+#209 is wholly contained in #205 → **superseded by #205**; propose closing
+#209 with a comment naming #205, and merge #205. Report supersession as its own
+`Note`, with the superseding PR number in it, and count it separately from
+stale — the reader needs to know a PR was dropped as redundant rather than as
+already-satisfied, because only one of those is a merge-set decision. Closing
+is still a write: it needs the same explicit confirmation as a merge, and never
+happens under `--check`.
+
 The `Note` column carries the `stale — already satisfied by manifest` flag
 alongside the existing CI-status/diff notes, so a stale PR is visible as such at
 a glance:
@@ -951,24 +1009,69 @@ OPEN DEPENDENCY PRs
 | #13 | npm            | 6 packages (minor + patch) | minor | green | grouped                           |
 | #14 | npm            | playwright-core 1.4 → 2.0  | MAJOR | red   | browser binary coupling           |
 | #15 | npm            | @biomejs/biome 2.5.5 → 2.5.6 | patch | green | stale — base lockfile already resolves 2.5.7 |
+| #16 | npm            | wrangler ^4.136.1 + sharp    | minor | green | superseded by #13 — close, don't merge      |
 ```
 
 Summarize the split explicitly below the table so callers (including
 `/repo:all`) get the counts without re-deriving them —
-**open**, **majors** (real forward majors only), and **stale**:
+**open**, **majors** (real forward majors only), **stale**, and
+**superseded**:
 
 ```
-4 open, 2 majors, 1 stale — already satisfied by manifest
+5 open, 2 majors, 1 stale — already satisfied by manifest, 1 superseded by a sibling
 ```
 
-The majors count excludes every stale PR. A PR whose title names a major bump
-but whose resolved dependency state already satisfies it (stale) is **not** a major here — it
-is counted only in the stale total.
+The majors count excludes every stale **and** every superseded PR. A PR whose
+title names a major bump but whose resolved dependency state already satisfies
+it (stale) is **not** a major here — it is counted only in the stale total; the
+same holds for a superseded PR, counted only in the superseded total. When
+nothing is superseded, leave that clause out entirely rather than printing
+`0 superseded` — the open/majors/stale counts keep their existing always-printed
+form.
 
 ### 9. Offer to merge the safe ones (confirm first)
 
 Propose a merge set and get explicit approval. **Never** merge a major without
 its own separate confirmation, and never merge a PR whose CI is red or pending.
+Every PR classified **superseded by a sibling** in step 8 is proposed for
+closure with a cross-reference, not for merge.
+
+#### A lockfile-bearing ecosystem merges one PR at a time
+
+**Several PRs reporting `mergeable: MERGEABLE` / `mergeStateStatus: CLEAN` at
+the same instant is not evidence that they are mutually compatible.** GitHub
+evaluates each PR against the **base branch** independently and has no concept
+of the other PRs in flight, so a whole queue can read `CLEAN` simultaneously and
+still conflict pairwise. (This is the same GitHub behavior `/loom:sweep`
+documents for its wave machinery — see the base-branch-only callout in
+`loom/sweep-execution-model.md`, installed as
+`.claude/commands/loom/sweep-execution-model.md` on a Loom-managed repo. One
+behavior, two surfaces; don't build a second explanation of it here.)
+
+For any ecosystem with a **single shared lockfile** — npm/pnpm/yarn
+(`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`), Cargo (`Cargo.lock`),
+Poetry/uv (`poetry.lock`, `uv.lock`), Bundler, Go's `go.sum` — the overlap is
+not a heuristic, it is a **certainty**: every PR in that ecosystem edits the
+lockfile, so every pair conflicts. Therefore:
+
+- **Merge strictly one at a time**, never a batch, and re-derive the next PR's
+  state after each merge (the `UNKNOWN`-window poll below).
+- **Order matters** — merge the *superseding* PR of any pair first, so the
+  sibling you would otherwise rebase is one you are closing anyway.
+- Ecosystems with **no** shared lockfile (GitHub Actions workflow pins, Docker
+  base images) only conflict when two PRs touch the same file, so they can be
+  batched — check the file lists from step 8 rather than assuming.
+
+#### After each merge, re-check the survivors instead of trusting them
+
+Each surviving PR's green CI was measured against a base that has now moved, so
+it is evidence about a tree that no longer exists — not about what merging it
+next would produce. In the four-PR run behind this guidance, three PRs had been
+tested against a base five merges old and were reporting a bundle size 10 KB
+below the current one. After every merge, for each remaining PR: re-read its
+mergeability (below), and treat its checks as **needing a re-run on the new
+base** before it counts as green — a rebase (next sub-step) triggers exactly
+that.
 
 In a Loom-managed repo (`.loom/scripts/merge-pr.sh` present) use that script
 rather than `gh pr merge` — `gh pr merge` attempts a local checkout that fails
@@ -1000,7 +1103,52 @@ A state that settles on `DIRTY` (or `BLOCKED`) is **not** a timing artifact —
 the earlier merge produced a genuine lockfile conflict, so stop the loop and
 report it rather than retrying.
 
-Under `--check`, stop at the report and merge nothing.
+#### Recovering a conflicted bot branch — ask the bot, not `gh`
+
+A `DIRTY` bot PR after a sibling merge is the **expected** state for a
+lockfile-bearing ecosystem, not a failure. It does not need closing, and it
+cannot be fixed with `gh`:
+
+```
+$ gh pr update-branch 210
+X Cannot update PR branch due to conflicts
+```
+
+`gh pr update-branch` asks GitHub to merge the base into the PR branch (or
+rebase onto it with `--rebase`). Neither mode can accept a conflict
+resolution — the API has no channel for one — so both fail outright on a
+conflicted branch rather than recovering it. The supported recovery is to
+**ask the bot to redo the branch**, which it does by recomputing the update
+against the current base:
+
+```bash
+gh pr comment <N> --body "@dependabot rebase"     # Dependabot
+# Renovate: tick the PR body's "Rebase/retry" checkbox, or comment the
+#   configured rebase trigger for that installation
+```
+
+Two outcomes, both normal, and they differ in a way that matters for anything
+holding a PR number:
+
+- **Simple PR (one or a few packages)** — the bot **rebases in place**: same PR
+  number, new head commit, CI re-runs against the new base.
+- **Grouped PR (a `groups:` entry, many updates)** — the bot **closes it and
+  opens a new PR under a new number**, having recomputed the group membership
+  against the new base (so the update count can change too: a 19-update group
+  came back as 18). Anything referencing the old number — your merge set, the
+  report you already printed, a tracking comment — goes stale the moment this
+  happens, so **re-list open bot PRs (step 7) after a grouped rebase** rather
+  than continuing against the number you had.
+
+Rebasing is a write to the PR, so it needs the same explicit authorization as a
+merge, and never happens under `--check`. Expect one CI cycle per rebase: on a
+queue of N lockfile-bearing PRs, merging all of them costs N sequential
+cycles — worth saying out loud when you propose the merge set, and worth
+weighing against merging the highest-value one or two now and letting the bot's
+next scan regenerate the rest.
+
+Under `--check`, stop at the report and merge nothing — no closures, no
+rebase comments.
 
 ## Check how dependency PRs interact with Loom
 
@@ -1046,7 +1194,9 @@ natural wrong assumption, and it is safety-relevant:
 ## Safety Rules
 
 1. **Writes and merges require authorization** — show the concrete scope and
-   use existing authorization when it covers it. Under `--check`, write nothing.
+   use existing authorization when it covers it. Closing a superseded PR and
+   commenting `@dependabot rebase` are writes too, held to the same bar. Under
+   `--check`, write nothing.
 2. **Policy, updater, alerts, and security PRs are independent** — a present
    config says nothing about whether CVE alerting is on. Report
    UNKNOWN (not `disabled`) when the token can't read the setting.
@@ -1064,8 +1214,11 @@ natural wrong assumption, and it is safety-relevant:
    dependency-free, recommend not scaffolding and say why.
 6. **Never auto-merge a major** — majors get their own confirmation, always.
    Red or pending CI is never merged.
-7. **Never push or merge under `--check`** — report-only means report-only.
-8. **Never file an issue without confirmation, and never re-file one already
+7. **Never merge a lockfile-bearing ecosystem's PRs in a batch** — one at a
+   time, re-checking each survivor afterwards. Simultaneous `CLEAN` across
+   several PRs proves nothing about their mutual compatibility.
+8. **Never push or merge under `--check`** — report-only means report-only.
+9. **Never file an issue without confirmation, and never re-file one already
    tracked** — the deferred-Dependabot-shutdown issue is offered, with its full
    body shown, only after the [[followups]]-style dedup search comes back empty
    for the client repo, and never under `--check` or `--all-repos`.

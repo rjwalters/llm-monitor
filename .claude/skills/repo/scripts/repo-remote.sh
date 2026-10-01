@@ -56,6 +56,29 @@
 #   1. ${XDG_CONFIG_HOME:-$HOME/.config}/repo/remote.env   (shared cloud creds)
 #   2. <git-root>/.env                                     (per-repo machine)
 #
+# Out-of-tree per-repo config (repo#492): some repos forbid ANY `.env` in the
+# checkout or its worktrees (worktrees are copied/rsynced constantly, and a
+# gitignored file is one `git add -f` away from leaking). For them, set
+# REPO_REMOTE_ENV_FILE=<absolute path> -- in the process environment or in the
+# shared remote.env -- and layer 2 becomes that file instead of
+# <git-root>/.env (a leading `~/` is expanded; the environment value wins over
+# the shared file's). The instance-id write-back goes there too.
+#
+# Instance-id write-back never CREATES <git-root>/.env: it updates the resolved
+# per-repo file when REPO_REMOTE_ENV_FILE is set (creating that file if
+# needed) or when <git-root>/.env already exists; otherwise it only logs the id
+# with a hint to pin it. REPO_REMOTE_NO_WRITEBACK=1 disables the write-back
+# entirely (the id is still logged).
+#
+# Linked-worktree warning (repo#538): when the checkout is a LINKED git
+# worktree (`git worktree add`, e.g. .loom/worktrees/issue-N -- detected by
+# `git rev-parse --git-dir` differing from `--git-common-dir`) and no
+# REPO_REMOTE_ENV_FILE is set, reading a pre-existing <git-root>/.env or writing
+# the instance id back into it prints a loud WARNING naming the file. The
+# read/write still happens (warn-then-proceed); the fix is to move the per-repo
+# settings out of the tree and set REPO_REMOTE_ENV_FILE. The primary checkout
+# is unaffected (no warning).
+#
 # Cost gate (repo#52 — the highest-cost-of-being-wrong element): `up` (with or
 # without --yes) REQUIRES the provider, that provider's credentials, and
 # REPO_REMOTE_INSTANCE_TYPE to be present in config. Instance type is the
@@ -117,7 +140,11 @@
 #
 # Exit codes:
 #   0  success (including a dry-run plan)
-#   2  missing / invalid required config (the cost gate; loud failure)
+#   2  missing / invalid required config (the cost gate; loud failure) — also
+#      the SSH-ingress fail-closed refusals: current-IP detection failed and no
+#      REPO_REMOTE_SSH_CIDR was pinned, or the pinned CIDR is wider than
+#      REPO_REMOTE_SSH_MIN_PREFIX without REPO_REMOTE_ALLOW_WORLD_SSH=1
+#      (repo#487)
 #   3  provider authentication failed
 #   4  cloud operation failed
 #   5  refused to act (reuse via `up`, stop/terminate via `down`) on a
@@ -194,18 +221,90 @@ json_escape() {
 # wins because it is sourced last). Mirrors commands/repo/remote.md step 2.
 SHARED_ENV=""
 REPO_ENV=""
+REPO_ENV_OVERRIDDEN=false   # true when REPO_ENV came from REPO_REMOTE_ENV_FILE (repo#492)
 GIT_ROOT=""
+# The caller's REPO_REMOTE_ENV_FILE, captured before any config file is sourced
+# so an explicit environment value beats one set in the shared remote.env.
+ENV_FILE_FROM_ENV="${REPO_REMOTE_ENV_FILE:-}"
+
+# expand_tilde <path> -> the path with a leading `~` / `~/` expanded to $HOME
+expand_tilde() {
+  local p="$1"
+  # shellcheck disable=SC2088  # matching a literal `~`, not expanding one
+  case "$p" in
+    "~")   printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${p:2}" ;;
+    *)     printf '%s' "$p" ;;
+  esac
+}
+
+# apply_env_file_override -- point REPO_ENV at REPO_REMOTE_ENV_FILE when set
+# (environment first, then whatever the shared remote.env set), else leave the
+# <git-root>/.env default from resolve_paths in place.
+apply_env_file_override() {
+  local override="${ENV_FILE_FROM_ENV:-${REPO_REMOTE_ENV_FILE:-}}"
+  if [[ -n "$override" ]]; then
+    REPO_ENV="$(expand_tilde "$override")"
+    REPO_ENV_OVERRIDDEN=true
+  fi
+}
+
+# is_linked_worktree -- true when the current checkout is a linked git worktree
+# (`git worktree add`), false in the primary checkout, a plain clone, or outside
+# git. The standard test: --git-dir differs from --git-common-dir only in a
+# linked worktree. Both are resolved physically, since git may print either one
+# relative to the cwd.
+is_linked_worktree() {
+  local gitdir commondir
+  gitdir="$(git rev-parse --git-dir 2>/dev/null)" || return 1
+  commondir="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ -n "$gitdir" && -n "$commondir" ]] || return 1
+  gitdir="$(cd "$gitdir" 2>/dev/null && pwd -P)" || return 1
+  commondir="$(cd "$commondir" 2>/dev/null && pwd -P)" || return 1
+  [[ "$gitdir" != "$commondir" ]]
+}
+
+# warn_worktree_env <read|write> -- repo#538: loud warning when an in-tree
+# <git-root>/.env is about to be read or written from inside a linked worktree.
+# Callers gate on IN_LINKED_WORKTREE + !REPO_ENV_OVERRIDDEN; this only prints.
+warn_worktree_env() {
+  local verb
+  case "$1" in
+    read)  verb="loading per-repo config from" ;;
+    *)     verb="writing the instance id into" ;;
+  esac
+  log "WARNING: ${verb} ${REPO_ENV}, a .env inside a linked git worktree."
+  log "  Worktrees get copied/rsynced and a gitignored .env is one 'git add -f' from leaking;"
+  log "  move these settings out of the tree and set REPO_REMOTE_ENV_FILE=<absolute path>"
+  log "  (e.g. ~/.config/<repo>/remote.env) in your environment or the shared remote.env."
+}
+
+IN_LINKED_WORKTREE=false   # set by resolve_paths (repo#538)
 
 resolve_paths() {
   SHARED_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/repo/remote.env"
   GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$GIT_ROOT" ]] && REPO_ENV="$GIT_ROOT/.env"
+  if [[ -n "$GIT_ROOT" ]] && is_linked_worktree; then
+    IN_LINKED_WORKTREE=true
+  fi
+  apply_env_file_override
 }
 
 load_config() {
   set -a
   # shellcheck disable=SC1090
   [[ -f "$SHARED_ENV" ]] && . "$SHARED_ENV"
+  set +a
+  # The shared file may itself name the per-repo file (repo#492).
+  apply_env_file_override
+  # repo#538: one warning (not per key) when the per-repo layer is an in-tree
+  # .env inside a linked worktree. Still sourced -- warn, then proceed.
+  if [[ -n "$REPO_ENV" && -f "$REPO_ENV" && "$IN_LINKED_WORKTREE" == true \
+        && "$REPO_ENV_OVERRIDDEN" != true ]]; then
+    warn_worktree_env read
+  fi
+  set -a
   # shellcheck disable=SC1090
   [[ -n "$REPO_ENV" && -f "$REPO_ENV" ]] && . "$REPO_ENV"
   set +a
@@ -224,6 +323,8 @@ IS_GPU=false
 FLEET_TAG_KEY=""   # tag/label key that marks a managed fleet host ("" disables)
 FLEET_TAG_VALUE="" # required value for that key ("" = any non-empty value)
 SSH_CIDR=""        # AWS only: pinned SSH-ingress CIDR override (see aws_resolve_ssh_cidr)
+SSH_MIN_PREFIX=""  # AWS only: narrowest IPv4 prefix length accepted for SSH ingress (default 32)
+ALLOW_WORLD_SSH="" # AWS only: "1" opts in to an SSH-ingress CIDR wider than SSH_MIN_PREFIX
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
@@ -379,9 +480,16 @@ resolve_settings() {
   FLEET_TAG_VALUE="${REPO_REMOTE_FLEET_TAG_VALUE-loom}"
 
   # AWS-only SSH-ingress CIDR override (repo#176). Unset (the default) means
-  # "detect it"; see aws_resolve_ssh_cidr for the detection + fallback logic.
-  # An explicit 0.0.0.0/0 is a valid, deliberate opt-in (still key-only auth).
+  # "detect it"; see aws_resolve_ssh_cidr for the detection logic, which now
+  # fails CLOSED rather than falling back to 0.0.0.0/0 (repo#487).
   SSH_CIDR="${REPO_REMOTE_SSH_CIDR:-}"
+  # Narrowest IPv4 prefix length accepted for SSH ingress (repo#487). The
+  # default 32 means "a single address"; raise the allowed width deliberately
+  # (e.g. 24 for a known ISP block) rather than by accident. Anything wider
+  # than this — 0.0.0.0/0 included — additionally requires
+  # REPO_REMOTE_ALLOW_WORLD_SSH=1.
+  SSH_MIN_PREFIX="${REPO_REMOTE_SSH_MIN_PREFIX:-32}"
+  ALLOW_WORLD_SSH="${REPO_REMOTE_ALLOW_WORLD_SSH:-0}"
 
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
@@ -426,7 +534,7 @@ require_cost_config() {
     local m
     log "cannot proceed — required config is missing (no silent defaults for cost-relevant fields):"
     for m in "${missing[@]}"; do log "  - $m"; done
-    log "set them in ${SHARED_ENV} (shared) or ${REPO_ENV:-<git-root>/.env} (per-repo), or run /repo:remote --configure."
+    log "set them in ${SHARED_ENV} (shared) or ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE} (per-repo), or run /repo:remote --configure."
     exit 2
   fi
 }
@@ -474,7 +582,7 @@ fleet_marker_gate() {  # <resource-id> <marker-value> <"tag"|"label">
   printf '%s\n' "repo-remote: ERROR: refusing to reuse ${id}: it carries the fleet marker ${kind} ${FLEET_TAG_KEY}=${val}." >&2
   log "  That marker means the host is managed as part of a fleet (e.g. a persistent loom-daemon worker), so starting or re-aliasing it from ephemeral dev-session tooling is almost certainly not what you want (operator incident, private tracker)."
   log "  If you really mean to target it, re-run with --force."
-  log "  To use a different box instead, clear REPO_REMOTE_INSTANCE_ID from ${REPO_ENV:-<git-root>/.env} (and/or remove the repo-remote=${NAME} tag from the fleet host)."
+  log "  To use a different box instead, clear REPO_REMOTE_INSTANCE_ID from ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE} (and/or remove the repo-remote=${NAME} tag from the fleet host)."
   log "  To disable this check entirely, set REPO_REMOTE_FLEET_TAG_KEY= (empty)."
   exit 5
 }
@@ -724,7 +832,7 @@ verify_host_identity() {
     log "  An auto-assigned EC2 public IP is released when its instance stops and reassigned on the next start — very possibly to another AWS customer's instance. The alias resolving and ssh connecting therefore prove NOTHING about which machine you reached (repo#458)."
     log "  Do NOT read from or write to this alias: work written through it lands on somebody else's host."
     log "  Fix: re-run 'repo-remote up --yes' to re-resolve the public IP and rewrite the alias, then re-run 'repo-remote verify'."
-    log "  If ${expected} is not the box you meant, correct REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env}."
+    log "  If ${expected} is not the box you meant, correct REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE}."
     log "  --force does NOT override this check (it is the fleet-marker override only)."
     exit 6
   fi
@@ -1010,20 +1118,69 @@ aws_resolve_or_create_sg() {
   log "created security group ${RESOLVED_SG} (tagged repo-remote=${NAME})"
 }
 
+# Validate an SSH-ingress CIDR before anything is authorized from it
+# (repo#487). Exposure decisions must be DELIBERATE: this tooling refuses any
+# IPv4 prefix wider than REPO_REMOTE_SSH_MIN_PREFIX (default 32 — a single
+# address) and any all-of-IPv6 `::/0`, so a stray `0.0.0.0/0` in a config file
+# cannot quietly open tcp/22 to the internet. REPO_REMOTE_ALLOW_WORLD_SSH=1 is
+# the explicit, loudly-logged escape hatch for an operator who really does
+# want a wider rule (a known ISP block, a bastion-free CI network).
+#
+# Rejection is exit 2 ("invalid required config") rather than 4: the remedy is
+# always a config change, never a retry.
+aws_validate_ssh_cidr() {  # <cidr> <source-label>
+  local cidr="$1" src="$2" prefix min="${SSH_MIN_PREFIX:-32}"
+
+  [[ "$min" =~ ^[0-9]+$ && "$min" -ge 1 && "$min" -le 32 ]] \
+    || die 2 "REPO_REMOTE_SSH_MIN_PREFIX must be an integer from 1 to 32 (got '${min}')"
+
+  if [[ "$cidr" == *:* ]]; then
+    # IPv6. Only a /0 ("the whole internet") is judged here; narrower IPv6
+    # prefixes are passed through unchanged.
+    prefix="${cidr##*/}"
+    [[ "$cidr" == */* && "$prefix" =~ ^[0-9]+$ ]] \
+      || die 2 "${src} is not a valid CIDR: '${cidr}' (expected <address>/<prefix-length>)"
+    [[ "$prefix" -ne 0 ]] && return 0
+    if [[ "${ALLOW_WORLD_SSH:-0}" == 1 ]]; then
+      log "WARNING: REPO_REMOTE_ALLOW_WORLD_SSH=1 — authorizing SSH ingress from ${cidr}, i.e. ALL of IPv6. Every host on the internet may reach tcp/22 on this instance (key-only auth is the only thing left in front of it)."
+      return 0
+    fi
+    die 2 "refusing to authorize SSH ingress from ${cidr} (${src}): that is all of IPv6. Pin a specific address instead, or set REPO_REMOTE_ALLOW_WORLD_SSH=1 to opt in deliberately."
+  fi
+
+  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] \
+    || die 2 "${src} is not a valid IPv4 CIDR: '${cidr}' (expected a.b.c.d/0-32)"
+  prefix="${cidr##*/}"
+  [[ "$prefix" -ge "$min" ]] && return 0
+
+  if [[ "${ALLOW_WORLD_SSH:-0}" == 1 ]]; then
+    local scope=""
+    [[ "$cidr" == "0.0.0.0/0" ]] && scope="That is the ENTIRE INTERNET. "
+    log "WARNING: REPO_REMOTE_ALLOW_WORLD_SSH=1 — authorizing SSH ingress from ${cidr}, which is WIDER than the /${min} minimum (REPO_REMOTE_SSH_MIN_PREFIX). ${scope}Key-only auth is the only thing left in front of tcp/22 on this instance."
+    return 0
+  fi
+  die 2 "refusing to authorize SSH ingress from ${cidr} (${src}): /${prefix} is wider than the required /${min} minimum (REPO_REMOTE_SSH_MIN_PREFIX). Pin a narrower CIDR, raise REPO_REMOTE_SSH_MIN_PREFIX deliberately, or set REPO_REMOTE_ALLOW_WORLD_SSH=1 to opt in to the wider rule."
+}
+
 # Resolve the CIDR to authorize for SSH ingress into RESOLVED_SSH_CIDR. An
-# explicit REPO_REMOTE_SSH_CIDR always wins (including an explicit 0.0.0.0/0
-# opt-in). Otherwise a best-effort current-IP lookup via an HTTPS echo service
-# is treated as UNVERIFIED: there is no reliable way for this script to
-# confirm the detected address is the one SSH egress will actually use —
-# behind an HTTPS proxy it commonly isn't (the reported incident: the echo
-# service returned the proxy's address, not the SSH egress address, producing
-# a correct-looking /32 that could never match). When detection itself fails
-# outright, fall back to 0.0.0.0/0 (SSH stays key-only auth, so this is a
-# scan-noise tradeoff, not an auth bypass) with an explicit notice rather than
-# silently creating a /32 that can never match.
+# explicit REPO_REMOTE_SSH_CIDR always wins — after validation (see
+# aws_validate_ssh_cidr). Otherwise a best-effort current-IP lookup via an
+# HTTPS echo service is treated as UNVERIFIED: there is no reliable way for
+# this script to confirm the detected address is the one SSH egress will
+# actually use — behind an HTTPS proxy it commonly isn't (the reported
+# incident: the echo service returned the proxy's address, not the SSH egress
+# address, producing a correct-looking /32 that could never match).
+#
+# When detection itself fails outright this FAILS CLOSED (repo#487): returns 1
+# with RESOLVED_SSH_CIDR left empty and lets the caller decide. It must never
+# fall back to 0.0.0.0/0 — a single flaky HTTPS call is not consent to open
+# tcp/22 to the internet, and a consumer auditing its security groups cannot
+# tell an accidental opening from a deliberate one.
 RESOLVED_SSH_CIDR=""
 aws_resolve_ssh_cidr() {
+  RESOLVED_SSH_CIDR=""
   if [[ -n "${SSH_CIDR:-}" ]]; then
+    aws_validate_ssh_cidr "$SSH_CIDR" "REPO_REMOTE_SSH_CIDR"
     RESOLVED_SSH_CIDR="$SSH_CIDR"
     log "using REPO_REMOTE_SSH_CIDR override for SSH ingress: ${RESOLVED_SSH_CIDR}"
     return 0
@@ -1033,23 +1190,85 @@ aws_resolve_ssh_cidr() {
   url="${REPO_REMOTE_IP_ECHO_URL:-https://checkip.amazonaws.com}"
   ip="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')"
   if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    aws_validate_ssh_cidr "${ip}/32" "the detected current IP"
     RESOLVED_SSH_CIDR="${ip}/32"
     log "detected current IP ${ip} via ${url} for SSH ingress (unverified — behind an HTTPS proxy this can be a different address than the one SSH egress actually uses; if SSH cannot connect afterward, set REPO_REMOTE_SSH_CIDR explicitly)"
-  else
-    RESOLVED_SSH_CIDR="0.0.0.0/0"
-    log "NOTICE: could not detect current IP via ${url}; falling back to SSH ingress from 0.0.0.0/0 (SSH remains key-only auth). Set REPO_REMOTE_SSH_CIDR to pin a specific CIDR instead."
+    return 0
   fi
+  return 1
 }
 
-# Idempotently authorize tcp/22 from the resolved CIDR. A duplicate rule on a
-# reused security group is success, not an error.
+# The single message every fail-closed detection failure prints (repo#487), so
+# the create and reuse paths cannot drift in what they tell the operator.
+aws_die_no_ssh_cidr() {
+  die 2 "could not detect the current IP via ${REPO_REMOTE_IP_ECHO_URL:-https://checkip.amazonaws.com}, so there is no address to authorize SSH ingress from. Refusing to fall back to 0.0.0.0/0. Set REPO_REMOTE_SSH_CIDR to the address you connect from (e.g. REPO_REMOTE_SSH_CIDR=203.0.113.7/32) and re-run."
+}
+
+# Every tcp/22 rule this tooling writes carries a Description marked with this
+# prefix (repo#487), so an audit can trace each rule to its owner and so the
+# refresh below knows which rules are ITS OWN and may be replaced. A rule
+# without this marker was added by somebody else and is never touched.
+ssh_rule_marker_prefix() { printf 'repo-remote:%s:' "$NAME"; }
+ssh_rule_description()   { printf 'repo-remote:%s:%s' "$NAME" "$(date -u +%Y-%m-%d)"; }
+
+# Idempotently authorize tcp/22 from the resolved CIDR, labelled with the
+# owner marker. A duplicate rule on a reused security group is success, not an
+# error. --ip-permissions (rather than the simpler --protocol/--port/--cidr
+# trio) is required because only that form can carry a per-rule Description.
 aws_authorize_ssh_ingress() {  # <sg-id> <cidr>
-  local sg="$1" cidr="$2" out rc
-  out="$(aws ec2 authorize-security-group-ingress \
-    --group-id "$sg" --protocol tcp --port 22 --cidr "$cidr" 2>&1)"; rc=$?
+  local sg="$1" cidr="$2" out rc desc
+  desc="$(ssh_rule_description)"
+  out="$(aws ec2 authorize-security-group-ingress --group-id "$sg" \
+    --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${cidr},Description=${desc}}]" 2>&1)"; rc=$?
   if [[ $rc -ne 0 ]] && ! printf '%s' "$out" | grep -q 'InvalidPermission.Duplicate'; then
     die 4 "aws ec2 authorize-security-group-ingress failed for ${sg} (tcp/22 from ${cidr}): ${out:-unknown error}"
   fi
+}
+
+# List the CIDRs of tcp/22 rules on <sg> that THIS tooling wrote (their
+# Description starts with the repo-remote:<name>: marker), one per line.
+# Rules with any other Description — or none at all — are somebody else's and
+# are deliberately excluded.
+#
+# Two non-obvious details in the JMESPath, both load-bearing:
+#   * the `| ` pipe STOPS the `IpRanges[]` projection before the filter. Without
+#     it the filter is applied element-wise to each IpRange *object* (which is
+#     not a list), so the query silently matches nothing at all.
+#   * `Description != null &&` short-circuits before starts_with(). A rule with
+#     no Description is extremely common on a real group, and starts_with(null)
+#     is a hard JMESPathTypeError that fails the whole describe call.
+aws_tool_owned_ssh_cidrs() {  # <sg-id>
+  local sg="$1" marker
+  marker="$(ssh_rule_marker_prefix)"
+  aws ec2 describe-security-groups --group-ids "$sg" \
+    --query "SecurityGroups[0].IpPermissions[?ToPort==\`22\`].IpRanges[] | [?Description != null && starts_with(Description, '${marker}')].CidrIp" \
+    --output text 2>/dev/null \
+    | tr '[:space:]' '\n' | grep -vE '^(None)?$' || true
+}
+
+# Replace, don't accumulate (repo#487). Each `up` from a new address used to
+# ADD a /32 and never remove the old one, so a group roamed across a few weeks
+# of coffee shops ended up admitting every address the operator had ever had.
+# Revoke this tooling's OWN earlier tcp/22 rules before authorizing the
+# current address; keep <keep-cidr> (the rule we are about to authorize) so a
+# repeat run from the same address doesn't flap it.
+#
+# Best-effort by design: a failed revoke is a loud NOTICE, not a fatal error.
+# It leaves a stale-but-narrow rule in place (never a wider one), and an
+# operator whose credentials lack RevokeSecurityGroupIngress should still be
+# able to provision.
+aws_revoke_stale_ssh_ingress() {  # <sg-id> <keep-cidr>
+  local sg="$1" keep="$2" cidr out rc
+  while read -r cidr; do
+    [[ -n "$cidr" && "$cidr" != "$keep" ]] || continue
+    out="$(aws ec2 revoke-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${cidr}}]" 2>&1)"; rc=$?
+    if [[ $rc -ne 0 ]]; then
+      log "NOTICE: could not revoke this tooling's stale SSH ingress rule (tcp/22 from ${cidr}) on ${sg}: ${out:-unknown error}. It is left in place; revoke it by hand with: aws ec2 revoke-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr ${cidr}"
+    else
+      log "revoked this tooling's stale SSH ingress rule on ${sg} (tcp/22 from ${cidr}) — superseded by ${keep}"
+    fi
+  done < <(aws_tool_owned_ssh_cidrs "$sg")
 }
 
 # Post-authorize verification — this is what would have caught the reported
@@ -1100,7 +1319,15 @@ aws_verify_ssh_ingress() {  # <sg-id>
 #
 # --no-create also never WIDENS an existing rule on a failed IP detection — see
 # the inline note below. Refreshing ingress on reuse must not be able to turn a
-# working /32 into 0.0.0.0/0 just because an echo service was unreachable.
+# working /32 into 0.0.0.0/0 just because an echo service was unreachable. Since
+# repo#487 NO path can do that: a failed detection resolves to nothing at all
+# and the run fails closed (exit 2) unless there is already a rule to preserve.
+#
+# The chain also REPLACES rather than accumulates (repo#487): every rule this
+# tooling writes is labelled `repo-remote:<name>:<date>`, and the labelled rules
+# from earlier runs are revoked before the current address is authorized, so a
+# roaming laptop can no longer leave a group admitting every address it ever
+# had. Rules without that label belong to somebody else and are never touched.
 aws_refresh_ssh_ingress() {  # [--no-create]
   if [[ "${1:-}" == "--no-create" ]]; then
     local sg="${REPO_REMOTE_SECURITY_GROUP:-}"
@@ -1110,23 +1337,26 @@ aws_refresh_ssh_ingress() {  # [--no-create]
       return 0
     fi
     RESOLVED_SG="$sg"
-    aws_resolve_ssh_cidr                                # sets RESOLVED_SSH_CIDR
-    # Reuse must never WIDEN exposure. A 0.0.0.0/0 that came from *failed*
-    # detection (rather than an explicit REPO_REMOTE_SSH_CIDR opt-in) is the
-    # documented least-bad tradeoff when CREATING — the alternative is a brand
-    # new box nobody can reach. On reuse the group normally already admits SSH
-    # from an earlier run, so applying that fallback here would be a pure
-    # exposure increase on a path that previously touched ingress at all. So:
-    # if the rule is already there, leave it exactly as it is and say so.
-    if [[ -z "${SSH_CIDR:-}" && "$RESOLVED_SSH_CIDR" == "0.0.0.0/0" ]] \
-       && aws_has_ssh_ingress "$RESOLVED_SG"; then
-      log "NOTICE: current-IP detection failed, so SSH ingress on ${RESOLVED_SG} was left EXACTLY as it is rather than widened to 0.0.0.0/0 for this reused instance. If SSH cannot connect, set REPO_REMOTE_SSH_CIDR to the address you are connecting from and re-run."
-      return 0
+    # Reuse must never WIDEN exposure, and since repo#487 no path widens on a
+    # failed detection at all — detection failure resolves to NOTHING rather
+    # than to 0.0.0.0/0. On reuse the group normally already admits SSH from an
+    # earlier run, so the right move is to leave that rule exactly as it is and
+    # say so; only a group with no tcp/22 rule at all (nothing to preserve, and
+    # nothing this run can safely invent) is a hard failure.
+    if ! aws_resolve_ssh_cidr; then
+      if aws_has_ssh_ingress "$RESOLVED_SG"; then
+        log "NOTICE: current-IP detection failed, so SSH ingress on ${RESOLVED_SG} was left EXACTLY as it is rather than changed for this reused instance. If SSH cannot connect, set REPO_REMOTE_SSH_CIDR to the address you are connecting from and re-run."
+        return 0
+      fi
+      aws_die_no_ssh_cidr
     fi
   else
     aws_resolve_or_create_sg                            # sets RESOLVED_SG
-    aws_resolve_ssh_cidr                                # sets RESOLVED_SSH_CIDR
+    aws_resolve_ssh_cidr || aws_die_no_ssh_cidr         # sets RESOLVED_SSH_CIDR
   fi
+  # Replace, don't accumulate: drop this tooling's own earlier /32s first
+  # (repo#487), then authorize the address actually in use now.
+  aws_revoke_stale_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
   aws_authorize_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
   aws_verify_ssh_ingress "$RESOLVED_SG"
 }
@@ -1426,7 +1656,7 @@ aws_verify() {
       src="discovered via the repo-remote=${NAME} tag"
     fi
   fi
-  [[ -n "$expected" ]] || die 2 "nothing to verify against: REPO_REMOTE_INSTANCE_ID is not set and no instance is tagged repo-remote=${NAME}. Pin REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env} (the recommended configuration for any session that outlives a stop/start), or run 'repo-remote up --yes' to provision one."
+  [[ -n "$expected" ]] || die 2 "nothing to verify against: REPO_REMOTE_INSTANCE_ID is not set and no instance is tagged repo-remote=${NAME}. Pin REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE} (the recommended configuration for any session that outlives a stop/start), or run 'repo-remote up --yes' to provision one."
 
   local alias="repo-remote-${NAME}"
   verify_host_identity "$alias" "$expected" "$src" strict
@@ -1606,11 +1836,48 @@ gcp_down() {
 }
 
 # ── write-back + SSH alias ──────────────────────────────────────────────────
-# Write the new instance id back to the repo's .env (git root, never the shared
-# file — the handle is per-repo), updating in place or appending. remote.md §4.
+# Write the new instance id back to the per-repo config file (REPO_ENV: the
+# REPO_REMOTE_ENV_FILE override, else <git-root>/.env -- never the shared file,
+# the handle is per-repo), updating in place or appending. remote.md §4.
+#
+# repo#492: this never CREATES <git-root>/.env. Some repos forbid any in-tree
+# `.env` (worktrees get copied around; a gitignored file is one `git add -f`
+# from leaking), and GIT_ROOT is the worktree root, so an unconditional append
+# littered every worktree. The rule:
+#   REPO_REMOTE_NO_WRITEBACK=1       -> write nothing; log the id + pin hint
+#   REPO_REMOTE_ENV_FILE set         -> write there (created, with its parent
+#                                       dir, if missing)
+#   <git-root>/.env already exists   -> write there (unchanged behavior; from
+#                                       a linked worktree it warns first,
+#                                       repo#538)
+#   otherwise                        -> write nothing; log the id + pin hint
+# Not writing is safe: the instance also carries the repo-remote=<name> tag, so
+# the next `up` still finds it; the pin is the stronger, recommended handle.
 writeback_instance_id() {  # <instance-id>
   local id="$1"
-  [[ -n "$REPO_ENV" ]] || return 0
+  if [[ "${REPO_REMOTE_NO_WRITEBACK:-}" == 1 ]]; then
+    log "instance id: ${id} (not written back: REPO_REMOTE_NO_WRITEBACK=1)."
+    log "  Pin it yourself with REPO_REMOTE_INSTANCE_ID=${id} in your per-repo config."
+    return 0
+  fi
+  if [[ -z "$REPO_ENV" ]]; then
+    log "instance id: ${id} (no git root, so not written back; pin REPO_REMOTE_INSTANCE_ID=${id} yourself)."
+    return 0
+  fi
+  if [[ "$REPO_ENV_OVERRIDDEN" != true && ! -f "$REPO_ENV" ]]; then
+    log "instance id: ${id} (not written back: ${REPO_ENV} does not exist, and it is never created automatically)."
+    log "  Pin it with REPO_REMOTE_INSTANCE_ID=${id} in ${REPO_ENV}, or set REPO_REMOTE_ENV_FILE to an out-of-tree file to have it written there."
+    return 0
+  fi
+  if [[ ! -f "$REPO_ENV" ]] && ! mkdir -p "$(dirname "$REPO_ENV")" 2>/dev/null; then
+    log "WARNING: could not create the directory for ${REPO_ENV}; pin REPO_REMOTE_INSTANCE_ID=${id} yourself."
+    return 0
+  fi
+  # repo#538: the pre-existing in-tree .env branch, from a linked worktree --
+  # warn loudly, then write (a repo that deliberately keeps one is not broken).
+  if [[ "$REPO_ENV_OVERRIDDEN" != true && "$IN_LINKED_WORKTREE" == true ]]; then
+    warn_worktree_env write
+  fi
   if [[ -f "$REPO_ENV" ]] && grep -q '^REPO_REMOTE_INSTANCE_ID=' "$REPO_ENV"; then
     local tmp; tmp="$(mktemp)"
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1624,6 +1891,7 @@ writeback_instance_id() {  # <instance-id>
   else
     printf 'REPO_REMOTE_INSTANCE_ID=%s\n' "$id" >>"$REPO_ENV"
   fi
+  log "wrote REPO_REMOTE_INSTANCE_ID=${id} to ${REPO_ENV}."
 }
 
 # ── SSH alias lock (repo#213) ───────────────────────────────────────────────
