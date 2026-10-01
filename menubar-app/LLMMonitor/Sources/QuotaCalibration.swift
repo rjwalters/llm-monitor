@@ -1136,12 +1136,19 @@ enum QuotaCalibration {
     /// back into midnight UTC of that day. `nil` for anything not in that
     /// exact shape.
     static func parseUTCDay(_ day: String) -> Date? {
+        utcDayFormatter.date(from: day)
+    }
+
+    /// Built once, as `utcDayString` runs per `usage_history` row in
+    /// `dailyPoints`. Never mutated after initialization, and `DateFormatter`
+    /// is thread-safe for formatting/parsing, hence `nonisolated(unsafe)`.
+    nonisolated(unsafe) private static let utcDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: day)
-    }
+        return formatter
+    }()
 
     /// `YYYY-MM-DD` in UTC. Pinned to `en_US_POSIX` and GMT rather than left to
     /// the ambient locale/calendar: the day boundary here is a wire contract
@@ -1149,11 +1156,7 @@ enum QuotaCalibration {
     /// choice, and a non-Gregorian device calendar would otherwise silently
     /// rekey the whole series.
     static func utcDayString(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        utcDayFormatter.string(from: date)
     }
 
     /// ISO 8601, whole seconds, UTC — the shape `usage_history.timestamp`

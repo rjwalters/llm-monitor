@@ -130,10 +130,20 @@ struct UsageRecord: Identifiable {
     /// fractional seconds).
     static func parseISO(_ string: String?) -> Date? {
         guard let string = string, !string.isEmpty else { return nil }
+        return isoFractional.date(from: string) ?? isoWholeSeconds.date(from: string)
+    }
+
+    // Built once: this is called per row over ~10^5-row tables (transcript
+    // import, quota calibration), and constructing a formatter per call cost
+    // ~1.75 cores at launch, mostly contending on ICU's global lock.
+    // `nonisolated(unsafe)` because the formatters are never mutated after
+    // initialization and their parsing is thread-safe in Foundation.
+    nonisolated(unsafe) private static let isoFractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
-    }
+        return formatter
+    }()
+    nonisolated(unsafe) private static let isoWholeSeconds = ISO8601DateFormatter()
 
     /// Compact state of the extra-usage balance for display. `.percent` carries
     /// a remaining figure only when the balance is actually metered (>0 used).
