@@ -453,6 +453,37 @@ func tokenStatusRank(_ status: TokenStatus) -> Int {
     }
 }
 
+/// Drag strip along the popover's bottom edge that sets a manual height
+/// (`PopoverHeightManager.dragChanged`); double-click returns to auto-fit.
+struct PopoverResizeHandle: View {
+    @ObservedObject var heightManager: PopoverHeightManager
+    @State private var isHovering = false
+
+    var body: some View {
+        Capsule()
+            .fill(Color.secondary.opacity(isHovering ? 0.6 : 0.3))
+            .frame(width: 36, height: 4)
+            .frame(maxWidth: .infinity)
+            .frame(height: 8)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    NSCursor.resizeUpDown.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { _ in heightManager.dragChanged() }
+                    .onEnded { _ in heightManager.dragEnded() }
+            )
+            .onTapGesture(count: 2) { heightManager.resetToFit() }
+            .help("Drag to resize · double-click to fit")
+    }
+}
+
 struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
@@ -745,6 +776,12 @@ struct UsagePopoverView: View {
             .padding(.vertical, 10)
         }
         .frame(width: heightManager.currentWidth, height: heightManager.currentHeight)
+        .overlay(alignment: .bottom) {
+            // Overlaid on the footer's bottom padding so it adds no chrome height.
+            if effectiveRowCount > 0 {
+                PopoverResizeHandle(heightManager: heightManager)
+            }
+        }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             heightManager.setVisibleProviders(visibleProviders)

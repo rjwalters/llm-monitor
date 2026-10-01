@@ -12,7 +12,9 @@ extension CGFloat {
 /// Sizes the popover to hug its content: the window height tracks the number
 /// of account rows so there is no empty space below the table. Height is
 /// clamped to [minHeight, maxHeight]; when rows would exceed maxHeight the row
-/// list scrolls. There is no manual resize — the fit is automatic.
+/// list scrolls. The user can override the fit by dragging the handle on the
+/// popover's bottom edge (`PopoverResizeHandle`); that height persists across
+/// launches, and double-clicking the handle returns to the automatic fit.
 ///
 /// `@MainActor`: it holds an `NSPopover` and mutates its `contentSize` (an
 /// AppKit main-actor API) and is only ever driven from the app's main-thread
@@ -46,6 +48,15 @@ class PopoverHeightManager: ObservableObject {
     @Published var currentWidth: CGFloat = PopoverHeightManager.popoverWidth
     weak var popover: NSPopover?
 
+    private static let userHeightKey = "popoverUserHeight"
+    /// Height the user dragged the popover to, or nil to auto-fit. Only a
+    /// height *below* the content fit is kept: dragging to or past it returns
+    /// to auto-fit, so the popover keeps growing as accounts are added.
+    private var userHeight: CGFloat? = (UserDefaults.standard.object(forKey: PopoverHeightManager.userHeightKey) as? Double).map { CGFloat($0) }
+    private var rowCount = 0
+    private var dragStartHeight: CGFloat?
+    private var dragStartMouseY: CGFloat = 0
+
     /// Recompute the width from the providers now visible in the table.
     func setVisibleProviders(_ providers: Set<AccountProvider>) {
         let w = SummaryColumns.tableWidth(among: providers)
@@ -61,12 +72,78 @@ class PopoverHeightManager: ObservableObject {
         return content.clamped(to: Self.minHeight...Self.maxHeight)
     }
 
-    /// Recompute `currentHeight` from the row count and resize the live popover
-    /// so the window hugs its content.
+    /// Unclamped height that shows every row without scrolling.
+    private func contentHeight(rowCount: Int) -> CGFloat {
+        Self.chromeHeight + CGFloat(rowCount) * Self.rowHeight
+    }
+
+    /// Tallest the user may drag the popover: the screen's usable height,
+    /// less a margin for the menu-bar arrow.
+    private var screenMaxHeight: CGFloat {
+        let screen = popover?.contentViewController?.view.window?.screen ?? NSScreen.main
+        return (screen?.visibleFrame.height ?? Self.maxHeight) - 40
+    }
+
+    /// Popover height for `rowCount` rows: the user's dragged height if set
+    /// (never taller than the content or the screen), else the content fit.
+    func effectiveHeight(rowCount: Int) -> CGFloat {
+        guard rowCount > 0 else { return Self.setupHeight }
+        guard let userHeight else { return fittedHeight(rowCount: rowCount) }
+        let upper = Swift.max(Self.minHeight, Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight))
+        return userHeight.clamped(to: Self.minHeight...upper)
+    }
+
+    /// Recompute `currentHeight` from the row count and resize the live popover.
     func update(rowCount: Int) {
-        let h = fittedHeight(rowCount: rowCount)
+        self.rowCount = rowCount
+        apply()
+    }
+
+    private func apply() {
+        let h = effectiveHeight(rowCount: rowCount)
         if h != currentHeight { currentHeight = h }
         popover?.contentSize = NSSize(width: currentWidth, height: h)
+    }
+
+    // MARK: Manual resize
+
+    /// Drag progress is read from the screen-space mouse position rather than
+    /// the gesture's translation, because the view being dragged is resized
+    /// (and its coordinate space moved) by the drag itself.
+    func dragChanged() {
+        if dragStartHeight == nil {
+            dragStartHeight = currentHeight
+            dragStartMouseY = NSEvent.mouseLocation.y
+            // Content-size changes animate by default, which lags the cursor.
+            popover?.animates = false
+        }
+        guard let start = dragStartHeight else { return }
+        // Screen y grows upward; the popover hangs down from the menu bar.
+        userHeight = start + (dragStartMouseY - NSEvent.mouseLocation.y)
+        apply()
+    }
+
+    func dragEnded() {
+        dragStartHeight = nil
+        popover?.animates = true
+        let reachesContent = currentHeight >= Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight)
+        userHeight = reachesContent ? nil : currentHeight
+        persistUserHeight()
+        apply()
+    }
+
+    func resetToFit() {
+        userHeight = nil
+        persistUserHeight()
+        apply()
+    }
+
+    private func persistUserHeight() {
+        if let userHeight {
+            UserDefaults.standard.set(Double(userHeight), forKey: Self.userHeightKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.userHeightKey)
+        }
     }
 }
 
@@ -183,7 +260,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create popover
         popover = NSPopover()
         heightManager.setVisibleProviders(Set(usageStore.accounts.map(\.provider)))
-        popover?.contentSize = NSSize(width: heightManager.currentWidth, height: heightManager.fittedHeight(rowCount: usageStore.accounts.count))
+        popover?.contentSize = NSSize(width: heightManager.currentWidth, height: heightManager.effectiveHeight(rowCount: usageStore.accounts.count))
         // .semitransient keeps the popover open while user interacts with other
         // windows in this app (e.g. multiple chart windows launched from rows).
         popover?.behavior = .semitransient
