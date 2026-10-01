@@ -441,7 +441,7 @@ final class ResizeHandleView: NSView {
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
+        for area in trackingAreas { removeTrackingArea(area) }
         // `.activeAlways`: the popover's window is rarely key, and the default
         // (key-window-only) tracking would never update the cursor.
         addTrackingArea(NSTrackingArea(
