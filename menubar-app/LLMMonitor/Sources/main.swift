@@ -59,6 +59,9 @@ class PopoverHeightManager: ObservableObject {
     private var rowCount = 0
     private var dragStartHeight: CGFloat?
     private var dragStartMouseY: CGFloat = 0
+    /// The popover content's screen rect when the drag began.
+    private var dragAnchor: NSRect = .zero
+    private var outlineWindow: ResizeOutlineWindow?
 
     /// Recompute the width from the providers now visible in the table.
     func setVisibleProviders(_ providers: Set<AccountProvider>) {
@@ -92,8 +95,13 @@ class PopoverHeightManager: ObservableObject {
     func effectiveHeight(rowCount: Int) -> CGFloat {
         guard rowCount > 0 else { return Self.setupHeight }
         guard let userHeight else { return fittedHeight(rowCount: rowCount) }
+        return clampedUserHeight(userHeight)
+    }
+
+    /// A user-chosen height limited to [minHeight, min(content, screen)].
+    private func clampedUserHeight(_ height: CGFloat) -> CGFloat {
         let upper = Swift.max(Self.minHeight, Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight))
-        return userHeight.clamped(to: Self.minHeight...upper)
+        return height.clamped(to: Self.minHeight...upper)
     }
 
     /// Recompute `currentHeight` from the row count and resize the live popover.
@@ -105,46 +113,52 @@ class PopoverHeightManager: ObservableObject {
     private func apply() {
         let size = NSSize(width: currentWidth, height: effectiveHeight(rowCount: rowCount))
         currentHeight = size.height
-        guard let popover, popover.contentSize != size else { return }
-        if dragStartHeight != nil {
-            // Mid-drag: apply each step instantly. `NSPopover` otherwise
-            // animates content-size changes, which lags behind the cursor.
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0
-                context.allowsImplicitAnimation = false
-                popover.contentSize = size
-            }
-        } else {
-            popover.contentSize = size
-        }
+        if popover?.contentSize != size { popover?.contentSize = size }
     }
 
     // MARK: Manual resize
 
-    /// Driven by `ResizeHandleView`'s mouse-tracking loop. Progress is read
-    /// from the screen-space mouse position, because the view being dragged is
-    /// resized (and its coordinate space moved) by the drag itself.
+    /// Driven by `ResizeHandleView`'s mouse-tracking loop. The popover itself
+    /// is resized once, on mouse-up: re-laying out the popover (every row and
+    /// its tooltips, over a blurred background) on each mouse event cannot
+    /// keep up with the cursor. During the drag an outline window shows the
+    /// new size instead, which is cheap to move.
     func beginDrag() {
         dragStartHeight = currentHeight
         dragStartMouseY = NSEvent.mouseLocation.y
-        popover?.animates = false
+        guard let view = popover?.contentViewController?.view, let window = view.window else { return }
+        dragAnchor = window.convertToScreen(view.convert(view.bounds, to: nil))
+        let outline = ResizeOutlineWindow()
+        outline.setFrame(dragAnchor, display: true)
+        outline.orderFront(nil)
+        outlineWindow = outline
     }
 
     func drag() {
-        guard let start = dragStartHeight else { return }
-        // Screen y grows upward; the popover hangs down from the menu bar.
-        userHeight = start + (dragStartMouseY - NSEvent.mouseLocation.y)
-        apply()
+        guard let candidate = dragCandidateHeight() else { return }
+        // Keep the top edge (under the menu bar) fixed; grow downward.
+        outlineWindow?.setFrame(
+            NSRect(x: dragAnchor.minX, y: dragAnchor.maxY - candidate, width: dragAnchor.width, height: candidate),
+            display: true
+        )
     }
 
     func endDrag() {
-        guard dragStartHeight != nil else { return }
+        guard let candidate = dragCandidateHeight() else { return }
         dragStartHeight = nil
-        popover?.animates = true
-        let reachesContent = currentHeight >= Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight)
-        userHeight = reachesContent ? Self.showAllRows : currentHeight
+        outlineWindow?.orderOut(nil)
+        outlineWindow = nil
+        let reachesContent = candidate >= Swift.min(contentHeight(rowCount: rowCount), screenMaxHeight)
+        userHeight = reachesContent ? Self.showAllRows : candidate
         persistUserHeight()
         apply()
+    }
+
+    /// The height the current mouse position asks for, clamped. Screen y grows
+    /// upward and the popover hangs down from the menu bar, hence the sign.
+    private func dragCandidateHeight() -> CGFloat? {
+        guard let start = dragStartHeight else { return nil }
+        return clampedUserHeight(start + (dragStartMouseY - NSEvent.mouseLocation.y))
     }
 
     func resetToFit() {
@@ -158,6 +172,31 @@ class PopoverHeightManager: ObservableObject {
             UserDefaults.standard.set(Double(userHeight), forKey: Self.userHeightKey)
         } else {
             UserDefaults.standard.removeObject(forKey: Self.userHeightKey)
+        }
+    }
+}
+
+/// Click-through outline previewing the popover's new size during a resize drag.
+final class ResizeOutlineWindow: NSWindow {
+    init() {
+        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        ignoresMouseEvents = true
+        isReleasedWhenClosed = false
+        level = .popUpMenu
+        contentView = OutlineView()
+    }
+
+    private final class OutlineView: NSView {
+        override func draw(_ dirtyRect: NSRect) {
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 8, yRadius: 8)
+            NSColor.controlAccentColor.withAlphaComponent(0.08).setFill()
+            path.fill()
+            NSColor.controlAccentColor.setStroke()
+            path.lineWidth = 2
+            path.stroke()
         }
     }
 }
