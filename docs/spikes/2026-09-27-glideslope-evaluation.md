@@ -1,5 +1,7 @@
 # Spike: glideslope as a reference implementation (2026-09-27)
 
+> **Outcome (2026-10-01):** the even-burn ◆ mark recommended in §1 shipped in #224 (#220) and was then removed at the operator's request — it was not wanted in the UI. Do not re-adopt it without an explicit ask.
+
 **Question.** Does [Stage-11-Agentics/glideslope](https://github.com/Stage-11-Agentics/glideslope)
 do anything llm-monitor should adopt? (#219)
 
