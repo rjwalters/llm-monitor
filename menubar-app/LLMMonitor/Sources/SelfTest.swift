@@ -1114,6 +1114,17 @@ enum SelfTest {
                "an unparseable document is no report")
         expect(LoomAccountsCheck.decode(Data(#"{"workspace":"/x"}"#.utf8)) == nil,
                "a document with no accounts array is no report")
+
+        // The idle-row reason phrases: known codes read as plain English, an
+        // unknown one passes through rather than being guessed at.
+        expectEqual(LoomAccountsCheck.describe(detail: "session_unavailable"), "session container stopped",
+                    "describe: session_unavailable")
+        expectEqual(LoomAccountsCheck.describe(detail: "not_logged_in"), "profile not logged in",
+                    "describe: not_logged_in")
+        expectEqual(LoomAccountsCheck.describe(detail: "some_new_code"), "some new code",
+                    "describe: unknown codes pass through, spaced")
+        expectEqual(LoomAccountsCheck.describe(detail: nil), nil, "describe: no detail, no phrase")
+        expectEqual(LoomAccountsCheck.describe(detail: "  "), nil, "describe: blank detail, no phrase")
     }
 
     /// `loom-daemon` resolution + the workspace rule, and the fallback when the

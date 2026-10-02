@@ -208,6 +208,22 @@ enum LoomAccountsCheck {
         }
     }
 
+    /// A short, operator-facing phrase for why the live check measured
+    /// nothing (`Reading.detail`), shown beside a stale Codex row so a blank
+    /// row says *why* it is blank. Unknown codes are passed through verbatim
+    /// with underscores spaced out, rather than guessed at.
+    static func describe(detail: String?) -> String? {
+        guard let detail = detail?.trimmingCharacters(in: .whitespaces), !detail.isEmpty else { return nil }
+        switch detail {
+        case "session_unavailable": return "session container stopped"
+        case "not_logged_in": return "profile not logged in"
+        case "no_rate_limit_snapshot": return "no Codex activity recorded"
+        case "disabled": return "account disabled in Loom"
+        case "rate_limits_unsupported_by_codex_cli": return "Codex CLI too old to report limits"
+        default: return detail.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+
     // MARK: - Decoding
 
     /// Decode one `--json` document. Pure, so `selftest` drives it offline over
