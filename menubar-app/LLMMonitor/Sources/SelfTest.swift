@@ -82,6 +82,7 @@ enum SelfTest {
         testOpenAIUsageResponseMapping()
         testOpenAIRawFieldRedaction()
         testOpenAITokenExpiryParsing()
+        testInstanceLock()
         testZaiQuotaResponseMapping()
         testZaiKeyFileParsing()
         testDataDirectoryMigration()
@@ -1378,6 +1379,56 @@ enum SelfTest {
             "currentValue":140045,"remaining":0,"percentage":100,"nextResetTime":1790617927983},
            {"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":40,"percentage":1}]}}
         """
+
+    /// The single-instance primitive (#238): acquire → second acquire refused →
+    /// release → acquire succeeds. A second `open` in the same process is a
+    /// distinct file description, so `flock` contends exactly as it would
+    /// across processes.
+    private static func testInstanceLock() {
+        withSelfTestTempDir("instance-lock") { dir in
+            let path = dir.appendingPathComponent("nested/instance.lock").path
+
+            guard case .acquired(let first) = InstanceLock.acquire(at: path) else {
+                expect(false, "first acquire of an unheld lock succeeds (creating its directory)")
+                return
+            }
+            let recorded = (try? String(contentsOfFile: path, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            expectEqual(recorded, "\(ProcessInfo.processInfo.processIdentifier)", "holder writes its pid (diagnostic only)")
+
+            switch InstanceLock.acquire(at: path) {
+            case .alreadyRunning(let pid):
+                expectEqual(pid, ProcessInfo.processInfo.processIdentifier, "refusal reports the holder's pid")
+            default:
+                expect(false, "second acquire while held is refused")
+            }
+            let message = InstanceLock.alreadyRunningMessage(pid: ProcessInfo.processInfo.processIdentifier, mode: "poll loop")
+            expect(message.contains("already running") && message.hasSuffix("\n"),
+                   "refusal message says the app is already running")
+
+            first.release()
+            guard case .acquired(let second) = InstanceLock.acquire(at: path) else {
+                expect(false, "acquire succeeds again after release")
+                return
+            }
+            // A lock that is dropped without release() must free itself too
+            // (the kernel does the same when a holder dies).
+            _ = second
+        }
+        withSelfTestTempDir("instance-lock-dealloc") { dir in
+            let path = dir.appendingPathComponent("instance.lock").path
+            do {
+                guard case .acquired = InstanceLock.acquire(at: path) else {
+                    expect(false, "acquire in a fresh directory succeeds")
+                    return
+                }
+            }
+            guard case .acquired = InstanceLock.acquire(at: path) else {
+                expect(false, "a dropped lock releases on deinit")
+                return
+            }
+        }
+    }
 
     private static func testZaiQuotaResponseMapping() {
         expectEqual(AccountProvider(stored: "zai"), .zai, "stored 'zai' parses to .zai")
