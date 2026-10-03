@@ -989,6 +989,18 @@ class OAuthPoller: ObservableObject {
         return report.reading(forProfile: profile).flatMap { $0.hasMeasurement ? $0 : nil }
     }
 
+    /// Why the last live check measured nothing for a profile home
+    /// (`session_unavailable`, `not_logged_in`, …), or nil when it measured
+    /// the profile or never reported on it. Display-only: the row uses it to
+    /// say why it is blank, never to decide what to poll.
+    func loomCodexLiveDetail(home: String) -> String? {
+        let profile = (home as NSString).lastPathComponent
+        guard !profile.isEmpty else { return nil }
+        let report = LoomAccountsCheck.Report(observedAt: .distantPast, readings: loomLiveReadings)
+        guard let reading = report.reading(forProfile: profile), !reading.hasMeasurement else { return nil }
+        return reading.detail
+    }
+
     /// Test seam: inject a live report without spawning `loom-daemon`.
     /// `SelfTest` uses it to drive `pollCodexSnapshot`'s newer-wins rule
     /// offline, the same way it drives the snapshot path directly.
