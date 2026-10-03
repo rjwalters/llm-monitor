@@ -237,6 +237,7 @@ enum LLMMonitorEntry {
             FileHandle.standardError.write(Data("--once/--interval require --headless on macOS, e.g. `LLMMonitor --headless --once`\n".utf8))
             exit(2)
         } else {
+            InstanceLock.enforceSingleInstance(mode: "instance")
             LLMMonitorApp.main()
         }
     }

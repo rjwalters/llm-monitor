@@ -29,6 +29,9 @@ enum HeadlessRunner {
             exit(0)
         }
 
+        // Only the poll loop is exclusive: --help/--version above stay free.
+        InstanceLock.enforceSingleInstance(mode: "poll loop")
+
         let once = args.contains("--once")
 
         var pollInterval: TimeInterval? = nil
