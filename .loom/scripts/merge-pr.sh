@@ -975,7 +975,8 @@ _check_loom_pr_label
 # The `merge-pr >=` floor above covers the whole subcommand group, including
 # #8191's post-merge porcelain lookups (`merge-pr worktree-primary` /
 # `worktree-branch-for` / `worktree-find-by-branch`, see _mp_worktree, plus the
-# --worktree-path parse-time `worktree-contains` check), and it is
+# --worktree-path parse-time `worktree-contains` check and the `remove-gate`
+# primary/sentinel guard, which fails CLOSED to a refused removal), and it is
 # deliberately NOT raised to their landing version. Raising it refuses the MERGE
 # on every host one release behind — the 2026-09-18 incident above — whereas a
 # daemon missing only those leaf verbs declines post-merge CLEANUP: the two
@@ -2768,21 +2769,23 @@ _remove_loom_worktree() {
   # guard did not run, and a guard that did not run must refuse the removal
   # rather than wave it through. Skipped cleanup is always recoverable
   # (loom-clean, the daemon's reaper); removing the primary checkout is not.
-  local primary_real
-  if ! primary_real="$(_primary_worktree_path)"; then
-    warning "Refusing to remove worktree at $worktree_real — the primary-worktree guard (#3710) could not run: 'loom-daemon merge-pr worktree-primary' failed, so whether this path IS the primary checkout is unknown. Best-effort cleanup only; the merge itself already succeeded and is unaffected. Remove it by hand once loom-daemon is available, if it really is a worktree: git -C \"$REPO_ROOT\" worktree remove \"$worktree_real\" --force $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)")"; return 0
+  # The decision itself — the primary comparison, the sentinel test, the
+  # --worktree-path bypass and their message text — is `loom-daemon merge-pr
+  # remove-gate` (Rust, loom-daemon/src/merge_pr/remove_gate.rs, #8191 slice).
+  # The `git worktree list` call stays here. Fails CLOSED: a gate that did not
+  # run (missing/older daemon, off-protocol first line) refuses the removal
+  # rather than waving it through.
+  local gate verdict gate_rc=0 level text
+  gate="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | _mp_worktree remove-gate --path "$worktree_path" --real "$worktree_real" --allow-unmanaged "$allow_unmanaged")" || gate_rc=$?
+  verdict="${gate%%$'\n'*}"
+  if [[ $gate_rc -ne 0 || ( "$verdict" != "LOOM-REMOVE-GATE PROCEED" && "$verdict" != "LOOM-REMOVE-GATE REFUSE" ) ]]; then
+    warning "Refusing to remove worktree at $worktree_real — the primary-worktree guard (#3710) could not run: 'loom-daemon merge-pr remove-gate' failed, so whether this path IS the primary checkout is unknown. Best-effort cleanup only; the merge itself already succeeded and is unaffected. Remove it by hand once loom-daemon is available, if it really is a worktree: git -C \"$REPO_ROOT\" worktree remove \"$worktree_real\" --force $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)")"; return 0
   fi
-  if [[ -n "$primary_real" ]] && [[ "$worktree_real" == "$primary_real" ]]; then
-    warning "Refusing to remove the primary/main worktree at $worktree_real (never removable regardless of .loom-managed sentinel, branch, or worktree.root)"
-    return 0
-  fi
-  if [[ "$allow_unmanaged" != "true" ]] && [[ ! -f "$worktree_path/.loom-managed" ]]; then
-    warning "Worktree at $worktree_path lacks .loom-managed sentinel — refusing to remove (user-owned)"
-    return 0
-  fi
-  if [[ "$allow_unmanaged" == "true" ]] && [[ ! -f "$worktree_path/.loom-managed" ]]; then
-    info "Bypassing sentinel guard (--worktree-path explicit opt-in for $worktree_path)"
-  fi
+  while IFS=$'\t' read -r level text; do
+    [[ -n "$level" ]] || continue
+    case "$level" in WARNING) warning "$text" ;; *) info "$text" ;; esac
+  done <<<"${gate#"$verdict"}"
+  [[ "$verdict" == "LOOM-REMOVE-GATE PROCEED" ]] || return 0
   # Record the attached branch BEFORE removing the worktree (the porcelain
   # entry vanishes once the worktree is gone). Only relevant when allow_unmanaged
   # — the default issue/pr path already has the branch encoded in PR_BRANCH.

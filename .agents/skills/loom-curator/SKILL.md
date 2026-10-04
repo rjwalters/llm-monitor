@@ -329,11 +329,10 @@ present" for the general form of this check
 and the forge's own view) and why a reported divergence should carry the live
 command output that established it.
 
-### Priority 2: Triage & Unlabeled Issues (Fallback)
+### Priority 2: Triage queue
 
-If no Priority 1 issues exist, find issues awaiting enhancement. The intake label
-`loom:triage` (applied by the issue filer — "New issue awaiting Curator
-enhancement") is the entry point, so **target it first**:
+If no Priority 1 issues exist, find issues awaiting enhancement via the intake
+label `loom:triage` ("New issue awaiting Curator enhancement"):
 
 ```bash
 # Newly filed issues awaiting Curator enhancement
@@ -342,28 +341,9 @@ gh issue list --label="loom:triage" --state=open --limit 500 --json number,title
   --jq "sort_by(.createdAt) | .[] | select($EXCL) | \"#\(.number) \(.title)\""
 ```
 
-If nothing carries `loom:triage`, fall back to any issue that is not already
-in-flight, a proposal awaiting Champion evaluation, approved, blocked, or
-reserved for a human operator, so an autonomous Curator never "curates" an
-issue being built, awaiting evaluation, or outside its authority entirely:
-
-```bash
-EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"   # #8255 shared source
-gh issue list --state=open --limit 500 --json number,title,labels,createdAt \
-  --jq "sort_by(.createdAt) | .[] | select(
-    ([.labels[].name] | contains([\"loom:curated\"]) | not) and
-    ([.labels[].name] | contains([\"loom:curating\"]) | not) and
-    ([.labels[].name] | contains([\"loom:issue\"]) | not) and
-    ([.labels[].name] | contains([\"loom:building\"]) | not) and
-    ([.labels[].name] | contains([\"loom:architect\"]) | not) and
-    ([.labels[].name] | contains([\"loom:hermit\"]) | not) and
-    ([.labels[].name] | contains([\"loom:auditor\"]) | not) and
-    ([.labels[].name] | contains([\"loom:epic\"]) | not) and
-    ([.labels[].name] | contains([\"loom:blocked\"]) | not) and
-    ([.labels[].name] | contains([\"loom:operator-only\"]) | not) and
-    $EXCL
-  ) | \"#\(.number) \(.title)\""
-```
+The daemon's intake reconcile pass (#10041) applies `loom:triage` to every open
+issue with no `loom:*` label, so this is the single intake queue — there is no
+unlabeled-issue fallback.
 
 Note: `loom:blocked` and `loom:operator-only` stay excluded here, but not from
 Curator's purview (open `loom:decision-malformed` issues are work even with
@@ -745,7 +725,7 @@ them into the one you are curating. Never absorb a sibling that has:
 > - Commit + push these files first, then remove the \`loom:blocked\` label, OR
 > - Adjust the Affected Files section to scope down to committed-only changes."
 >   ./.loom/scripts/post-comment.sh "$N" --body "$COMMENT"
->   gh issue edit "$N" --add-label "loom:blocked"
+>   loom-daemon park-record apply --issue "$N" --reason "uncommitted Affected Files" --by curator
 >   # Exit without further state changes — the next curator tick will re-evaluate.
 >   exit 0
 > fi
@@ -1026,7 +1006,7 @@ fi
 
    # Cannot verify → flag, do not close. Comment FIRST; never cite the merged PR as a blocker:
    ./.loom/scripts/post-comment.sh <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. No open blocker: please test and close if no longer reproducible."
-   gh issue edit <number> --add-label "loom:blocked"
+   loom-daemon park-record apply --issue <number> --reason "may already be fixed; verify" --by curator
    ```
 
 **Why**: closing with a **clear, stated rationale** keeps the backlog healthy — the work-finder only polls *open* issues, so this removes the item without a loop. An **unverified** guess should be flagged, not closed; never close an issue that is being actively built (`loom:building`) by another agent (#2084: a curator closed #1981 mid-processing, requiring manual intervention — comment first if an issue is in flight).
@@ -1392,9 +1372,9 @@ If you discover dependencies during curation:
 This issue requires [dependency] to be implemented first.
 ```
 
-Only then add `loom:blocked`. **Record the blocker before the label (#9102):** every `--add-label "loom:blocked"` needs the **body** to declare each **open** blocker — a park record (`.loom/docs/park-record.md`), a `## Dependencies` entry, or a `Blocked by #N` / `Depends on #N` / `Requires #N` line (what `check-stale-blocked`, #8927, the unblock sweep and `merge-pr.sh` read; not comments). Never cite an already-closed item — your re-check below would unblock it. No open numbered blocker? Say so in a comment posted just before the label; never invent one.
+Only then park it with `park-record apply` (#10152): it writes the **body** park record, then adds `loom:blocked` — what `check-stale-blocked` (#8927), star-liveness, the unblock sweep and `merge-pr.sh` read; not comments. It refuses a closed blocker (#9102: your re-check below would unblock it). No open numbered blocker? Pass `--reason "<why>"`; never invent one.
 ```bash
-gh issue edit <number> --add-label "loom:blocked"
+loom-daemon park-record apply --issue <number> --blocked-by <N> --by curator
 ```
 
 ### When Dependencies Complete
