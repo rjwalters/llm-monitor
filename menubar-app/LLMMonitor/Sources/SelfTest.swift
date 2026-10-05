@@ -127,6 +127,7 @@ enum SelfTest {
         testSchemaMigrationFromPreMigrationDatabase()
         testRankingExportCarriesProvider()
         testRankingExportMarksAbsentIdentity()
+        testRankingExportBlocksRevokedCredential()
         testNamedLimitsRoundTrip()
         testHistoryDecimationKeepsFirstLastAndBigJumps()
         testFullHistoryDecimationMatchesLoadHistory()
@@ -8565,6 +8566,141 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("absent-identity ranking export test threw: \(error)")
+            }
+        }
+    }
+
+    /// A credential the provider rejects with 401 must stop being exported as
+    /// capacity. Before this, a revoked token's last reading stayed in
+    /// `ranking.json` as `available` (frozen utilization and all) and
+    /// `last_error` was never written, so any consumer without its own
+    /// bad-token list kept routing work to it. The marker must also lift the
+    /// moment the token is rolled, by either roll path, without waiting for a
+    /// poll, and a non-auth failure (a 503) must not block anything.
+    private static func testRankingExportBlocksRevokedCredential() {
+        withSelfTestTempDir("ranking-revoked") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
+
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
+
+                for (id, email) in [("org-dead", "dead@example.com"), ("org-flaky", "flaky@example.com")] {
+                    poller.saveCredentialForAccount(
+                        accountId: id, email: email, orgName: email, plan: "max",
+                        accessToken: "sk-ant-selftest-\(id)-v1"
+                    )
+                    try db.run("""
+                        INSERT INTO usage_history
+                            (account_id, timestamp, primary_percent, session_percent,
+                             weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                        VALUES (?, ?, 10, 10, 30, 0,
+                                '{"overall_status":"allowed","session_status":"allowed","weekly_status":"allowed"}', 0)
+                    """, id, now)
+                }
+
+                func stored(_ id: String) -> (error: String?, polledAt: String?, updatedAt: String?) {
+                    for r in try! db.prepare(
+                        "SELECT last_error, last_poll_at, updated_at FROM oauth_credentials WHERE account_id = ?"
+                    ).bind(id) {
+                        return (r[0] as? String, r[1] as? String, r[2] as? String)
+                    }
+                    return (nil, nil, nil)
+                }
+                func exportedStatus() -> [String: String] {
+                    RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+                    guard let data = FileManager.default.contents(atPath: outPath),
+                          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let accounts = root["accounts"] as? [[String: Any]] else { return [:] }
+                    var out: [String: String] = [:]
+                    for a in accounts {
+                        if let e = a["email"] as? String, let st = a["status"] as? String { out[e] = st }
+                    }
+                    return out
+                }
+
+                expectEqual(exportedStatus()["dead@example.com"], "available",
+                            "fixture precondition: a healthy credential exports as available")
+
+                let loaded = poller.loadActiveCredentials()
+                guard let dead = loaded.first(where: { $0.accountId == "org-dead" }),
+                      let flaky = loaded.first(where: { $0.accountId == "org-flaky" }) else {
+                    checks += 1
+                    failures.append("revoked-credential fixture: credentials did not load")
+                    return
+                }
+                poller.recordPollFailure(dead, status: .revoked, error: ProviderAPIError.unauthorizedMessage)
+                poller.recordPollFailure(flaky, status: .error, error: ProviderAPIError.httpError(503).localizedDescription)
+
+                expectEqual(stored("org-dead").error, ProviderAPIError.unauthorizedMessage,
+                            "a 401 poll failure is persisted to last_error, not only held in memory")
+                expect(stored("org-dead").polledAt == nil,
+                       "…without stamping last_poll_at, which would read a failed poll as fresh")
+                var status = exportedStatus()
+                expectEqual(status["dead@example.com"], "blocked",
+                            "a credential rejected with 401 is exported as blocked, not available")
+                expectEqual(status["flaky@example.com"], "available",
+                            "a non-auth failure (503) says nothing about the credential and does not block it")
+
+                // A repeat of the same failure must not rewrite the row every cycle.
+                try db.run("UPDATE oauth_credentials SET updated_at = '2000-01-01T00:00:00Z' WHERE account_id = 'org-dead'")
+                poller.recordPollFailure(dead, status: .revoked, error: ProviderAPIError.unauthorizedMessage)
+                expectEqual(stored("org-dead").updatedAt, "2000-01-01T00:00:00Z",
+                            "an unchanged error is not rewritten")
+
+                // Re-saving the *same* token (the periodic env/token-file re-sync)
+                // is not a roll and must not lift the block.
+                poller.saveCredentialForAccount(
+                    accountId: "org-dead", email: "dead@example.com", orgName: "dead@example.com",
+                    plan: "max", accessToken: "sk-ant-selftest-org-dead-v1"
+                )
+                expectEqual(exportedStatus()["dead@example.com"], "blocked",
+                            "re-saving the same revoked token keeps it blocked")
+
+                // Rolling the token (token-file / popover path) clears the marker
+                // immediately, before any poll has had a chance to.
+                poller.saveCredentialForAccount(
+                    accountId: "org-dead", email: "dead@example.com", orgName: "dead@example.com",
+                    plan: "max", accessToken: "sk-ant-selftest-org-dead-v2"
+                )
+                expect(stored("org-dead").error == nil, "rolling the token clears last_error")
+                expectEqual(exportedStatus()["dead@example.com"], "available",
+                            "…so the replacement token is routable at once")
+
+                // The other roll path: `accounts import` from a peer.
+                poller.recordPollFailure(dead, status: .revoked, error: ProviderAPIError.unauthorizedMessage)
+                func bundle(token: String, at stamp: String) -> AccountSync.ExportBundle {
+                    AccountSync.ExportBundle(
+                        formatVersion: AccountSync.formatVersion,
+                        exportedAt: stamp,
+                        sourceHost: "selftest",
+                        accounts: [AccountSync.ExportedAccount(
+                            id: "org-dead", provider: "anthropic", accountName: "dead",
+                            email: "dead@example.com", plan: "max",
+                            lastUpdated: stamp, sortOrder: 0,
+                            credentials: [AccountSync.ExportedCredential(
+                                label: "dead@example.com", source: "token", provider: "anthropic",
+                                accessToken: token, refreshToken: nil,
+                                expiresAt: nil, tokenExpiresAt: nil,
+                                scopes: nil, subscriptionType: nil, rateLimitTier: nil,
+                                isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
+                            )]
+                        )]
+                    )
+                }
+                _ = try AccountSync.importBundle(bundle(token: "sk-ant-selftest-org-dead-v2", at: "2099-01-01T00:00:00Z"), dbPath: dbPath)
+                expectEqual(exportedStatus()["dead@example.com"], "blocked",
+                            "importing the same revoked token from a peer keeps it blocked")
+                _ = try AccountSync.importBundle(bundle(token: "sk-ant-selftest-org-dead-v3", at: "2099-01-02T00:00:00Z"), dbPath: dbPath)
+                expect(stored("org-dead").error == nil, "importing a rolled token clears last_error")
+                expectEqual(exportedStatus()["dead@example.com"], "available",
+                            "…and the account is routable again")
+            } catch {
+                checks += 1
+                failures.append("revoked-credential ranking test threw: \(error)")
             }
         }
     }

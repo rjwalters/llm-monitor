@@ -112,6 +112,7 @@ enum RankingExporter {
     /// | Condition                                              | status         |
     /// |--------------------------------------------------------|----------------|
     /// | account has no active OAuth credential (`is_active=0`) | `blocked`      |
+    /// | its last poll was rejected 401 (stored `last_error`)   | `blocked`      |
     /// | weekly (`7d`) status is `rejected`                     | `exhausted`    |
     /// | session (`5h`) or overall status is `rejected`         | `rate_limited` |
     /// | `allowed` / `allowed_warning` / unknown                | `available`    |
@@ -119,13 +120,20 @@ enum RankingExporter {
     /// Weekly-rejected is treated as `exhausted` (the 7d quota is spent and resets
     /// on a multi-day cadence); a session-only rejection is `rate_limited` (the 5h
     /// window is temporarily full and resets soon).
+    ///
+    /// A 401 is `blocked` rather than `available` because the last reading is
+    /// frozen at the moment the token died: exporting it as usable capacity
+    /// would route work to a credential the provider has already revoked. The
+    /// poller clears the marker on the next successful poll and whenever the
+    /// token value is rolled, so a replacement token is never held back by it.
     static func mapStatus(
         overallStatus: String?,
         sessionStatus: String?,
         weeklyStatus: String?,
-        credentialActive: Bool
+        credentialActive: Bool,
+        credentialRejected: Bool = false
     ) -> String {
-        if !credentialActive { return "blocked" }
+        if !credentialActive || credentialRejected { return "blocked" }
         if weeklyStatus == "rejected" { return "exhausted" }
         if sessionStatus == "rejected" || overallStatus == "rejected" { return "rate_limited" }
         return "available"
@@ -268,13 +276,14 @@ enum RankingExporter {
 
         // Parse the per-poll status blob written by OAuthPoller.writePingToDB().
         let statuses = parseStatuses(rawData)
-        let credentialActive = isCredentialActive(db: db, accountId: accountId)
+        let credential = credentialState(db: db, accountId: accountId)
 
         obj["status"] = mapStatus(
             overallStatus: statuses.overall,
             sessionStatus: statuses.session,
             weeklyStatus: statuses.weekly,
-            credentialActive: credentialActive
+            credentialActive: credential.active,
+            credentialRejected: credential.rejected
         )
 
         // utilization: DB stores 0–100 percentages; schema wants 0.0–1.0 fractions.
@@ -303,17 +312,24 @@ enum RankingExporter {
 
     // MARK: - Helpers
 
-    /// Whether the account has an active OAuth credential. Reads only the
-    /// non-secret `is_active` flag — never a token column. A missing table or
-    /// absent row is treated as "active" (we have no signal that it is blocked).
-    private static func isCredentialActive(db: Connection, accountId: String) -> Bool {
-        guard let stmt = try? db.prepare(
-            "SELECT is_active FROM oauth_credentials WHERE account_id = ? ORDER BY updated_at DESC LIMIT 1"
-        ) else { return true }
+    /// Whether the account's OAuth credential is active, and whether its last
+    /// poll was rejected as unauthorized. Reads only the non-secret `is_active`
+    /// and `last_error` columns — never a token column. A missing table, column,
+    /// or row is treated as "active, not rejected" (we have no signal that it is
+    /// blocked). Only the exact stored 401 marker counts as rejected; any other
+    /// error (a 5xx, a network failure) says nothing about the credential.
+    private static func credentialState(db: Connection, accountId: String) -> (active: Bool, rejected: Bool) {
+        let hasLastError = tableColumns(db, "oauth_credentials").contains("last_error")
+        guard let stmt = try? db.prepare("""
+            SELECT is_active, \(hasLastError ? "last_error" : "NULL")
+            FROM oauth_credentials WHERE account_id = ? ORDER BY updated_at DESC LIMIT 1
+        """) else { return (true, false) }
         for r in stmt.bind(accountId) {
-            if let active = r[0] as? Int64 { return active != 0 }
+            let active = (r[0] as? Int64).map { $0 != 0 } ?? true
+            let rejected = (r[1] as? String) == ProviderAPIError.unauthorizedMessage
+            return (active, rejected)
         }
-        return true
+        return (true, false)
     }
 
     private struct Statuses { let overall: String?; let session: String?; let weekly: String? }
