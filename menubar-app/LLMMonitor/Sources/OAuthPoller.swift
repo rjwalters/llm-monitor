@@ -1611,7 +1611,7 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Save Credential for Account
 
-    private func saveCredentialForAccount(
+    func saveCredentialForAccount(
         accountId: String, email: String?, orgName: String?, plan: String,
         accessToken: String, source: String = "token",
         provider: AccountProvider = .anthropic,
@@ -1663,7 +1663,8 @@ class OAuthPoller: ObservableObject {
                             access_token = ?, source = ?, provider = ?,
                             refresh_token = COALESCE(?, refresh_token),
                             token_expires_at = ?,
-                            is_active = 1, updated_at = ?, token_rolled_at = ?
+                            is_active = 1, updated_at = ?, token_rolled_at = ?,
+                            last_error = NULL
                         WHERE id = ?
                     """, accessToken, source, providerValue, refreshToken, expiryISO, now, now, credId)
                     flog.info("Rolled credential for account \(accountId)", category: fcat)
@@ -1926,15 +1927,19 @@ class OAuthPoller: ObservableObject {
 
     /// Record a diagnostic against a credential row **without** claiming it was
     /// polled. `updateCredentialLastPoll` writes `last_poll_at` alongside
-    /// `last_error`; a row nothing polled must not get that timestamp.
+    /// `last_error`; a row nothing polled must not get that timestamp — nor a
+    /// row whose poll *failed*, since a fresh `last_poll_at` would make the
+    /// staleness backstop (#148) read it as current. A repeat of the stored
+    /// error is a no-op, so a dead credential does not rewrite its row on every
+    /// cycle.
     private func persistCredentialError(id: Int64, error: String) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
             let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             try db.run(
-                "UPDATE oauth_credentials SET last_error = ?, updated_at = ? WHERE id = ?",
-                error, now, id
+                "UPDATE oauth_credentials SET last_error = ?, updated_at = ? WHERE id = ? AND last_error IS NOT ?",
+                error, now, id, error
             )
         } catch {
             flog.error("Failed to record credential diagnostic: \(error.localizedDescription)", category: fcat)
@@ -2317,9 +2322,23 @@ class OAuthPoller: ObservableObject {
                 if case AnthropicAPIError.unauthorized = error { isUnauthorized = true } else { isUnauthorized = false }
                 let status: TokenStatus = isUnauthorized ? .revoked : .error
                 flog.error("Poll failed for \(credential.label): \(error.localizedDescription)", category: fcat)
-                updateCredentialStatus(credential, status: status, error: error.localizedDescription)
+                recordPollFailure(credential, status: status, error: error.localizedDescription)
                 return
             }
+        }
+    }
+
+    /// A poll's final (non-retried) failure. The in-memory status alone dies
+    /// with the process, and `ranking.json` reads a stored 401 as `blocked`, so
+    /// the message is persisted too: before this a revoked token kept
+    /// exporting `available` with frozen utilization while `last_error` stayed
+    /// blank. The next successful poll clears it (`updateCredentialLastPoll`),
+    /// as does rolling the token. Internal (not private) so `selftest` can
+    /// drive it without a network round-trip.
+    func recordPollFailure(_ credential: OAuthCredential, status: TokenStatus, error: String) {
+        updateCredentialStatus(credential, status: status, error: error)
+        if let id = credential.id {
+            persistCredentialError(id: id, error: error)
         }
     }
 

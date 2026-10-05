@@ -94,10 +94,16 @@ enum ProviderAPIError: Error, LocalizedError {
     case invalidResponse
     case networkError(Error)
 
+    /// `.unauthorized`'s description, spelled once because it is also a stored
+    /// marker: a failed poll persists it to `oauth_credentials.last_error`, and
+    /// `RankingExporter` reads that exact value back as "this credential is
+    /// rejected" (`blocked`). Change the wording here and both sides move.
+    static let unauthorizedMessage = "Unauthorized — token may be expired or revoked"
+
     var errorDescription: String? {
         switch self {
         case .unauthorized:
-            return "Unauthorized — token may be expired or revoked"
+            return Self.unauthorizedMessage
         case .httpError(let code):
             return "HTTP error \(code)"
         case .invalidResponse:

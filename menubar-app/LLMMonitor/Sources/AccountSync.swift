@@ -343,12 +343,13 @@ enum AccountSync {
                     expires_at = ?, token_expires_at = ?,
                     scopes = ?, subscription_type = ?, rate_limit_tier = ?,
                     is_active = ?, updated_at = ?,
-                    token_rolled_at = CASE WHEN ? THEN ? ELSE token_rolled_at END
+                    token_rolled_at = CASE WHEN ? THEN ? ELSE token_rolled_at END,
+                    last_error = CASE WHEN ? THEN NULL ELSE last_error END
                 WHERE id = ?
             """, credential.label, credential.source, provider, credential.accessToken, credential.refreshToken,
                  credential.expiresAt, credential.tokenExpiresAt,
                  credential.scopes, credential.subscriptionType, credential.rateLimitTier,
-                 credential.isActive, now, tokenChanged, credential.tokenRolledAt ?? now, credId)
+                 credential.isActive, now, tokenChanged, credential.tokenRolledAt ?? now, tokenChanged, credId)
         } else {
             try db.run("""
                 INSERT INTO oauth_credentials (
