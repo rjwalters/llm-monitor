@@ -10,7 +10,6 @@ dist/
 .claude/*
 !.claude/commands/
 !.claude/skills/
-!.claude/settings.json
 *.zip
 # >>> loom-managed (do not edit) >>>
 # Loom runtime state (don't commit these)

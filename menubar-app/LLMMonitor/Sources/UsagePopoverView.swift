@@ -1235,11 +1235,11 @@ struct SummaryRow: View {
     }
 
     /// Why a Loom Codex profile has nothing newer, from the live check; with
-    /// no live verdict, the snapshot path's own limit (no Codex turn since).
+    /// no live verdict, the snapshot path's own limit (no Codex turn recorded).
     private var codexIdleReason: String? {
         guard let home = account.codexHome, OAuthPoller.isLoomCodexProfile(home) else { return nil }
         return LoomAccountsCheck.describe(detail: oauthPoller.loomCodexLiveDetail(home: home))
-            ?? "no Codex activity since"
+            ?? "no Codex activity recorded"
     }
 
     /// Built once (a formatter per render is measurably expensive).
