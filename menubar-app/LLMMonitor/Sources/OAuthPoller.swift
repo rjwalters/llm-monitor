@@ -1915,6 +1915,12 @@ class OAuthPoller: ObservableObject {
     /// `loggedAmbiguousCodexHome` / `loggedCodexCapabilityGap`.
     private var loggedStrandedCodexIdentity: Set<Int64> = []
 
+    /// `CredentialMissingError`s already logged this process, keyed
+    /// `"<credential id>:<reason>"` so a changed reason logs again. Same
+    /// once-per-process discipline: a missing credential is a steady state, and
+    /// a headless host's `debug.log` is its only window onto it.
+    private var loggedMissingCredential: Set<String> = []
+
     /// Give the rows `loadActiveCredentials` drops an honest status.
     ///
     /// Called from `pollAll`/`pollDue` beside that enumeration, because those
@@ -2358,6 +2364,9 @@ class OAuthPoller: ObservableObject {
         case let missing as CredentialMissingError:
             // The throwing site already set `.missing` and its message in
             // memory; persist that message, never the 401 marker.
+            if loggedMissingCredential.insert("\(credential.id ?? -1):\(missing.reason)").inserted {
+                flog.warning("Cannot poll \(credential.label): \(missing.reason)", category: fcat)
+            }
             if let id = credential.id {
                 persistCredentialError(id: id, error: missing.reason)
             }
