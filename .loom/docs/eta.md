@@ -229,8 +229,9 @@ the forge PR timelines behind the fleet snapshot (every `labeled` and
 `unlabeled` event, operator labels included) and the tracker's own listings.
 No new forge read; the PR listing gains `closedAt` in the same call, so a PR
 closed unmerged ends its last episode at its close. The webhook label stream
-is not readable by the daemon today; it becomes one more adapter once #10197's
-raw event cache imports it.
+reaches only #10197's raw event cache (`eta fleet events import-webhook`);
+episodes do not read it yet, and the star's training read takes forge rows
+only.
 
 - **Fleet snapshot.** `episodes` sits beside `samples` (`serde(default)`, not
   written when empty), so an older daemon still parses the file and a
@@ -694,10 +695,13 @@ it links whose link **and** star were both known before `cutoff`.
 - **Knowable-at**: a fact at `a` is usable iff `a < cutoff`. An issue's star
   run counts from the later of its labeled-at time and the link's known-at
   time, so a link or star that becomes known after `T` never stars a row at
-  `T`. Training reads issue `label_added` / `label_removed` rows; serving
+  `T`. Training reads forge issue `label_added` / `label_removed` rows; serving
   reads one ETag-conditional listing per star label per pass, for repos with
   at least one tracked PR only (the work finder's URLs), and stamps changes
-  at the pass.
+  at the pass. The listing walks every page
+  (`forge_listing::list_issues_cached_all_as`, #10389; page 1 is the work
+  finder's own cache entry): a repo can have more than 100 starred items. A
+  failed or incomplete walk records nothing: unknown, not unstarred.
 - **Known skew: closed issues.** Serving lists only *open* starred issues, so
   a linked issue that closes while still labeled reads as an unstar from that
   pass on. Training replays label events only and keeps it starred until a
@@ -705,7 +709,8 @@ it links whose link **and** star were both known before `cutoff`.
   affects the recorded `starred_any` / `star_source`, never the model.
 - **Unknown coverage**: a repo whose raw cache has no pulls (link) or
   issue-events rows before `cutoff` gives an unknown state (`null`, counted in
-  `rows_star_unknown`), never "unstarred". Serving records nothing for a repo
+  `rows_star_unknown`), never "unstarred". `eta fit` also prints
+  `rows_starred_any` and `rows_star_issue_only` (starred only through an issue). Serving records nothing for a repo
   with no star observation within the last hour.
 - **Not a model input.** Twin-otter's `starred` feature is still the PR's own
   flag, and coefficient files are byte-identical. The result is recorded as
@@ -1176,9 +1181,12 @@ reference: [`telemetry-schema.md`](telemetry-schema.md).
 - **No explanation rides along.** The dashboard's "why this ETA?" fetches the
   full `eta-explanation/v1` record from SigNoz on demand by `estimate_id`, and
   the accuracy panel queries `eta.outcome` there.
-- **Only `current`'s estimate.** A shadow candidate's estimate (above) is
-  never the subject's answer, and a superseded refresh is not current: exactly
-  one row survives per `(repo, issue, kind)`.
+- **One row per item, shadows as `alternates[]`.** A shadow candidate's
+  estimate (above) is never the subject's answer, and a superseded refresh is
+  not current: exactly one row survives per `(repo, issue, kind)`. Each row
+  carries the newest estimate or refusal of every registered shadow heuristic
+  under `alternates[]` (#10390), from tracker state only; `schema_version`
+  stays 12.
 - **A refusal is a row.** An issue with a `no_estimate_reason` and no
   quantiles is carried, not dropped: that it *cannot* be estimated, and why,
   is the answer.
@@ -1421,8 +1429,22 @@ of what is on disk and never needs a refetch.
   surfaced behind a dismissed `changes_requested`. The answer depends on
   each review's latest read, not on whether it was also read before the
   dismissal. The CI and approval counts are absent until a row
-  of their listing precedes `--as-of`. Not yet cached: the webhook-mirror
-  source.
+  of their listing precedes `--as-of`.
+- **Webhook mirror.** `eta fleet events import-webhook --from FILE [--repo
+  R | --all-repos]` appends a loom-ui `label.transition` export (D1
+  `records` rows as JSONL, or `wrangler d1 execute --json` output) as
+  `source: "webhook-mirror"` rows: `seq` = the D1 row id (delivery order),
+  `event_time` = the payload's `at` (Worker receipt, seconds after the
+  change, so never early), `fetched_at` = import time. Read-only, no
+  network, zero forge calls; ids ignore `fetched_at`, so re-importing or
+  importing an overlapping later export (after D1 eviction) appends only new
+  rows and removes none. It carries `loom:*` labels and open/close only.
+  `state --source forge|webhook-mirror` replays one source; mixed, a
+  transition seen by both is replayed twice, seconds apart. The per-PR
+  fan-out's work list reads `forge` rows only, so an import never queues a
+  forge read, and so do the star inputs, so an import never moves a star or
+  its coverage. It is a manual verb: the captain-gated refresh cycle never
+  imports, and an import spends no reader budget, so it is not captain-only.
 
 `loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
 `loom-daemon eta …`.
@@ -1442,7 +1464,7 @@ of what is on disk and never needs a refetch.
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
 | `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
 | `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |
-| `fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` |
+| `fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` (#10329; was `1500`) |
 | `fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 | `fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor 15: the fit window + 1) |
 | `fleetRefresh.signoz.enabled` | `LOOM_ETA_FLEET_SIGNOZ_ENABLED` | `false` (#9758; see [SigNoz in-sweep half](#signoz-in-sweep-half-fleetrefreshsignoz-9758)) |
@@ -1480,6 +1502,22 @@ reads, and it is budgeted with a reserve floor. Without it the fit would have
 no training data on a fleet host. Settings are read once at spawn; change
 them with a daemon restart.
 
+- **One refresher: declare `fleet.captain`** (#10329). On a multi-host fleet,
+  declare `fleet.captain` in the tracked `.loom/config.json`. Only the captain
+  refreshes; it is the singleton job `eta-fleet-refresh`
+  ([daemon-reference → Fleet captain](daemon-reference.md#fleet-captain-8848)).
+  Pick a captain with reader Apps, the OTLP exporter, and every fleet repo
+  provisioned or already snapshotted. Every other host makes **no** forge call
+  and emits no record, but still runs the daily fit on the snapshots it has.
+  Those are the captain's only when `LOOM_ETA_FLEET_SNAPSHOT_DIR` is shared
+  with it; otherwise they are its own older ones, or none. With **no** captain
+  declared, every host with a reader refreshes, as before, and logs a hint
+  once. That keeps a single-host install's fit, but N hosts spend N times the
+  shared reader budgets. The gate is re-read every tick, so editing
+  `fleet.captain` needs no restart. The opt-in
+  [SigNoz in-sweep half](#signoz-in-sweep-half-fleetrefreshsignoz-9758) is not
+  gated: it spends no reader budget.
+
 - **Cadence.** The first cycle runs 120 s after start, then every
   `intervalSecs`, skipping missed ticks. Each cycle runs off the tick in a
   blocking task; a panic is logged and the next tick retries.
@@ -1507,13 +1545,20 @@ them with a daemon restart.
   passes draw from `maxCallsPerCycle`, backfills from
   `backfillMaxCallsPerCycle`, both host-wide. When a response reports fewer
   than `reserveCalls` core calls remaining, that page is kept and every further
-  repo on the same reader App is skipped for the cycle (`reserve`).
+  repo on the same reader installation is skipped for the cycle (`reserve`).
+  An installation is an App **and** a repo owner (#10329): that is the bucket
+  the response header reports, so one owner's low bucket does not skip the
+  same App's repos for another owner. Spend per hour is
+  `budget × 3600 / intervalSecs`, so a lowered `intervalSecs` multiplies it.
 - **Calls per refresh.** A quiet repo costs **1** (page 1 sent with its ETag,
   answered `304`, which still advances `as_of`). An active one costs
   `ceil(rows updated since the watermark / 100)` listing pages plus one
   timeline page per moved PR (more for a PR with over 100 timeline entries).
   A first backfill of `rjwalters/loom` at 21 days is about 1,300 calls, which
-  fits one cycle at the default backfill budget.
+  takes three cycles (about 3 h at the default `intervalSecs`) at the default
+  backfill budget of 600, inside the fit's 6 h backfill hold. A whole-fleet
+  first backfill can take longer; the first fit then trains on what has
+  finished, and the fit reruns daily.
 - **Rate limits.** A rate-limited reader is withdrawn App-wide until the
   forge's reset, the cycle ends, and the task makes **zero** calls until
   `max(reset, now + intervalSecs)` (`backoff`). With the rate-limit breaker
@@ -1553,8 +1598,8 @@ them with a daemon restart.
   per cycle with the stop-reason counts and the calls spent.
 - **Shared snapshot directory.** There is no lock against the CLI or another
   host: every writer replaces whole files atomically, and the last writer
-  wins. A `LOOM_ETA_FLEET_SNAPSHOT_DIR` shared between hosts works, but enable
-  the task on only one of them.
+  wins. A `LOOM_ETA_FLEET_SNAPSHOT_DIR` shared between hosts works. Declare
+  `fleet.captain` so only one of them refreshes it; the others fit from it.
 
 ### SigNoz in-sweep half (`fleetRefresh.signoz`, #9758)
 

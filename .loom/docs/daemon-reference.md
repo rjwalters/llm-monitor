@@ -2932,11 +2932,11 @@ rules with `git check-ignore`.
 | `autonomous.eta.historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` — `local` (this host's journals), `augment` (plus the cached fleet snapshot) or `fleet` (the snapshot alone). A no-op until a snapshot is cached (#9343); since #10263 the fleet refresh task below caches one by default, so live estimates switch to `scope = fleet` on a host with reader Apps. `local` opts out |
 | `autonomous.eta.fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily coefficient refit (#10245). It checks hourly, fits at most once per UTC day into `.loom/state/eta/fit/`, makes no forge call, and runs only with `autonomous.eta.enabled`. A no-op until a snapshot is cached. With `fleetRefresh.enabled` (below, #10263) the check runs at the end of every fleet refresh cycle instead of on its own task, so it always sees fresh snapshots. Read at start |
 | `autonomous.eta.current.{finish,land}` | none | `finish-v1` / `land-v1` |
-| `autonomous.eta.fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | **`true`** — the fleet snapshot backfill/refresh task (#10263). Default-on like `transcriptIngest`, and for the same kind of reason: it generates no work, only reads (reader Apps only, never the operator PAT), and is budgeted with a reserve floor, while default-off would leave the daily fit with no training data. Also requires `autonomous.eta.enabled` and an observability exporter. **Restart required** |
+| `autonomous.eta.fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | **`true`** — the fleet snapshot backfill/refresh task (#10263). Default-on like `transcriptIngest`, and for the same kind of reason: it generates no work, only reads (reader Apps only, never the operator PAT), and is budgeted with a reserve floor, while default-off would leave the daily fit with no training data. Also requires `autonomous.eta.enabled` and an observability exporter. **Restart required**. **Multi-host fleets must declare `fleet.captain`** (#10329): only the captain refreshes, and with no captain every host with a reader does, against the same shared reader budgets — see [Fleet captain](#fleet-captain-8848) |
 | `autonomous.eta.fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor `900`); first cycle 120 s after start |
 | `autonomous.eta.fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` forge calls per cycle for refresh passes, host-wide (`304`s and errors count) |
-| `autonomous.eta.fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` per cycle for backfill passes, host-wide; a larger backfill resumes next cycle |
-| `autonomous.eta.fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` — below this many remaining core calls, skip the rest of that reader App's repos this cycle |
+| `autonomous.eta.fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` per cycle for backfill passes, host-wide (was `1500`, most of a 5,000/h installation, #10329); a larger backfill resumes next cycle. Spend per hour is `budget × 3600 / intervalSecs`, so a lowered `intervalSecs` multiplies it |
+| `autonomous.eta.fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` — below this many remaining core calls, skip the rest of that reader installation's repos (App and repo owner, #10329) this cycle |
 | `autonomous.eta.fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor `15`, the fit window + 1) |
 
 Model, heuristics, explanation schema, scoring and queries:
@@ -3358,6 +3358,30 @@ commits**, which keep the PR branch's re-date commits reachable (verified
 2026-09-30). A repo that squash-merges drops them, and the report then
 undercounts. The PR's `loom:stale-check-redate` comment stays the budget's
 durable record either way.
+
+#### Re-dates per PR and time to land (#10163)
+
+On 2026-10-04 chain head #9832 was re-dated three times in about 40 minutes
+while `main` kept moving under it, and 31 approved PRs waited behind it. The
+per-check table above says *why* re-dates happen. It does not say *which PR*
+keeps being re-dated or how long that PR waited, so the livelock did not show
+on the dashboard. `merge_pr::redate::chain_telemetry` adds the per-PR view.
+
+| Surface | What it shows |
+|---------|---------------|
+| `merge-pr redate-report` | A `Per PR` section in the text output and `chains` in `--json`. Each row has the PR, its re-date count, the first and last re-date times, the landing merge's time, `time_to_land_secs` (first re-date to landing), and `stuck` (not landed after at least the default re-date budget of 3). |
+| `metric.points` (OTLP) | `loom.merge.redate_prs{state=landed\|pending\|stuck}`, `loom.merge.redates_max{state=landed\|pending}` and `loom.merge.time_to_land_max` (seconds). These are trailing-24 h gauges sampled on the `host.health` cadence by `observability::ops::redate_chain`. They are never labelled by PR. Every host that manages the repo reports it, so read them with `max` across hosts. A non-zero `stuck`, or a rising `redates_max{state=pending}`, is the livelock signature. |
+
+Unlike the per-check table, these rows also read every local
+**remote-tracking** ref (`git log <ref> --remotes`). A re-date commit only
+reaches `main` when its PR merges, so a PR that is still livelocked has all of
+its re-dates on its own branch. Everything is read from local git: nothing is
+fetched and no forge call is made. A PR is therefore seen as of the clone's last
+fetch. A remote branch whose PR closed unmerged reads as not landed until it is
+pruned, and the window bounds that error. Landing lookups are capped at 64 PRs
+per pass, most re-dated first. Telemetry only observes the livelock. The
+daemon-enforced chain-head merge lock that would prevent it is a separate
+follow-up.
 
 #### Anchoring an unmarked verdict (#6319)
 
@@ -6897,6 +6921,40 @@ explicit disarm verb layered on top as an optional precision option**:
 Full module-level rationale (including why `evaluate()` stays pure while
 `run()` writes): `loom-daemon/src/fleet_captain.rs`'s "Two arm registries" /
 "Staleness policy" doc sections.
+
+#### The ETA fleet refresh: a fail-open singleton (#10329)
+
+`autonomous.eta.fleetRefresh` (#10263) publishes fleet-wide snapshots that are
+byte-deterministic and host-independent, from reader installations every host
+resolves identically. Running it on N hosts buys nothing and spends N times
+the shared reader budgets. Each tick re-reads the gate for the singleton job
+**`eta-fleet-refresh`**:
+
+| Gate | What the tick does |
+|---|---|
+| `Armed` (this host is the captain) | Arms `eta-fleet-refresh` (`host.health.armed_singleton_jobs`) and runs the cycle |
+| `Refused` (another host is) | **No forge call** (snapshots, backfill, raw events) and no `eta.fleet_refresh` record. The daily fit check still runs, on the snapshots this host has |
+| `NoCaptainDeclared` | Runs the cycle **unarmed**, and logs once that a multi-host fleet should declare a captain. Not listed in `captainless_singleton_jobs` |
+
+**Why it fails open, unlike `ci-telemetry-poll`**: the gate's fail-closed
+contract protects dedup-sensitive alerts, where a duplicate is a bug. A
+duplicate refresh only costs budget (each writer replaces whole files
+atomically and the output is deterministic). The task is on by default, so
+failing closed would silently stop every single-host install's fit.
+
+**A non-captain host's fit** sees the captain's snapshots only when its
+`LOOM_ETA_FLEET_SNAPSHOT_DIR` points at a directory shared with the captain.
+It then also honours the captain's six-hour backfill hold, read from the
+`refresh/` state beside the snapshots. Otherwise it fits on its own older
+snapshots, or has nothing to fit. The stand-down log line says which. Shipping
+the captain's coefficients to other hosts is separate follow-up work.
+
+**Operator step**: on a multi-host fleet, declare `fleet.captain` naming a
+host that has reader Apps, the OTLP exporter, and every fleet repo provisioned
+or already snapshotted (the repo set is that host's provisioned roots, its own
+repo, and every existing snapshot). Then re-enable `fleetRefresh` on any host
+where it was turned off as a mitigation; the other hosts stand down by
+themselves.
 
 ### Role-runner host roster (#6704, phases A and B)
 
