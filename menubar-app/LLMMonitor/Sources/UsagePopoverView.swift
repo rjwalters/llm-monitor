@@ -1216,6 +1216,46 @@ struct SummaryRow: View {
         return "Stale — as of \(asOfTimeString)"
     }
 
+    /// One line explaining a row that has no current figures to show, laid
+    /// across the percent/reset columns instead of a run of blank cells: when
+    /// the last reading was true, and — for a Loom Codex profile, whose only
+    /// sources are its own Codex turns and Loom's live check — why nothing
+    /// newer exists. Nil for a row with current figures, and for drifted and
+    /// absent rows, which already carry their own badges.
+    private var idleSummary: String? {
+        guard !isDrifted, !isAbsent else { return nil }
+        let reason = codexIdleReason
+        if let usage {
+            guard isStale else { return nil }
+            let since = "Last reading \(Self.idleSinceFormatter.string(from: usage.timestamp))"
+            return reason.map { "\(since) · \($0)" } ?? since
+        }
+        // Never read at all. Only worth a line when there is a reason to give.
+        return reason.map { "No reading yet · \($0)" }
+    }
+
+    /// Why a Loom Codex profile has nothing newer, from the live check; with
+    /// no live verdict, the snapshot path's own limit (no Codex turn recorded).
+    private var codexIdleReason: String? {
+        guard let home = account.codexHome, OAuthPoller.isLoomCodexProfile(home) else { return nil }
+        return LoomAccountsCheck.describe(detail: oauthPoller.loomCodexLiveDetail(home: home))
+            ?? "no Codex activity recorded"
+    }
+
+    /// Built once (a formatter per render is measurably expensive).
+    private static let idleSinceFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("MMMdjmm")
+        return formatter
+    }()
+
+    /// Combined width of the cells `idleSummary` replaces.
+    private var idleSummaryWidth: CGFloat {
+        SummaryColumns.headroom + 2 * SummaryColumns.percent + 2 * SummaryColumns.reset
+            + (SummaryColumns.shows(.premium, among: visibleProviders) ? SummaryColumns.fable : 0)
+            + (SummaryColumns.shows(.extra, among: visibleProviders) ? SummaryColumns.extra : 0)
+    }
+
     /// Short local time string for the "as of <time>" freshness label, so a
     /// stale row states when its figures were last true instead of implying
     /// "now".
@@ -1314,40 +1354,50 @@ struct SummaryRow: View {
             }
             .frame(width: SummaryColumns.account, alignment: .leading)
 
-            headroomCell
-                .frame(width: SummaryColumns.headroom, alignment: .trailing)
+            if let idleSummary {
+                Text(idleSummary)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(idleSummary)
+                    .frame(width: idleSummaryWidth, alignment: .trailing)
+            } else {
+                headroomCell
+                    .frame(width: SummaryColumns.headroom, alignment: .trailing)
 
-            // Session and weekly cells both read the shared window model. When a
-            // provider reports no session window at all, `session` is nil and
-            // both cells render "—" rather than a misleading 0% / "now". A
-            // drifted row reads `displayUsage` (nil), not `usage` — same "—"
-            // rendering, for the same reason: don't present frozen numbers.
-            percentText(displayUsage?.rateLimit.session?.usedPercent)
-                .frame(width: SummaryColumns.percent, alignment: .trailing)
+                // Session and weekly cells both read the shared window model. When a
+                // provider reports no session window at all, `session` is nil and
+                // both cells render "—" rather than a misleading 0% / "now". A
+                // drifted row reads `displayUsage` (nil), not `usage` — same "—"
+                // rendering, for the same reason: don't present frozen numbers.
+                percentText(displayUsage?.rateLimit.session?.usedPercent)
+                    .frame(width: SummaryColumns.percent, alignment: .trailing)
 
-            Text(resetLabel(displayUsage?.rateLimit.session?.resetAt))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-                .frame(width: SummaryColumns.reset, alignment: .trailing)
+                Text(resetLabel(displayUsage?.rateLimit.session?.resetAt))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-            percentText(displayUsage?.rateLimit.weekly?.usedPercent)
-                .frame(width: SummaryColumns.percent, alignment: .trailing)
+                percentText(displayUsage?.rateLimit.weekly?.usedPercent)
+                    .frame(width: SummaryColumns.percent, alignment: .trailing)
 
-            if SummaryColumns.shows(.premium, among: visibleProviders) {
-                fableCell
-                    .frame(width: SummaryColumns.fable, alignment: .trailing)
-            }
+                if SummaryColumns.shows(.premium, among: visibleProviders) {
+                    fableCell
+                        .frame(width: SummaryColumns.fable, alignment: .trailing)
+                }
 
-            Text(resetLabel(displayUsage?.rateLimit.weekly?.resetAt))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-                .frame(width: SummaryColumns.reset, alignment: .trailing)
+                Text(resetLabel(displayUsage?.rateLimit.weekly?.resetAt))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-            if SummaryColumns.shows(.extra, among: visibleProviders) {
-                extraCell
-                    .frame(width: SummaryColumns.extra, alignment: .trailing)
+                if SummaryColumns.shows(.extra, among: visibleProviders) {
+                    extraCell
+                        .frame(width: SummaryColumns.extra, alignment: .trailing)
+                }
             }
 
             Circle()
