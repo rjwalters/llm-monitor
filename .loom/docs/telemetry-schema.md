@@ -1598,6 +1598,17 @@ per-PR rows are in `loom-daemon merge-pr redate-report --json` (`chains`); see
 [`daemon-reference.md`](daemon-reference.md) §"Re-dates per PR and time to
 land".
 
+Long-running task liveness (Issue #10414, `observability/ops/liveness.rs`).
+`task_alive` is sampled every 60 s on its own ticker, not on the collector's
+pass. `task_faults` is emitted when a fault happens. The `task` label is a
+fixed daemon loop name: `auto_update`, `eta_fleet_refresh`, `eta_pass` or
+`role_runner.<role>`. It is never a repo, issue or path.
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
+| `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
+
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
 measure how long ready-queue issues have waited; for depth, use
@@ -2012,6 +2023,80 @@ record whose provenance does not validate is never emitted.
 | `snapshot_id` / `as_of` | string? / RFC3339? | the published snapshot after the cycle |
 | `duration_ms` | integer | wall time spent on the repo |
 | `loom` | object | the computing daemon's provenance (required) |
+
+### `auto_update.tick`
+
+One self-update loop decision (Issue #10414). The loop is described in
+[`daemon-reference.md`](daemon-reference.md). There is one record per tick,
+every `autonomous.autoUpdate.intervalSecs` (default 900 s). Envelopes carry
+`schema_version: 12`. **OTLP-only** (native: `false`). The body is the
+record's JSON. The scalars ride as `loom.auto_update.*` attributes
+(`AUTO_UPDATE_LOG_ATTRIBUTE_KEYS`, which the collector's `transform/privacy`
+allowlists). The record time is the tick's start. Provenance is required:
+`loom` exports as `loom.auto_update.version` / `revision` / `tree_state` /
+`provenance_complete`, and a record whose provenance does not validate is
+never emitted. Severity is `ERROR` for `panic`. It is `WARN` for `roll_stall`,
+`stale_repo` and a fetch or rebuild that did not succeed, and `INFO`
+otherwise.
+
+| Field | Type | Notes |
+|---|---|---|
+| `tick_id` | string | derived, never random: `derived_hex(["loom.auto_update.tick", host_id, tick start], 32)` |
+| `started_at` | RFC3339 | the tick's start |
+| `decision` | string | `skip` (nothing to roll onto), `defer` (a newer target exists, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, roll window), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll is already armed), `roll_stall` (#8998), `panic` (the tick panicked; the loop keeps running) |
+| `reason` | string | the tick's note, the same text as `last tick:` in `loom-daemon status` |
+| `outcome` | string? | `success` / `retryable` / `terminal`, for `fetch` and `rebuild` |
+| `roll_armed` | bool | the fetch or rebuild succeeded and its drain-and-restart was accepted |
+| `installed_version` | string? | the installed binary's version as the artifact probe read it, else the running build's |
+| `target_version` / `target_published_at` | string? | the newest release artifact resolved for this host |
+| `commits_behind` / `hours_behind` | integer? | source-checkout staleness, when the tick read it |
+| `in_flight` | integer? | in-flight sweeps, when the tick read them |
+| `drain` | object | `{armed, pending, refusals, target?}`: the drain armed at tick start |
+| `consecutive_failures` | integer | retryable failures for the tracked target |
+| `duration_ms` | integer | wall time of the tick |
+| `loom` | object | the deciding (running) daemon's provenance (required) |
+
+### `eta.fit`
+
+One daily-fit check (Issue #10391), whether it fitted or not. Envelopes carry
+`schema_version: 12`. **OTLP-only** (native: `false`). Each caller of the fit
+check emits exactly one record per check: the fleet refresh tick's end-of-cycle
+check (`trigger: fleet_refresh`, every host including a stand-down one) and the
+standalone daily task (`trigger: daily_task`, when fleet refresh is off). They
+double as the fit loop's heartbeat, about 24 per host per day. The body is the
+record's JSON; the scalars ride as `loom.eta.fit.*` attributes (in
+`ETA_LOG_ATTRIBUTE_KEYS`, allowlisted in the collector's `transform/privacy`).
+The record time is the check's start. Provenance is required, as for
+`eta.estimate`: it exports as `loom.eta.version` / `revision` / `tree_state` /
+`provenance_complete`, and a record whose provenance does not validate is never
+emitted. **Absent is never zero**: every `?` field is omitted when it does not
+apply. `fit_id` joins to the `fit_id` on every twin-otter explanation.
+
+| Field | Type | Notes |
+|---|---|---|
+| `check_id` | string | derived, never random: `derived_hex(["loom.eta.fit_check", host_id, started_at])` |
+| `trigger` | string | `fleet_refresh` or `daily_task` |
+| `started_at` | RFC3339 | the check's start |
+| `outcome` | string | `written`, `skipped`, `error` or `panic` |
+| `skip_reason` | string? | present exactly when `outcome = skipped`: `disabled`, `held`, `today_exists`, `no_snapshots` or `stale_before_grace` |
+| `error` | string? | `error` only; at most 512 bytes of daemon-authored text |
+| `fit_id` | string? | the coefficient file's content id: on `written`, and on `today_exists` (the existing file's) |
+| `cutoff` | RFC3339? | the fit's `T` |
+| `window_start`, `window_days`, `data_through` | RFC3339? / integer? / RFC3339? | the training window and the data horizon `H` |
+| `snapshots` | integer | snapshots read (`0` on `no_snapshots`) |
+| `snapshot_oldest_as_of`, `snapshot_newest_as_of` | RFC3339? | ages are derivable at query time |
+| `snapshot_as_of` | object? | body only: `{repo: as_of}` |
+| `stages` | object? | body only: per fit stage `{rows, exits, exit_censored, merge_events, merge_censored, hazard, aft}`; `exit_censored` counts rows with no exit label, `merge_censored` is `rows - merge_events` |
+| `rows_total`, `rows_censored` | integer? | rows over every stage, and those with a censored exit label |
+| `rows_dropped_missing`, `rows_dropped_no_flags`, `rows_star_unknown`, `dwells`, `pruned` | integer? | the fit report's counts |
+| `coeff_file` | string? | file name, never a path |
+| `coeff_bytes`, `coeff_sha256` | integer? / string? | size and sha256 of the file as written |
+| `duration_ms` | integer | wall time of the check |
+| `loom` | object | the computing daemon's provenance (required) |
+
+The daemon also keeps the last record at `.loom/state/eta/health/fit-check.json`
+(byte-identical to the body) and the last refresh tick at
+`refresh-cycle.json`, for `loom-daemon eta doctor`.
 
 ### `eta.snapshot`
 
