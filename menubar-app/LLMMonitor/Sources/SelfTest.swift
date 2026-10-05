@@ -8632,8 +8632,8 @@ enum SelfTest {
                     failures.append("revoked-credential fixture: credentials did not load")
                     return
                 }
-                poller.recordPollFailure(dead, status: .revoked, error: ProviderAPIError.unauthorizedMessage)
-                poller.recordPollFailure(flaky, status: .error, error: ProviderAPIError.httpError(503).localizedDescription)
+                poller.recordPollFailure(dead, error: ProviderAPIError.unauthorized)
+                poller.recordPollFailure(flaky, error: ProviderAPIError.httpError(503))
 
                 expectEqual(stored("org-dead").error, ProviderAPIError.unauthorizedMessage,
                             "a 401 poll failure is persisted to last_error, not only held in memory")
@@ -8645,9 +8645,31 @@ enum SelfTest {
                 expectEqual(status["flaky@example.com"], "available",
                             "a non-auth failure (503) says nothing about the credential and does not block it")
 
+                // A revoked token whose next poll merely fails to connect must
+                // stay blocked: the 5xx / offline error proves nothing about the
+                // credential, and replacing the 401 marker would export it as
+                // `available` for that cycle.
+                poller.recordPollFailure(dead, error: ProviderAPIError.httpError(503))
+                poller.recordPollFailure(dead, error: ProviderAPIError.networkError(NSError(domain: "selftest.offline", code: 1)))
+                expectEqual(stored("org-dead").error, ProviderAPIError.unauthorizedMessage,
+                            "a later 5xx or network failure does not replace a stored 401")
+                expectEqual(exportedStatus()["dead@example.com"], "blocked",
+                            "…so the revoked credential stays blocked through a transient outage")
+
+                // No credential to send is not a provider rejection: the
+                // specific reason is persisted, the in-memory status the
+                // throwing site set is left alone, and nothing is blocked.
+                poller.recordPollFailure(flaky, error: CredentialMissingError(reason: "No access token"))
+                expectEqual(stored("org-flaky").error, "No access token",
+                            "a missing credential persists its own reason, not the 401 marker")
+                expect(!poller.credentialStatuses.contains { $0.accountId == "org-flaky" && $0.status == .revoked },
+                       "…and is never relabelled revoked in memory")
+                expectEqual(exportedStatus()["flaky@example.com"], "available",
+                            "…and does not export the row as blocked")
+
                 // A repeat of the same failure must not rewrite the row every cycle.
                 try db.run("UPDATE oauth_credentials SET updated_at = '2000-01-01T00:00:00Z' WHERE account_id = 'org-dead'")
-                poller.recordPollFailure(dead, status: .revoked, error: ProviderAPIError.unauthorizedMessage)
+                poller.recordPollFailure(dead, error: ProviderAPIError.unauthorized)
                 expectEqual(stored("org-dead").updatedAt, "2000-01-01T00:00:00Z",
                             "an unchanged error is not rewritten")
 
@@ -8671,7 +8693,7 @@ enum SelfTest {
                             "…so the replacement token is routable at once")
 
                 // The other roll path: `accounts import` from a peer.
-                poller.recordPollFailure(dead, status: .revoked, error: ProviderAPIError.unauthorizedMessage)
+                poller.recordPollFailure(dead, error: ProviderAPIError.unauthorized)
                 func bundle(token: String, at stamp: String) -> AccountSync.ExportBundle {
                     AccountSync.ExportBundle(
                         formatVersion: AccountSync.formatVersion,
