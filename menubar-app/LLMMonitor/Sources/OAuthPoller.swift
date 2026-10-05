@@ -128,6 +128,18 @@ struct CredentialExpiredError: Error, LocalizedError {
     var errorDescription: String? { reason }
 }
 
+/// Raised when a poll cannot even be attempted because this host holds no
+/// usable credential for the row (no stored token or key, or — for OpenAI —
+/// every Codex tier exhausted). The throwing site has already recorded the
+/// specific `.missing` status; the retry loop persists `reason` and stops.
+/// Distinct from `ProviderAPIError.unauthorized` because nothing was rejected:
+/// treating it as a 401 overwrote the actionable message with "revoked" and,
+/// once that was persisted, exported the row as `blocked` in `ranking.json`.
+struct CredentialMissingError: Error, LocalizedError {
+    let reason: String
+    var errorDescription: String? { reason }
+}
+
 struct EnvImportResult {
     let email: String
     let success: Bool
@@ -1932,14 +1944,24 @@ class OAuthPoller: ObservableObject {
     /// staleness backstop (#148) read it as current. A repeat of the stored
     /// error is a no-op, so a dead credential does not rewrite its row on every
     /// cycle.
+    ///
+    /// A stored 401 (`ProviderAPIError.unauthorizedMessage`) is never replaced
+    /// by any other diagnostic. A revoked token whose next poll merely fails to
+    /// connect (a 5xx, a laptop waking offline) proves nothing about the
+    /// credential, and overwriting the marker would export the dead row as
+    /// `available` for that cycle. Only a successful poll
+    /// (`updateCredentialLastPoll`) or a token roll clears it.
     private func persistCredentialError(id: Int64, error: String) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
             let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
-            try db.run(
-                "UPDATE oauth_credentials SET last_error = ?, updated_at = ? WHERE id = ? AND last_error IS NOT ?",
-                error, now, id, error
+            let marker = ProviderAPIError.unauthorizedMessage
+            try db.run("""
+                UPDATE oauth_credentials SET last_error = ?, updated_at = ?
+                WHERE id = ? AND last_error IS NOT ? AND (? = ? OR last_error IS NOT ?)
+                """,
+                error, now, id, error, error, marker, marker
             )
         } catch {
             flog.error("Failed to record credential diagnostic: \(error.localizedDescription)", category: fcat)
@@ -2312,17 +2334,8 @@ class OAuthPoller: ObservableObject {
                 updateCredentialStatus(credential, status: .refreshing, error: "Retrying...")
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay *= 2
-            } catch is CredentialExpiredError {
-                // The refresh path already recorded `.expired` plus an
-                // actionable message; retrying or downgrading it to the generic
-                // "revoked" would bury the reason. Stop here.
-                return
             } catch {
-                let isUnauthorized: Bool
-                if case AnthropicAPIError.unauthorized = error { isUnauthorized = true } else { isUnauthorized = false }
-                let status: TokenStatus = isUnauthorized ? .revoked : .error
-                flog.error("Poll failed for \(credential.label): \(error.localizedDescription)", category: fcat)
-                recordPollFailure(credential, status: status, error: error.localizedDescription)
+                recordPollFailure(credential, error: error)
                 return
             }
         }
@@ -2333,12 +2346,30 @@ class OAuthPoller: ObservableObject {
     /// the message is persisted too: before this a revoked token kept
     /// exporting `available` with frozen utilization while `last_error` stayed
     /// blank. The next successful poll clears it (`updateCredentialLastPoll`),
-    /// as does rolling the token. Internal (not private) so `selftest` can
-    /// drive it without a network round-trip.
-    func recordPollFailure(_ credential: OAuthCredential, status: TokenStatus, error: String) {
-        updateCredentialStatus(credential, status: status, error: error)
-        if let id = credential.id {
-            persistCredentialError(id: id, error: error)
+    /// as does rolling the token. Synchronous and internal (not private) so
+    /// `selftest` can drive every branch without a network round-trip.
+    func recordPollFailure(_ credential: OAuthCredential, error: Error) {
+        switch error {
+        case is CredentialExpiredError:
+            // The refresh path already recorded `.expired` plus an actionable
+            // message; downgrading it to the generic "revoked" would bury the
+            // reason.
+            return
+        case let missing as CredentialMissingError:
+            // The throwing site already set `.missing` and its message in
+            // memory; persist that message, never the 401 marker.
+            if let id = credential.id {
+                persistCredentialError(id: id, error: missing.reason)
+            }
+        default:
+            let status: TokenStatus
+            if case ProviderAPIError.unauthorized = error { status = .revoked } else { status = .error }
+            let message = error.localizedDescription
+            flog.error("Poll failed for \(credential.label): \(message)", category: fcat)
+            updateCredentialStatus(credential, status: status, error: message)
+            if let id = credential.id {
+                persistCredentialError(id: id, error: message)
+            }
         }
     }
 
@@ -2359,7 +2390,7 @@ class OAuthPoller: ObservableObject {
     private func pollZai(_ credential: OAuthCredential) async throws {
         guard let key = credential.accessToken, !key.isEmpty else {
             updateCredentialStatus(credential, status: .missing, error: "No API key")
-            throw AnthropicAPIError.unauthorized
+            throw CredentialMissingError(reason: "No API key")
         }
         guard let accountId = credential.accountId, !accountId.isEmpty else {
             flog.warning("Credential \(credential.label) has no account_id", category: fcat)
@@ -2376,7 +2407,7 @@ class OAuthPoller: ObservableObject {
     private func pollAnthropic(_ credential: OAuthCredential) async throws {
         guard let token = credential.accessToken else {
             updateCredentialStatus(credential, status: .missing, error: "No access token")
-            throw AnthropicAPIError.unauthorized
+            throw CredentialMissingError(reason: "No access token")
         }
 
         let ping = try await apiClient.pingToken(accessToken: token)
@@ -2545,9 +2576,9 @@ class OAuthPoller: ObservableObject {
             updateCredentialStatus(credential, status: codexFailure.tokenStatus, error: reason)
             return
         }
-        updateCredentialStatus(credential, status: .missing,
-                               error: Self.exhaustedTiersMessage(home: home))
-        throw AnthropicAPIError.unauthorized
+        let reason = Self.exhaustedTiersMessage(home: home)
+        updateCredentialStatus(credential, status: .missing, error: reason)
+        throw CredentialMissingError(reason: reason)
     }
 
     /// Why every tier is exhausted, when no tier left a more specific failure
