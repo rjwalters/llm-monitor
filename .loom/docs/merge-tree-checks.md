@@ -88,6 +88,13 @@ Precedence is env > config > default. An unparseable value falls through to
 the next tier. When the flag is off, `stale-checks` behaves exactly as before:
 no fetch, no temp dir, no extra output.
 
+**Version floor (#10465).** The flag only has an effect on a merging host whose
+`loom-daemon` is >= 0.19.741 (`_MP_REVERIFY_FLOOR` in `merge-pr.sh`). An older
+binary ignores it and falls back to re-dates, so with the flag on `merge-pr.sh`
+prints one warning per invocation naming the host, the resolved daemon version
+and the floor. The warning never changes the exit code; roll the host with
+`cli/loom-daemon-update.sh --fetch`.
+
 When it is on, `loom-daemon merge-pr stale-checks` finds required checks
 stale, and **every** stale component of every stale context is on the cheap
 allowlist (`local_eval::CHEAP_CHECKS`), it does the following:

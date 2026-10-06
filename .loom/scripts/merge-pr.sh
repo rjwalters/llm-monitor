@@ -131,6 +131,14 @@
 #       on any repo whose suites outrun the default 600s (this one's `Shell
 #       Test Suites (hermetic)` alone takes ~10 minutes), and especially on
 #       the pass right after an exit-4 --redate-stale-checks re-run.
+#   6 = deferred behind another PR's chain-head merge lock (#10167): a PR on
+#       the same base was just re-dated and its required checks have not
+#       reported, so merging now would move the base under it again (the
+#       #10163 livelock). Checked only under --auto or LOOM_CHAIN_LOCK_GUARD=1,
+#       before anything is written; nothing merged, nothing failed. Bounded
+#       by LOOM_CHAIN_LOCK_CAP_SECS (default 1200, max 3600);
+#       LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it. Same caller contract as exits
+#       3/4/5 — re-queue, never a failure comment.
 
 set -euo pipefail
 
@@ -361,10 +369,10 @@ Precedence (highest wins):
   4. default: .loom/worktrees/issue-N or pr-N + sentinel guard
 
 Exit codes:
-  0 = merged (or --help)
-  1 = failed
+  0 = merged (or --help) · 1 = failed
   3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
   4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
+  6 = deferred behind another PR's chain-head merge lock (#10167; --auto or LOOM_CHAIN_LOCK_GUARD=1; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses) — nothing written; retry later
 
 Examples:
   ./.loom/scripts/merge-pr.sh 123
@@ -644,10 +652,20 @@ if [[ "$PR_MERGED" == "true" ]]; then
   exit 0
 fi
 
-# Check if closed (not merged)
-if [[ "$PR_STATE" == "closed" ]]; then
-  error "PR #$PR_NUMBER is closed (not merged)"
-fi
+# Check if closed (not merged). One line: the code-line offset for the
+# chain-head merge lock guard below (verbatim, behavior-preserving join).
+[[ "$PR_STATE" != "closed" ]] || error "PR #$PR_NUMBER is closed (not merged)"
+
+# Chain-head merge lock (#10167): while ANOTHER PR on this base is a re-dating
+# chain head whose required checks have not reported, defer with exit 6 BEFORE
+# anything below writes (ref pins, re-dates, comments, the merge). The decision
+# is `loom-daemon merge-pr chain-lock` (loom-daemon/src/merge_pr/chain_lock.rs):
+# trusted marker, capped at LOOM_CHAIN_LOCK_CAP_SECS, unreadable state defers
+# only within the cap. Runs under --auto (Champion) or LOOM_CHAIN_LOCK_GUARD=1,
+# so a plain hand-merge is not held; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it.
+# Any exit other than 0/6 (an older daemon without the verb) proceeds with a
+# warning: the lock only orders merges, it never judges a tree.
+_check_chain_lock() { [[ "$FORGE_TYPE" == "github" ]] && [[ "$AUTO_MERGE" == "true" || "${LOOM_CHAIN_LOCK_GUARD:-0}" == "1" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr chain-lock --pr "$PR_NUMBER" --repo "$REPO_NWO" --base-ref "${base_ref:-${DEFAULT_BRANCH_NAME:-main}}" --repo-root "${REPO_ROOT:-.}")" || rc=$?; if [[ $rc -eq 0 ]]; then [[ "$msg" == "LOOM-CHAIN-LOCK-CLEAR" ]] || warning "$msg"; return 0; fi; if [[ $rc -ne 6 ]]; then warning "Chain-head merge lock (#10167) did not run ('merge-pr chain-lock' exited $rc${msg:+: $msg}); proceeding. Roll loom-daemon to restore it."; return 0; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would DEFER merge of PR #$PR_NUMBER (exit 6): $msg"; return 0; fi; warning "$msg" >&2; warning "Exiting 6: merge deferred behind a re-dating chain head (#10167); nothing was written. Re-attempt on a later pass." >&2; exit 6; }; _check_chain_lock
 
 # ---------------------------------------------------------------------------
 # Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2; reshaped by
@@ -1114,7 +1132,11 @@ _check_verdict_label_contradiction
 # This file is at its file-size-ratchet ceiling (file-size-policy.md), so the
 # function is one dense line and the two MAX_MERGE_RETRIES/MERGE_RETRY_DELAY
 # pairs below are joined (verbatim, behavior-preserving) to offset it.
+# #10465: merge.reverifyStaleChecks (#10397) only works on a loom-daemon >= _MP_REVERIFY_FLOOR; an older binary silently falls back to re-dates. Warn ONCE per invocation (never changes the exit code, no requires-daemon floor: fail-open), naming host and both versions.
+_MP_REVERIFY_FLOOR=0.19.741
+_mp_warn_reverify_floor() { local on="${LOOM_MERGE_REVERIFY_STALE_CHECKS:-}" bin have lo; case "${on,,}" in 1|true|yes|on) on=1 ;; "") on="$(jq -r '.merge.reverifyStaleChecks // false' "${REPO_ROOT:-.}/.loom/config.json" 2>/dev/null || true)"; [[ "$on" == "true" ]] && on=1 ;; *) on="" ;; esac; [[ "$on" == "1" ]] || return 0; bin="${LOOM_DAEMON_BIN:-loom-daemon}"; have="$("$bin" --version 2>/dev/null | awk 'NR==1{print $2}' || true)"; [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || have=unknown; lo="$(sort -V <<<"$have"$'\n'"$_MP_REVERIFY_FLOOR")"; [[ "$have" != unknown && "${lo%%$'\n'*}" == "$_MP_REVERIFY_FLOOR" ]] && return 0; warning "merge.reverifyStaleChecks is enabled but loom-daemon on host $(hostname 2>/dev/null || echo unknown) is $have, older than $_MP_REVERIFY_FLOOR, the first release with merge-tree re-verification (#10397): stale required checks will fall back to re-dates. Roll this host: ${SCRIPT_DIR:-.loom/scripts}/cli/loom-daemon-update.sh --fetch (#10465)." || true; return 0; }
 _check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$(LOOM_STALE_CHECKS_DRY_RUN="$DRY_RUN" "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; if [[ $rc -ne 1 ]]; then local why=" It printed nothing, so the binary is most likely missing or predates the subcommand: build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; [[ -z "$msg" ]] || why=$'\n\n'"What it reported: $msg"; msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted.$why"; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$(LOOM_REDATE_ALLOW_PROCEED=1 "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 5 ]]; then info "$out"; return 0; fi; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: not merged this pass. The stale required checks are re-running in place (head and loom:pr kept, #8914) or were re-dated by a no-op push (fresh Judge review needed, #5686) — see above. Re-attempt on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
+_mp_warn_reverify_floor
 _check_required_check_freshness
 # #10026: repo-declared merge.treeChecks run on the merge tree (base + PR head) by `loom-daemon merge-pr tree-checks`. Strict no-op (no daemon call) unless .loom/config.json declares checks; once declared it fails CLOSED, so a missing/older daemon refuses (deliberately no requires-daemon floor: repos that do not opt in are unaffected). --allow-red-tree warns; the daemon records the audit comment. See defaults/docs/merge-tree-checks.md.
 _check_tree_checks() { local n msg rc=0 base_ref flags=(); n="$(jq -r '(.merge.treeChecks // []) | length' "${REPO_ROOT:-.}/.loom/config.json" 2>/dev/null)" || true; [[ -f "${REPO_ROOT:-.}/.loom/config.json" && "$n" != "0" ]] || return 0; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ "$DRY_RUN" != "true" ]] || flags+=(--dry-run); [[ "$ALLOW_RED_TREE" != "true" ]] || flags+=(--allow-red-tree); msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr tree-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "${base_ref:-${DEFAULT_BRANCH_NAME:-main}}" --config "${REPO_ROOT:-.}/.loom/config.json" ${flags[@]+"${flags[@]}"})" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-TREE-CHECKS-CLEAN" ]] && return 0; [[ $rc -eq 0 && "$msg" == "LOOM-TREE-CHECKS-BYPASSED"* ]] && { warning "$msg"; return 0; }; [[ $rc -eq 1 ]] || msg="Merge blocked: PR #$PR_NUMBER's merge.treeChecks gate (#10026) could not run (exit $rc): $msg. A gate that cannot run refuses the merge; fix the cause (build/roll loom-daemon, config, fetch); --allow-red-tree overrides only a failing check, not a gate that cannot run."; [[ "$DRY_RUN" != "true" ]] || { warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; }; error "$msg"; }
@@ -2278,6 +2300,9 @@ _revalidate_merge_guards() {
   PR_LABELS="$(echo "$fresh" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)"
   _check_loom_pr_label
   _check_verdict_label_contradiction
+  # #10167: a chain head may have taken its lock while --auto waited. Nothing
+  # forge-side has been written yet, so exit 6 here still writes nothing.
+  _check_chain_lock
 }
 
 if [[ "$AUTO_MERGE" == "true" ]]; then

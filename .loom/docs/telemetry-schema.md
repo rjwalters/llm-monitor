@@ -1748,10 +1748,18 @@ GitHub rate limit (Issue #10022):
 | `github.ratelimit.used` | `Gauge` | `{request}`; labels `resource`, `account` | requests spent this window; absent when the response carried no `used` |
 | `github.ratelimit.reset` | `Gauge` | `s` (Unix epoch seconds); labels `resource`, `account` | when the pool's window resets |
 | `github.ratelimit.breaker_skips` | delta `Sum` | `{pass}`; label `reason` | job passes skipped because the breaker was suppressing, flushed on the 60 s tick |
+| `github.ratelimit.{remaining,used,reset}` per bucket | `Gauge` | as above; labels `resource`, `account`, `owner` | one series per believed reading of the forge bucket book (W1): every App installation's pool this host spends, keyed `(account, owner, resource)`. Fed by the free `x-ratelimit-*` headers of `gh api --include` calls and by one free `gh api rate_limit` probe per published credential directory after each 5-minute reader-refresh pass. A reading counts only while its window is open and it is under 10 minutes old. The account-only points above are unchanged |
+| `loom.forge.calls` | delta `Sum` | `{request}`; labels `caller`, `op`, `role`, `account`, `cred_owner`, `target_owner`, `resource`, `outcome` | requests the `gh` facade sent since the previous point (W1), flushed on the 60 s tick. A `--paginate --include` call counts its pages; `run download` counts 2. The free `gh api rate_limit` probe is counted under `resource` = `other` (a request observation, never a charge). `outcome` ∈ `ok`, `not_modified`, `rate_limited`, `error`, `shed` (reserved for a budget gate). Past 2048 distinct label sets between flushes, a new set is folded into one series per `outcome` with every other label `overflow`, so totals are kept and the point count stays bounded. Accumulated only while an ops sink is registered |
 
 `resource` ∈ `core`, `graphql`. `account` is `app-<app id>` when the daemon
 runs on its GitHub App credential, the validated `gh` login for an ambient
-credential, else `unknown` — never a token, token hash or path. `reason` and
+credential, else `unknown` — never a token, token hash or path. On the
+per-bucket points and `loom.forge.calls`, `account` is `app-<app id>`,
+`app-unknown` (the writer's id is not configured), `env-token` (a
+`GH_TOKEN`/`GITHUB_TOKEN` reached `gh`) or `ambient`, and `owner` /
+`cred_owner` is the GitHub owner the App installation covers, lowercased.
+`target_owner` is the owner of the repository the call was for, or
+`unknown`. `reason` and
 `loom.ratelimit.source` ∈ `work_finder`, `claim_reconciliation`,
 `role_runner`, `epic_supervisor`, `quarantine_reconciliation`,
 `ci_telemetry`, `outcome_journal`, `star_liveness`, `other`. Names follow the
