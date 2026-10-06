@@ -64,6 +64,15 @@ reference) — the one-line-per-blocker rule binds the *writer*, not the parser.
 
 ## Who writes one, and when — `park-record apply` (#10152)
 
+**Cross-repo blockers (#10443).** A blocker in another repository is written
+`OWNER/REPO#N` (`Blocked by: example-org/tool-repo#202`). `--blocked-by` accepts `N`,
+`#N` (this repo) and `OWNER/REPO#N`, mixed and comma-separated; still one record
+per blocker. A qualified reference is **never** resolved against the local repo:
+`check-stale-blocked` reads its state in its own repo, `apply` refuses a closed
+one by looking it up there, and it is a self-block only when it names this very
+repo and number. `#9` and `o/r#9` are two distinct blockers. Records written
+with a bare number parse exactly as before (`repo` is `None`).
+
 **Every** role applying `loom:blocked` writes one, through one command — never
 a bare label edit:
 
@@ -178,15 +187,16 @@ check_and_unblock_prs() {
 
     for dep in $deps; do
       # A declared blocker can itself be an issue or a PR — try both reads.
+      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
       local state
-      state=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null) \
-        || state=$(gh pr view "$dep" --json state --jq '.state' 2>/dev/null) \
+      state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
+        || state=$(gh pr view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
         || state="UNKNOWN"
       if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
         all_resolved=false
         break
       fi
-      resolved_deps="$resolved_deps #$dep"
+      resolved_deps="$resolved_deps $dr#$dn"
     done
 
     if [ "$all_resolved" = true ]; then

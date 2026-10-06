@@ -2191,8 +2191,9 @@ Each row:
 **`alternates[]` (#10390)** is additive: `schema_version` stays 12 and older
 readers ignore it. One entry per registered non-current heuristic of the row's
 kind that has a pending estimate for the item — the newest per heuristic
-(matched by item, never by equal `as_of`), sorted by `heuristic`, at most 8
-(loom-ui slices at 8). Built only from estimates the tracker already holds; an
+(matched by item, never by equal `as_of`), sorted by `heuristic`, at most 12
+(#10549, was 8; a loom-ui that still slices at 8 reads the first 8, so
+either deploy order is safe). Built only from estimates the tracker already holds; an
 alternate never creates a row, and a row cut by the 200-row cap takes its
 alternates with it. A change to a shadow estimate alone triggers a new
 snapshot. Each alternate:
