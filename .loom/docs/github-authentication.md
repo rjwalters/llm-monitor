@@ -446,7 +446,14 @@ Every host is configured the same way. There is no per-host pinning:
   history is not recognised until the host moves to `forge.identities`.
   With no readers configured at all, reads share the writer, as before.
 - **Read routing**: each repo's reads go to `hash(owner/repo) mod N`, the same
-  reader on every host. A failed read is retried once on the writer, and the
+  reader on every host. A reader entry may carry `"owners": ["acme"]` to
+  serve only those owners; `N` then counts only the readers serving the
+  repo's owner. A hot repo listed in `forge.readPool.routing.splitRepos` is
+  split per request (one URL, one reader), and a reader whose bucket is
+  projected to run dry spills part or all of its repo's reads to a reader
+  with headroom until its reset (W4-B) — see
+  [daemon-reference](daemon-reference.md#read-pool-routing-forgereadpoolrouting).
+  A failed read is retried once on the writer, and the
   reader is withdrawn only from what failed (W4-A), because GitHub meters each
   App installation per owner and per resource:
   - a **rate limit** withdraws the reader from that owner's refused pool

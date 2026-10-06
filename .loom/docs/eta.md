@@ -195,8 +195,8 @@ tracker and every later consumer call it, so the stage a model is trained on
 and the stage it serves cannot drift. `loom:blocked`, `loom:needs-capability`
 and an operator hold on a PR that is not approved are still `blocked`.
 
-**Shipped heuristics do not move.** `start-v1`, `finish-v1`, `land-v1` to
-`land-v3` and `land-2026-10-04-amber-heron` refuse an item in `merge_hold` as
+**Shipped heuristics do not move.** `start-v1`, `finish-v1`, `land-v1` and
+`land-v2` refuse an item in `merge_hold` as
 `blocked` before writing any field, and a held item's `features` are those
 of that refusal (`no_stage`), so their explanations are byte-identical to
 the refusal of a held PR before the stage existed, and no shipped
@@ -267,12 +267,30 @@ only.
 | `finish-v1` | `finish` | in-sweep phase durations (`sweep-outcome-telemetry.jsonl`) | after the in-sweep merge when at least half of the history's successful sweeps merged themselves, else at the verdict |
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
-| `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
-| `land-2026-10-04-amber-heron` | `land` | `land-v2`'s path, then its p25/p75 recalibrated from `land-v2`'s own track record: the current stage's `ln(actual / p50)` distribution (landed estimates as events, still-open ones as censored lower bounds, recency-weighted) fitted at the estimate's own `as_of`; the median is kept (recorded as `recalibration`; #10207) | after `merge_wait` |
 | `land-2026-10-04-fresh-tide` | `land` | `land-v2`'s, with every stage sample (observed and censored) weighted `exp(−age / half_life)`, half-life 2 days, and the grid built from the weighted samples; when the effective N `(Σw)²/Σw²` falls below 8 the half-life doubles (up to 6 times, then flat). Records `distribution.half_life_sec` (absent when flat) and `distribution.effective_n` per stage (#10209) | after `merge_wait` |
-| `land-v4` | `land` | `land-v3`'s, plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
+| `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are `land-2026-10-04-twin-otter`'s own answer, unchanged | at the merge |
+
+### Retired heuristics
+
+A retired id is **not registered**: it produces no `eta.estimate`, no
+`eta.snapshot` `alternates[]` entry and no shadow-ledger pairs, and
+`eta backtest --heuristic` / `eta promote` reject it as an unknown id. Pairs
+for it in an older `shadow.json` load without error and are never added to.
+Pending-store entries for it are dropped when the daemon restores the store
+(the startup log counts them), so they are never scored: no `eta.outcome` and
+no ledger pair when the item lands or is censored at expiry. A config that
+names a retired id as `autonomous.eta.current` falls back to the kind's
+default (`land-v1`), as any unregistered id does. The ids stay immutable and are
+never reused. Historical outcomes remain
+in the outcome journals for audit; replay is not retained (a replay-only
+registry would be a second mechanism for dominated heuristics).
+
+| id | retired | reason | refs |
+|---|---|---|---|
+| `land-v3` | 2026-10-06 | Dominated in live outcomes (48 h of `eta.outcome`, `land`): pinball4 3.51 h, p25-p75 coverage 0.126, late surprise (> p90) 0.611. It sits strictly between `land-v2` and `land-v4` on every calibration figure, and `land-v4` is `land-v3` plus the stall, hold and tail fixes. Its grid step lives on inside `land-v4`. | #9970, #10484 |
+| `land-2026-10-04-amber-heron` | 2026-10-06 | Dominated in live outcomes (same 48 h window): pinball4 8.97 h (the worst of any heuristic that answers broadly), p25-p75 coverage 0.147, late surprise 0.649, barely better than `land-v2`'s 0.71. On the small common subset all seven answered (6 items) it is last on pinball. | #10207, #10484 |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -365,15 +383,13 @@ fixture. A behaviour change is a new id registered beside the old one
 
 `land-v2` ships registered-not-current on purpose, as the worked example of
 all of the above.
-`land-v3` (#9970) ships the same way: its constants are fixture-derived,
-and the live coverage/pinball result is the operator's backtest, not a claim.
-`land-2026-10-04-amber-heron` (#10207) ships the same way, named by the
-datestamp-plus-two-words convention for shipped heuristics. Its evidence is
-`.loom/state/eta/calibration.jsonl` (every landed `land-v2` outcome the
-tracker scored) plus the pending store; `eta backtest` derives the same
-evidence by replaying `land-v2` over the cases, leak-free because the table is
-refitted at each case's own `as_of`. With fewer than 20 landings, even pooled
-across stages, it returns its base estimate unchanged.
+`land-v3` (#9970) and `land-2026-10-04-amber-heron` (#10207) shipped the same way and
+were retired on 2026-10-06 (see [Retired heuristics](#retired-heuristics)).
+The calibration log (`.loom/state/eta/calibration.jsonl`, every landed
+`land-v2` outcome the tracker scored) and the recalibration machinery stay in
+the daemon; the CLI no longer loads the log or rebuilds it by replay in
+`eta view`, `eta backtest` or `eta promote`, since no registered heuristic
+reads it.
 `land-2026-10-04-twin-otter` (#10243) ships the same way; `land-2026-10-04-twin-otter-b`
 (#10244) follows it. Twin-otter's model is PR-level, so on its own it refuses every
 pre-PR item (`unknown_stage`) and could never pass the answer-rate gate against
@@ -791,7 +807,7 @@ is scored against. It is the nearest-rank 90th percentile of the same
 simulated path totals the quartiles come from, so it costs no new draws and
 leaves `p25_sec`, `p50_sec` and `p75_sec` unchanged; `run_explanation`
 recomputes all four. Every heuristic that simulates (`start-v1`, `finish-v1`,
-`land-v1`, `land-v2`, `land-v3`, `land-2026-10-04-twin-otter`) records it. It is absent only on a refusal
+`land-v1`, `land-v2`, `land-2026-10-04-twin-otter`) records it. It is absent only on a refusal
 and on an explanation recorded before the field existed, which still parses:
 the field is additive, so the schema stays `eta-explanation/v1`. The stage
 marks stay at three percentiles.
@@ -904,7 +920,7 @@ population.
 
 Every estimate records `features`: point-in-time context for the fitted
 models (`eta fit`, #10221; the twin-otter heuristic, #10222) and for testing
-which inputs matter. No v1 heuristic reads them; `land-v3` reads `labels`
+which inputs matter. No v1 heuristic reads them; `land-v4` (through its `land-v3` grid step) reads `labels`
 and `queue_running`. A feature is `null` when unmeasured, with a specific
 `features_omitted` reason. `not_collected` is only the backstop for declared
 features that nothing populates yet (#10232).
@@ -1090,6 +1106,7 @@ first call fails.
 |---|---|---|
 | `pr_additions`, `pr_deletions`, `pr_changed_files`, `pr_commits` | `pulls/{n}` | items with a PR |
 | `checks_pending`, `checks_failed` | `commits/{head}/check-runs` and `commits/{head}/status` (legacy statuses; if either read fails the features are omitted as `read_failed`) for the head the PR read shows, counted over the base branch's **required** contexts only (the `forge wait-checks` lookup and rollup): a required context still running or not yet registered is pending; one concluded other than `success`, `neutral` or `skipped` is failed. Optional checks never count; a branch that requires nothing gives `0`, `0` | items with an open PR |
+| `checks_all_pending`, `checks_all_failed` | the same head's runs and statuses over **every** check, required or not (#10334), apart from the required counts; no required lookup needed, so set even while those are `required_unknown`. An optional failure raises `checks_all_failed` only | items with an open PR |
 | `complexity_marker`, `points_marker`, `author` | `issues/{n}`: the `<!-- loom:complexity=… -->` and `<!-- loom:points=… -->` markers (the work finder's parsers) and `user.login` | every item |
 
 Each pass plans the reads that are due (`pulls` and checks older than
@@ -1140,20 +1157,32 @@ in-process state, the pool from the token directory.
 |---|---|
 | `ratelimit_core_remaining`, `ratelimit_core_reset_at` | the item's reader App's freshest REST budget reading (≤ 15 min old) and its reset |
 | `ratelimit_graphql_remaining`, `ratelimit_graphql_reset_at` | the same for GraphQL |
+| `ratelimit_writer_core_remaining`, `ratelimit_writer_graphql_remaining` | the freshest REST / GraphQL budget reading of the writer credential that serves the item's repo (#10334) |
+| `ratelimit_min_remaining`, `ratelimit_exhausted` | the fewest calls left over the item's serving reader and serving writer, both pools, and whether that is zero (#10334); a reading past its reset is ignored |
 | `breaker_state`, `breaker_cooldown_until` | the rate-limit breaker: `closed` or `cooldown`, and when an active cooldown releases |
 | `pool_usable_accounts`, `pool_exhausted` | spawnable accounts in the pool the workspace resolves to (neither bad-marked nor hard-excluded), and whether that is zero |
 
 The sink keeps each reader's readings under a public bucket label
 (`reader:<app id>@<owner>`, never a credential), because two reader Apps
 share the `reader` role but not a budget. An item's budget is the reading of
-the reader App that serves its repo; the writer's and any other reader's
-readings are never borrowed. A repo with no reader App (it reads on the
+the reader App that serves its repo; another reader's readings are never
+borrowed. Writers are per owner too: a multi-owner fleet holds one writer
+credential per managed owner (`.loom/gh-config-by-owner/<owner>` beside the
+primary `.loom/gh-config`), so each writer's readings sit under
+`writer@<owner>` — the owner its credential is installed for, else the owner
+of the repo the call served; a public owner name, never a credential, token or
+App id, and a writer line naming no owner lands in no bucket. An item reads the
+writer that serves its repo — that owner's own writer when one is registered,
+else the primary writer — carried as its own features, so neither a healthy
+reader nor another owner's healthy writer can mask an exhausted writer. A repo
+with no reader App (it reads on the
 writer) has no budget features, and neither does a reader with no fresh
 reading.
 
 Null reasons: `no_stall_snapshot` (no snapshot taken before `as_of`),
 `stale_inputs` (the snapshot is over 15 min old), `no_reader_for_repo`,
 `no_identity_reading` (the serving reader has no fresh reading),
+`no_writer_reading`, `no_budget_reading` (no identity has a live reading),
 `no_reset_in_reading` (a breaker probe carries none), `breaker_not_registered`,
 `breaker_closed` (`breaker_cooldown_until` only) and `no_token_pool`.
 
@@ -1219,7 +1248,8 @@ triggers:
 An unchanged estimate is refreshed every `refreshSecs` (300); a changed stage,
 rework count or refusal reason emits at once; a series is capped at 20
 emissions per rolling hour. Every emitted estimate waits for its outcome in
-`.loom/state/eta/pending.jsonl`, which survives a restart. It is per-host
+`.loom/state/eta/pending.jsonl`, which survives a restart (an entry whose
+heuristic is no longer registered is dropped on restore). It is per-host
 runtime state and is never git-tracked (the managed gitignore block ignores
 all of `.loom/state/*`, #9592).
 
