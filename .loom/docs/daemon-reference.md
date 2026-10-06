@@ -37,6 +37,7 @@
 - [Curator intake reconcile (#10041)](#curator-intake-reconcile-10041)
 - [Autonomous work finder (#3810)](#autonomous-work-finder-3810)
 - [Operability — config, start/stop, E2E (Phase D, #3813)](#operability--config-startstop-e2e-phase-d-3813)
+- [Reader withdrawal kill switch (`LOOM_READ_ROUTING`)](#reader-withdrawal-kill-switch-loom_read_routing)
 - [Observability exporter (`observability`, #4705, epic #4702 Phase 1)](#observability-exporter-observability-4705-epic-4702-phase-1)
 - [Fleet dashboard (`loom-daemon serve`)](#fleet-dashboard-loom-daemon-serve)
 - [Locks and lifecycle](#locks-and-lifecycle)
@@ -11346,6 +11347,25 @@ dispatch — is validated by the E2E playbook at
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
+
+## Reader withdrawal kill switch (`LOOM_READ_ROUTING`)
+
+When a reader App fails a read, the daemon withdraws it from routing for a
+while and retries the read once on the writer. Since W4-A the withdrawal is
+scoped to the `(App, owner, resource)` bucket that failed, so one owner's
+exhausted `core` pool no longer takes the reader off every other owner and
+resource; the rules are in
+[`github-authentication.md`](github-authentication.md#several-apps-one-writer-a-pool-of-readers-9248-9537).
+
+| Env | Default | Effect |
+|---|---|---|
+| `LOOM_READ_ROUTING` | *(unset: scoped)* | `legacy` (any case) restores the pre-W4-A behaviour exactly: the old failure classifier, an App-wide withdrawal for any rate limit or credential failure (until the caller's reported reset, else 300 s), no on-demand `rate_limit` probe, and no scoped withdrawal consulted when choosing a reader. Any other value is the scoped default. Read on **every** withdrawal and reader choice (a plain env read, no cache), so a process started with it set behaves as before W4-A with no new release; the daemon picks it up on its next start |
+
+Scoped withdrawals live in the daemon's memory only (a restart clears them),
+are only ever extended, never shortened, and are listed by `loom-daemon
+status` under `reader withdrawals (scoped)`. Each withdrawal, scoped or
+App-wide, is exported as a `forge.reader.withdrawn` span
+([`telemetry-schema.md`](telemetry-schema.md)).
 
 ## Observability exporter (`observability`, #4705, epic #4702 Phase 1)
 

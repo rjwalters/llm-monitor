@@ -387,7 +387,10 @@ tracker's, which loads the file (below).
 `land-2026-10-04-fresh-tide` (#10209) ships the same way. Its half-life is a
 constructor parameter (`LandFreshTide::with_half_life`), so a 1/2/7-day
 comparison needs no extra registered ids; only the 2-day default is
-registered and shadowed.
+registered and shadowed. `loom-daemon eta backtest --heuristic
+land-2026-10-04-fresh-tide --compare land-v2 --half-life-days 1|2|7` replays
+any setting on the same snapshot (#10325); it needs a journal that holds
+stage samples (run `eta backfill` first), or every case refuses.
 `land-v4` (#10210) ships the same way.
 
 ## Fitted coefficients (`eta-fit/v1`)
