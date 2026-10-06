@@ -454,8 +454,12 @@ waited (`loom.dispatch.idle_slot_seconds`). Forge label-stage dwell
 (`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state}`)
 covers created → curated, curated → `loom:issue`, building → review requested
 and review requested → merged. It reads ETag-cached stage listings every 5
-minutes plus at most 8 per-item reads per sample, never per tick. Details are
-in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+minutes plus at most 8 per-item reads per sample, never per tick. With
+`fleet.captainGauges` configured, the fleet captain samples for the fleet and
+dispatchers stand down while its published data is fresh
+(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
+[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
+Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
 re-date remedy over a trailing 24 h: `loom.merge.redate_prs{state}`
@@ -583,6 +587,12 @@ shadow on a bucket means spend from outside this fleet's daemons (agent `gh`
 calls, another host, an operator) or an uninstrumented caller. A negative
 shadow means the bucket's readings undercount it (sparse readings, or the
 readings describe another bucket — #10571), not that Loom over-spent.
+
+**Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
+`auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
+`peer_coord.rs` and `main_health_gate` bypasses the `invoke github` span, so it
+reads as shadow spend. The span-vs-`/rate_limit` hourly reconciliation is an
+operational check on a fleet host (shadow recipe above), not a CI check.
 
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry

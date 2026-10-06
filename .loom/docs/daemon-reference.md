@@ -1473,7 +1473,7 @@ auth**. A reader that cannot serve the store falls through to the writer after
 one request. The App needs read access to the store repo (`contents: read`).
 Calls are counted in the forge-call stats as `fleet_store`. GitHub only.
 
-### `fleet-config render [--host H] [--check] [--offline]`
+### `fleet-config render [--host H] [--check] [--offline] [--allow-reduce]`
 
 Computes the host's machine tier as `deep_merge(fleet/defaults.json,
 fleet/hosts/<H>/defaults.json)` — the same `config_resolver::deep_merge` the
@@ -1489,6 +1489,17 @@ so a no-op render makes no backup.
 `--check` writes nothing: it prints a per-path diff (`~ key: disk -> store`,
 `+`, `-`) and exits `1` on drift, `0` in sync, `2` on error — the drift
 detector. Comparison is semantic (parsed JSON), not textual.
+
+**Lossy-reduction guard (2am#1653):** a write that would DROP a top-level
+block the file on disk carries but the store's render does not is refused by
+default (exit `2`; `--check` reports it as `LOSSY REDUCTION`) — the store is
+the tier's record of truth, so the block belongs there first
+(`fleet-config propose adopt [--host H]` proposes exactly that). Pass
+`--allow-reduce` to accept the loss knowingly. This CLI flag is the operator's
+answer to that prompt; the daemon's own unattended writes (the startup pass,
+and the timer pass under `fleet.autoApply`) apply the identical guard but have
+no operator to ask, so they just skip the write and surface the loss via the
+sync status (`ConfigPass.error` / the tier's `detail`) instead of writing.
 
 If the forge is unreachable, `render` (and `state`) use the last good snapshot
 and print a `CACHED … last confirmed current <age> ago` warning; `--offline`
@@ -7022,6 +7033,69 @@ repo, and every existing snapshot). Then re-enable `fleetRefresh` on any host
 where it was turned off as a mitigation; the other hosts stand down by
 themselves.
 
+#### Fleet gauges produced by the captain (W12)
+
+Some collector gauges describe the forge, not the host. The forge label-stage
+dwell (`loom.forge.stage_dwell`, `loom.forge.stage_items`; singleton job
+**`stage-dwell`**) lists the same stage labels of the same repos on every host
+that manages them, so N hosts spend N times the reader budget to export N
+copies of one fact. With `fleet.captainGauges` configured, the declared
+captain produces it for the fleet and a dispatcher stops producing it for the
+repos the captain covers, **only while the captain's output is fresh**.
+Assigned, not elected: there is no standby producer. Per-host gauges and
+dispatch gates (`role_queue_gate`, `role_demand`, the work finder's listings)
+are unchanged on every host. Code: `observability/captain_gauges.rs`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fleet.captainGauges.enabled` | `false` | On the declared captain: arm the singleton jobs (`host.health.armed_singleton_jobs`) and publish their freshness |
+| `fleet.captainGauges.standDown` | `false` | On a dispatcher: skip a job for the repos a fresh heartbeat covers. Env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` (`0`/`1`) overrides it per host |
+| `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
+| `fleet.captainGauges.publishIntervalSecs` | `600` | How often the captain writes the heartbeat |
+| `fleet.captainGauges.ref` | `fleet.etaFitRef` (`eta-fit`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
+
+**How a dispatcher knows the captain is fresh.** Hosts have no channel to
+each other's telemetry, so the captain publishes a heartbeat to the fleet
+store (`fleet.repo`), beside its ETA fit and through the same transport and
+credentials (#10395): `captain/gauges.json`, schema `captain-gauges/v1`, with
+per job the `as_of` of the captain's last finished pass (its points handed to
+the OTLP sink) and the repos it covered. A dispatcher reads it once per
+collector pass with `If-None-Match` (a `304` when unchanged) and stands down
+for a job and repo only when the heartbeat names the declared captain and the
+`as_of` is within `maxAgeSecs`. A read failure keeps the last heartbeat, which
+keeps ageing; a missing or malformed one counts as absent. Without
+`fleet.repo` there is no heartbeat and every host produces locally. When a
+dispatcher takes a repo back it starts from a fresh baseline, so the
+transitions the captain already sampled are not replayed.
+
+| Gate | `fleet.captainGauges` | What the pass does |
+|---|---|---|
+| `Armed` | `enabled` | Arms `stage-dwell`, produces as before, publishes the heartbeat every `publishIntervalSecs` |
+| `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
+| anything else | | Produces locally, exactly as before |
+
+**Captain down** shows as `loom.captain.gauge_age_seconds{task}` growing on
+every dispatcher, then `loom.captain.gauge_fallback{task} = 1` once it passes
+`maxAgeSecs` while the dispatchers produce locally: the gauges never go
+missing. Alert on `gauge_fallback == 1` or on the age passing the bound. See
+[`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+
+**Mixed-version safety.** Both switches default off and older daemons ignore
+the keys, so an unconfigured or older host keeps today's behaviour. A
+dispatcher stands down only on fresh data from the current captain, so an
+older captain (no heartbeat) leaves every dispatcher producing.
+
+**Rollout order**: deploy everywhere; set `fleet.captainGauges.enabled` and
+confirm the captain's `loom.captain.gauge_age_seconds` stays under
+`maxAgeSecs`; then set `fleet.captainGauges.standDown`. The captain needs the
+OTLP exporter, the fleet repos provisioned, and the writer App's
+`contents:write` on the store's publication branch (already true where the ETA
+fit is published).
+
+**ETA queue friction** is already a singleton: it runs inside the ETA pass,
+which only the ETA authority runs (#10498), and the authority defaults to the
+declared captain. It needs no heartbeat.
+
 ### Role-runner host roster (#6704, phases A and B)
 
 The design record — [`role-runner-roster.md`](role-runner-roster.md) — picked
@@ -7377,8 +7451,8 @@ layers:
 1. **The base repo**, resolved locally the way gh resolves it (`GH_REPO` >
    `gh repo set-default` > `upstream` > `github` > `origin`, the same port
    write scoping uses). Each site keeps its own `GH_REPO` rule: placeholder
-   (`gh api`) sites honour `LOOM_REPO`/`GH_REPO`, `gh repo view` sites ignore
-   it. The answer is memoised until any git config file that defines it
+   (`gh api`) sites honour `LOOM_REPO`/`GH_REPO`, `gh repo view` sites and
+   the hygiene read path (below) ignore it. The answer is memoised until any git config file that defines it
    changes. The fingerprint is `(dev, inode, length, mtime)` of every file
    `git config --list --show-origin` read (system, global, includes),
    `<common-dir>/config` and `<git-dir>/config.worktree` (presence counts),
@@ -7506,12 +7580,13 @@ rate-limit signature, so it never trips the breaker. A shed books an
 `intake_reconcile` reports a shed listing as a skipped pass, not a failure.
 Classified sites:
 Hygiene — `worktree.issue_state`, `worktree.has_open_pr`, `clean.pr_list`,
-`clean.pr_by_number_rest`, `clean.pr_status_rest`, `worktree.landed_pulls`,
-`intake.list_open`; Observability — `stage_dwell`'s `api.rest`,
-`telemetry.repo_identity`. `worktree.issue_state_rest`,
-`worktree.issue_closed_at` and `visibility.repo` are conditional reads
-through the shared ETag store (#10512) and route as `Gate` — not shed, but
-mostly free `304`s. Nothing under `sweep_registry/`,
+`clean.pr_status_rest`, `worktree.landed_pulls`, `intake.list_open`, and
+`clean.pr_by_number_rest` / `worktree.issue_state_rest` /
+`worktree.issue_closed_at` on a root without a repo fact; Observability —
+`stage_dwell`'s `api.rest`, `telemetry.repo_identity`. `visibility.repo`, and
+the single-item hygiene reads on a root with a repo fact, are conditional
+reads through the shared ETag store (#10512, W6) and route as `Gate` — not
+shed, but mostly free `304`s. Nothing under `sweep_registry/`,
 `claim_reconciliation`, `merge_*`, verdict, quarantine or reclaim, nor
 `forge_check_claim`, `cli/lease_co_occupancy`, `role_runner/roster`,
 `worktree_reaper` or `primary_checkout_reaper`, is ever anything but `Gate`
@@ -7535,6 +7610,64 @@ A `Gate` read always confirms on the writer, and the reader is not withdrawn.
 | `LOOM_FACADE_CWD_ROUTING` | on | `0` disables the derivation: every untargeted read stays on the writer. Typed reads keep the class-aware chain, so a typed `Observability` read (`telemetry.repo_identity`) can still be shed. Read on every call. |
 | `LOOM_READ_SHED` | on | `0` treats every read as `Gate`: no shed and no gone-memo shortcut, so `Hygiene`/`Observability` reads fall back to the writer. Derivation stays on. Read on every call. |
 | `LOOM_READ_ROUTING` | `v2` | `legacy` is the only exact revert: the pre-W4 path (no derivation, no classes, no reserve, the unconditional reader → writer fallback), and it reverts W4-A's scoped withdrawal and W4-B's split and spill with it. `LOOM_FACADE_CWD_ROUTING=0` plus `LOOM_READ_SHED=0` together restore W4-C's load placement only (untargeted reads on the writer, nothing shed), keeping W4-A/W4-B, the retry on the next reader and the writer pins. Read on every call. |
+
+### Hygiene read path: the checkout's own repo, conditional and fresh (`LOOM_HYGIENE_CONDITIONAL`)
+
+The REST issue and PR reads behind the worktree reaper, eager reclaim,
+`clean` (sweep transients, stale branches, the `pr-<N>` probe),
+`--aggressive`, `checkpoint read` and the primary-checkout reaper go through
+one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Not every hygiene
+read does yet: the GraphQL-backed probes `gh::issue_state` (`gh issue view`,
+in `clean`'s worktree pass and stale-branch cleanup), `check_pr_merged`, and
+the `check_pr_status_for_branch` fallback (`clean` and the primary-checkout
+reaper, when REST is unknown or no owner resolves) still name gh's own
+target and are not conditional.
+
+- **The checkout's own repo.** Reads name gh's base repo for the root,
+  resolved and verified by the repo facts above with `GH_REPO`/`LOOM_REPO`
+  ignored, by its canonical (post-rename) name. A process that exported
+  `LOOM_REPO` for another repo never reads that repo's issue `N` for this
+  checkout. A root the facts cannot model keeps gh's `{owner}/{repo}`
+  placeholder, unconditional, with `GH_REPO` stripped from the child. A fact
+  that cannot be established now is "unknown" (keep). The `head=` owner for
+  PR listings follows the same rule.
+- **Conditional and fresh.** `issues/{n}` (state and `closed_at` in one
+  read) and `pulls/{n}` (status and `head.sha`) are conditional `GET`s on the
+  agents' shared `view-` entry, so an unchanged item is a free `304` and
+  `gh-cached --invalidate N` drops the entry after a write. Nothing is
+  remembered beyond the `ETag` and its body: every read reaches the forge,
+  and a `304` is server-fresh (ADR-0021). Branch listings
+  (`pulls?head=`) stay unconditional, because `--invalidate` does not drop
+  them.
+- **Identity.** An answer must be the item asked for: its `number`, and its
+  repository by `base.repo.id` (when the record knows the id) or by name. A
+  mismatch — a transferred item, a followed redirect — is "unknown" and
+  bumps `hygiene.identity_mismatch`. Only a first-hand `200` for the
+  asked-for number that names the repo under a new name (same id, or no id
+  to compare) marks the repo record suspect, as of the request-sent time, so
+  a renamed repo re-resolves on the next read; a `304` body, another number
+  (a transferred issue) or another repo id never does.
+- **Rate-limit breaker.** While the global breaker is cooling, an item read
+  makes no forge call (not even the repo resolve) and is "unknown"; a failed
+  item read's stderr is reported to the breaker, so a rate-limit refusal
+  trips it. The branch listings and the owner read keep their pre-W6
+  behaviour: they never consulted the breaker.
+- **Failure.** A shed, timeout, non-200/304, parse failure or mismatch is
+  "unknown"; a `404`/`410` is "gone" (`hygiene.item_gone`). Both are KEEP —
+  never "closed" or "no PR".
+- **Item-scoped `404`.** A reader `404` on `issues/{n}` or `pulls/{n}` is the
+  item's answer (no writer retry, no withdrawal, `forge.item_scoped_404`)
+  only when the same reader answered a `200`/`304` for the same repo and the
+  same endpoint family (`issues` vs `pulls`) within the last hour. Otherwise
+  it is a coverage failure, retried on the writer as before.
+- **Trust boundary.** A `304` serves the body stored next to the `ETag` in
+  the `0700` per-user store. Any process of the same uid (agents included)
+  can write it; that is accepted, as the same uid can already edit the
+  worktrees and the daemon's state. Other users are refused.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_HYGIENE_CONDITIONAL` | on | `0` makes the single-item reads on a root with a repo fact unconditional: no `If-None-Match` sent, the `view-` entry neither read nor written. Everything else stays: the explicit target, the identity check, reader routing and the breaker. It is not a revert of W6 — no switch restores the pre-W6 `LOOM_REPO` > `origin` target. `LOOM_REPO_FACTS=0` sends every item read down the placeholder path (`{owner}/{repo}`, `GH_REPO` stripped, unconditional). |
 
 ### Merged-PR worktree reaper (#4876)
 
@@ -8495,6 +8628,79 @@ this is the periodic counterpart to `check-main-clean.sh`'s own #6162 AC3
 detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
+
+### Codex session-container reconciler (#10453)
+
+The daemon restarts dead Codex session containers itself
+(`loom-daemon/src/session_reconcile.rs`). The pass runs once at start, then
+every interval. It visits each **enabled**, session-managed Codex account
+across the registered roots:
+
+| Container `loom-codex-session-<acct>` | Action |
+|---|---|
+| held (operator stop) | none, and no `docker` call |
+| running | none |
+| restarting, first pass | none (Docker's `unless-stopped` policy is retrying) |
+| restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
+| stopped, host-mounted | `docker start`, via the `accounts session start` path |
+| missing, host-mounted | recreated with the workspace and image of the last operator `session start`; otherwise the label last seen on it; otherwise the registered roots' common parent, logged as a guess. Never `/`: that is refused and reported |
+| stopped or missing, private-clone | skipped with one WARN; never recreated host-mounted |
+
+- The pass never stops, removes or restarts a container. A container with an
+  in-flight `docker exec` is never touched (#5119).
+- After a resume or recreate, the account is re-probed at once, bypassing the
+  300 s probe cache.
+- A failed start backs off per account: 120 s, doubling, capped at 30 min. It
+  WARNs once per distinct error. No `docker` call runs while backing off. A
+  start that "succeeds" but whose container is not running at the next pass
+  (stopped, gone or restarting) counts as a failed start. The count resets
+  only once the container is seen running.
+- If reading a container fails, or any `docker` call (including a start or
+  `run`) times out, Docker is treated as unavailable. The rest of the pass is skipped and the **pass** backs off on
+  the same schedule. No start is attempted and no per-account failure is
+  counted.
+- Every `docker` call has a deadline: 60 s, 120 s for `stop`, 600 s for `run`.
+  The operator CLI inherits these deadlines. An `accounts session start` that
+  has to pull the image for the first time on a slow link fails after 600 s,
+  where it used to wait indefinitely. `docker pull` the image beforehand if
+  that is a risk.
+- With no enabled session-managed account, the pass makes zero `docker` calls.
+- **Hold:** `loom-daemon accounts session stop <acct>` keeps the container
+  down. It writes `.session-hold.json` in the account's profile directory
+  *before* `docker stop`. Only an operator `accounts session start` (or
+  `shell`) removes it, by deleting it before that start touches Docker.
+  Whether an account is held depends only on whether the file exists, never
+  on timestamps, so a wall clock stepping back between a start and a stop
+  cannot drop the hold. The pass checks the hold before any `docker` call and
+  again just before a start. If a pass already past that check still
+  `docker start`s the container between `stop`'s `docker stop` and its
+  `docker rm`, the `rm` fails. `stop` then re-inspects, re-applies the
+  in-flight-exec refusal, and stops and removes the container once more. That
+  one retry suffices because every later start sees the hold. `session status`
+  shows `stopped, held (operator stop)`, and `session status --json` carries
+  `"held": true|false`, a field added in #10453. The hold is per account: a
+  hold, or `enabled=false`, in any registered root holds the account in all
+  of them. An operator start deletes the hold in the account's profile in
+  every registered root. `accounts disable <acct>` also keeps it down, but it
+  takes the account out of dispatch too.
+- An operator `session start` also records its workspace and image in
+  `.session-last-start.json` next to the hold. A container recreated after a
+  daemon restart uses those values. If that record cannot be written, the
+  start still succeeds, with a warning: the container is up and unheld.
+
+```json
+{ "autonomous": { "sessionReconcile": { "enabled": true, "intervalSecs": 60 } } }
+```
+
+| Env var | Config key | Precedence | Default |
+|---|---|---|---|
+| `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
+| `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+Docker reports a crash-looping container as `Running=true, Restarting=true`.
+`accounts session status`, `start`, the login probe and `session-exec posture`
+all treat it as **not running**: `start` refuses to reuse it, and posture
+yields `not-running`.
 
 ### Autonomous periodic support-role runner (#4015)
 

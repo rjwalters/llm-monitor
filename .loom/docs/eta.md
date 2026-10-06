@@ -1244,13 +1244,28 @@ for a fit or backtest to report.
   v1 transform exactly as before; all `FEATURES_V2` names use
   `model_features_v2` with `twin_otter.input.priority`. So a v2 explanation
   recomputes from its own record, as v1's does.
-- **Roster history.** The tracker's roster history is set with
-  `Tracker::set_fleet_history` and the fit's with `rows::build_with_context`.
-  Today no reader of the fleet store's `repos.yml` commit history feeds
-  either, so both sides pass `None`. `repo_rank` and
-  `ahead_dispatch_fleet` are then unknown in training and serving alike (the
-  indicators are 1, the standardized columns constant). They are not
-  silently filled from today's file.
+- **Roster history** (`eta::roster_history`, #10586). On the ETA
+  authority, each fleet refresh cycle polls the fleet store (`fleet.repo`,
+  `fleet.ref`) before the fit: `GET repos/{store}/commits?path=repos.yml`,
+  paginated over the last 21 days (the 14-day window plus margin), plus the
+  newest earlier commit as the anchor in force when the window opens. Each
+  revision's `repos.yml` is cached content-addressed under
+  `.loom/state/eta/roster-history/`. The fit (`fit::run`) and the tracker's
+  pass (`Tracker::set_fleet_history`) both load that one cache, so the two
+  sides read one history value.
+  - *Knowability convention.* `committed_at` is the committer date.
+    `observed_at` is set only for a commit first listed by a poll that
+    follows an earlier successful poll: it is that poll's time, a bound that
+    is never early. So a backdated or late-pushed edit counts only from when
+    it was seen. Commits listed by a cache's first poll have no observation
+    and use their commit date. `FitReport.roster_history` counts each basis.
+  - *Unknown, never today's file.* The history is `None` when there is no
+    cache (no `fleet.repo`, or no successful poll yet), when any cached
+    revision is unreadable or not a valid roster, or when the last
+    successful poll is over 24 h old. `repo_rank` and
+    `ahead_dispatch_fleet` are then unknown on both sides, with their
+    indicators at 1. A failed poll leaves the cache and `last_poll_at`
+    unchanged.
 - **`ready_wait`.** keen-wren's start comes from the item's position in the
   work finder's own dispatch plan. The planner sorts that plan with the real
   comparator: level, star, star time, main-red fix, the workspace's
@@ -1258,12 +1273,11 @@ for a fit or backtest to report.
   issue is therefore earlier in the plan and gets an earlier start. No
   second ordering is defined for the ETA to drift from (#10528).
 - **Status.** keen-wren is registered in shadow (tier `candidate`,
-  after `held-heron`, before the twin-otter pair). Still open in #10508: the
-  fleet-store roster-history reader; publishing the v2 file from the captain
-  to other hosts (`fit::publish` carries v1 only, so only the fitting host
-  has a v2 file); the walk-forward backtest against twin-otter-b; and live
-  evidence that the ETA authority, the loom-ui chooser and the nightly
-  scoring pick the new id up.
+  after `held-heron`, before the twin-otter pair). Still open in #10508:
+  publishing the v2 file from the captain to other hosts (`fit::publish`
+  carries v1 only, so only the fitting host has a v2 file, #10586); the
+  walk-forward backtest against twin-otter-b; and live evidence that the ETA
+  authority, the loom-ui chooser and the nightly scoring pick the new id up.
 
 ### Friction predictors and cumulative stage age (#10521)
 
