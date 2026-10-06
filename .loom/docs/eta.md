@@ -267,6 +267,7 @@ only.
 | `finish-v1` | `finish` | in-sweep phase durations (`sweep-outcome-telemetry.jsonl`) | after the in-sweep merge when at least half of the history's successful sweeps merged themselves, else at the verdict |
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
+| `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
 | `land-2026-10-04-fresh-tide` | `land` | `land-v2`'s, with every stage sample (observed and censored) weighted `exp(−age / half_life)`, half-life 2 days, and the grid built from the weighted samples; when the effective N `(Σw)²/Σw²` falls below 8 the half-life doubles (up to 6 times, then flat). Records `distribution.half_life_sec` (absent when flat) and `distribution.effective_n` per stage (#10209) | after `merge_wait` |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
@@ -387,9 +388,63 @@ all of the above.
 were retired on 2026-10-06 (see [Retired heuristics](#retired-heuristics)).
 The calibration log (`.loom/state/eta/calibration.jsonl`, every landed
 `land-v2` outcome the tracker scored) and the recalibration machinery stay in
-the daemon; the CLI no longer loads the log or rebuilds it by replay in
-`eta view`, `eta backtest` or `eta promote`, since no registered heuristic
-reads it.
+the daemon. `land-2026-10-06-calm-plover` (below) reads it, so `eta view`
+loads it and `eta backtest` / `eta promote` derive the same evidence by
+replaying `land-v2` over the cases, leak-free because the calibration is
+refitted at each case's own `as_of`.
+`land-2026-10-06-calm-plover` (#10489) ships the same way: registered, not
+current, shadowed so it appears in every snapshot's `alternates` (the loom-ui
+ETA chooser), promotion only through the #10233 gate. It is a generic
+calibration layer; the registered id fixes its base at `land-v2`
+(`eta::conformal::calibrate` takes any base explanation and the base's
+observations).
+
+*Method.* A past base estimate with quantile `q_τ` and actual remaining time
+`a` has score `ln(a / q_τ)`; `a ≤ q_τ` exactly when the score is `≤ 0`. The
+adjusted quantile is `q_τ · exp(c_τ)` where `c_τ` is the finite-sample
+corrected (`(n+1)τ/n`) split-conformal quantile of the scores in the cell,
+so it would have held `τ` of the cell's outcomes: p25, p50, p75 and p90 each
+aim at 25/50/75/90%. The cell is the estimate's (stage, age bucket) when it
+has 20 landings in the window, else the stage, else all stages, else nothing
+(the base estimate is returned unchanged with no `calibration`; rows logged
+before observations carried the base's p25/p75/p90 and age are not evidence).
+A still-open base estimate is a **lower bound** `ln(elapsed / q_τ)` entering a
+Kaplan–Meier estimate with the landings; an unresolvable tail clamps to the
+largest bound. The change of every shift is limited to `ln 1.2` per day: the
+shift is replayed day by day (on `as_of`'s own day lattice) from the oldest
+usable base estimate, each day's raw fit clamped to one step of the day
+before. The anchor is fixed by the evidence, not by `as_of`, so two estimates
+a day apart differ by at most one step whatever enters or leaves the window,
+and a backtest replays it exactly; only log compaction moves the anchor
+(#10497). Outputs are made monotone (`p25 ≤ p50 ≤ p75 ≤ p90`).
+
+*Point-in-time.* Everything is a function of the estimate's own `as_of`: a
+base estimate made at or after it, and an outcome *known* at or after it, are
+not used (a landing not yet known is a censored bound). A test perturbs every
+post-`as_of` outcome and requires bit-identical output.
+
+*The record.* `calibration{method, base, window{from,to,days}, level, stage,
+age_bucket, shift{p25,p50,p75,p90}, raw_shift, n_events, n_censored,
+max_daily_step, replay_from, base_quantiles_sec}` — the shifts are natural-log units, so
+"why this range?" is `base_quantiles_sec × exp(shift)`; the result recomputes
+from the explanation alone.
+
+*Why it differs from `amber-heron`* (retired, see above). Amber-heron also
+folds still-open estimates in as lower bounds, so censoring is not the
+difference. What differs
+is what is calibrated against what. Amber-heron fits one distribution of
+`ln(actual / p50)` per stage and sets every quantile by
+`p50 · exp(Q(τ) − Q(0.5))` (default `SpreadOnly`): the base median is kept
+as-is, and the p25/p75/p90 are placed relative to it using ratios to the
+*median*, not to the quantile being reported, so no reported quantile is tied
+to its own hit rate. It has no age conditioning, and a recency-weighted fit
+that nothing limits from one day to the next — on the live data #10489
+reports it as the worst candidate (pinball 8.97 h, late surprise 0.649).
+Calm-plover scores each quantile against itself (`ln(actual / q_τ)`), moves
+the median too, conditions on the age bucket, and rate-limits the adjustment.
+That it fixes those defects is the hypothesis the shadow evidence and the
+#10233 gate test; it is not claimed here.
+
 `land-2026-10-04-twin-otter` (#10243) ships the same way; `land-2026-10-04-twin-otter-b`
 (#10244) follows it. Twin-otter's model is PR-level, so on its own it refuses every
 pre-PR item (`unknown_stage`) and could never pass the answer-rate gate against
