@@ -1467,7 +1467,7 @@ inventing a record kind per signal. Envelopes carry `schema_version: 10`.
 | `interval_start` | RFC 3339, optional | start of the interval the batch's delta counters cover (OTLP `start_time_unix_nano`; the tick start for `loom.dispatch.decisions`); defaults to `captured_at` |
 | `points[].name` | string | closed vocabulary, `telemetry::ops::MetricName` |
 | `points[].value` | int or float | non-finite floats are dropped before the queue (at emit) and again at export |
-| `points[].labels` | object | optional; keys limited to `reason`, `provider`, `account`, `model`, `state`; values ≤128 bytes, no control chars, ≤8 per point |
+| `points[].labels` | object | optional; keys limited to `OPS_METRIC_LABEL_KEYS` (`reason`, `provider`, `account`, `model`, `state`, `resource`, `task`, `heuristic`, `kind`, `repo`); values ≤128 bytes, no control chars, ≤8 per point |
 
 Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 **delta `Sum`**, one point per non-zero work-finder outcome per tick, labelled
@@ -1608,6 +1608,26 @@ fixed daemon loop name: `auto_update`, `eta_fleet_refresh`, `eta_pass` or
 |---|---|---|---|
 | `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
 | `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
+
+ETA pipeline health (Issue #10391, `observability/ops/eta_health.rs`). All
+gauges, sampled once per collector pass, so they stay alive when no
+`eta.fleet_refresh` record is emitted (a stood-down host). An unmeasurable
+reading emits no point. `kind` is `start`/`finish`/`land`; `heuristic` is a
+registered heuristic id; `repo` is `owner/repo` of a cached fleet snapshot.
+Never an issue number, sha or path.
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.eta.health.items` | `{item}` | `kind`, `heuristic`, `reason` ∈ `answered` or a `no_estimate_reason` | live items in the tracker's pending set (newest estimate per item and heuristic). Answer rate is `answered / sum`. Omitted when ETA is disabled |
+| `loom.eta.health.fit_loaded` | `1` | none | `1` when a coefficient file is loaded, else `0` |
+| `loom.eta.health.fit_age_seconds` | `s` | none | now minus the loaded file's cutoff. Omitted when none is loaded |
+| `loom.eta.health.fit_check_age_seconds` | `s` | `reason` (the last fit check's outcome or skip reason) | time since the last fit check. Omitted until one has run in this process |
+| `loom.eta.health.snapshot_age_seconds` | `s` | `repo` | now minus each cached fleet snapshot's `as_of` |
+| `loom.eta.health.refresh_gate` | `1` | `state` ∈ `captain`, `no_captain`, `stand_down`, `disabled` | `1` for the current gate state, `0` for the other three. Before the first tick it is the state the read-only captain resolver reports (`disabled` when the loop does not run) |
+| `loom.eta.health.refresh_last_cycle_age_seconds` | `s` | none | time since the last refresh tick (stand-down ticks count). Omitted before the first tick; keeps growing if the loop stalls |
+| `loom.eta.health.refresh_repos` | `{repository}` | `reason` (a fleet-refresh stop reason) | repos per stop reason in the last tick that refreshed; a reason that drops out is exported once as `0` |
+| `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
+| `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
 
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
@@ -2175,6 +2195,15 @@ estimate is carried with its `no_estimate_reason` and no quantiles: that it
 as "no such issue" instead. No field carries forge free text (no title, no
 label text, no comment body): every value is an enum, a number, or a
 daemon-derived id.
+
+### `pick.decision`
+
+One OTLP-only log record per role tick and per work-finder tick (Issue #10212):
+the ranked candidate list (capped at 50, with `candidates_total`), the items
+acted on, and a closed-set reason code per skipped candidate. Empty ticks still
+emit, so per-host service cadence is measurable. Full field reference, the
+SigNoz rank-at-instant query and the rows/day volume:
+[`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
 
 ### `tokens.snapshot`
 
