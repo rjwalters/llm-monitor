@@ -1968,6 +1968,12 @@ envelope's `trace_context` to the issue's D32 story
 (`story_context(repo_id, issue)`), so they land in the issue's story trace;
 a repo with no resolvable `repo_id` gets none.
 
+**One emitter per fleet (#10498).** Only the fleet's ETA authority emits these
+kinds (and `eta.snapshot`, `eta.fit`); every record carries the attribute
+`loom.eta.authority`, the authority's host id, which equals the envelope's
+`host_id`. `uniqExact(host.id)` over `eta.*` in the last hour is `1`. See
+[`eta.md`](eta.md#one-eta-authority-per-fleet-fleetetaauthority-10498).
+
 **Provenance is required on both.** `version`, the full 40-hex `revision`
 (or `unknown` for a tarball build), `tree_state` and `complete` (a full SHA
 and a `clean`/`dirty` tree) of the computing daemon,

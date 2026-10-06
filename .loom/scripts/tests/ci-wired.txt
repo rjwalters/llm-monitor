@@ -293,3 +293,7 @@ tests/hermit/test-stateless-ceremony.sh
 # scripts/ — repo-root tooling suites. Hermetic: builds a disposable git
 # repo under mktemp -d with its own identity, no network, no gh.
 scripts/test-changelog.sh
+
+# #9987: spawn-claude.sh managed-gh container admission. Hermetic: a fake daemon
+# and docker stub under mktemp -d; no network, forge or real daemon binary.
+test-spawn-claude-managed-gh.sh

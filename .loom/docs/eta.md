@@ -270,6 +270,7 @@ only.
 | `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
 | `land-2026-10-04-fresh-tide` | `land` | `land-v2`'s, with every stage sample (observed and censored) weighted `exp(−age / half_life)`, half-life 2 days, and the grid built from the weighted samples; when the effective N `(Σw)²/Σw²` falls below 8 the half-life doubles (up to 6 times, then flat). Records `distribution.half_life_sec` (absent when flat) and `distribution.effective_n` per stage (#10209) | after `merge_wait` |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
+| `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are `land-2026-10-04-twin-otter`'s own answer, unchanged | at the merge |
 
@@ -445,6 +446,24 @@ the median too, conditions on the age bucket, and rate-limits the adjustment.
 That it fixes those defects is the hypothesis the shadow evidence and the
 #10233 gate test; it is not claimed here.
 
+`little-v0` (#10208) is registered the same way but is a **floor**, not a
+candidate: zero parameters, expected to lose to `land-v2` (long waits are mostly
+PRs held for a human, which a queue model cannot see), reported beside every
+candidate in `eta backtest` / `eta view` as the bar a fitted model must clear. It
+is never set as `current.land`, and the gates only ever promote a candidate that
+measurably beats `land-v1`.
+
+Its inputs arrive in `EstimateInput.queue` (`eta::stage_queue`), never fetched:
+for the stage the PR is in, `items_ahead` (other open PRs in that stage and
+scope that entered it earlier; scope is the repo for `merge_wait`, the fleet for
+`review_wait` / `doctor`) and `drain_rate_per_hr` (exits from the stage in
+scope over the 24 h before `as_of`, each weighted `2^(-age/6h)` and normalised so
+a steady rate reads as itself), from events and the roster known before `as_of`.
+The explanation's `queue` record carries `items_ahead`, `drain_rate_per_hr`,
+`half_life_sec`, `window_sec`, `exits`, `wait_sec`, each later stage's service
+mean and the seed, so `p50_sec = round(items_ahead / drain_rate_per_hr * 3600) +
+round(sum of service means)` is recomputable from it alone. A backtest
+`ReplayCase` carries the same `queue`, built by the same `stage_queue` function.
 `land-2026-10-04-twin-otter` (#10243) ships the same way; `land-2026-10-04-twin-otter-b`
 (#10244) follows it. Twin-otter's model is PR-level, so on its own it refuses every
 pre-PR item (`unknown_stage`) and could never pass the answer-rate gate against
@@ -1408,6 +1427,8 @@ issue's D32 story trace.
 
 ## The live list (`eta.snapshot`)
 
+> Only the fleet's [ETA authority](#one-eta-authority-per-fleet-fleetetaauthority-10498) emits it (#10498).
+
 The estimates above are emitted one at a time as `eta.estimate` log records
 and live in SigNoz, which is what accuracy scoring needs and what a dashboard
 list does not: answering "what is this host estimating *right now*" from an
@@ -1745,6 +1766,47 @@ estimates report `scope = fleet`. That is #9343's designed path; set
 `historyScope = local` to keep a host on its own journals.
 
 Each pass logs `eta: pass emitted=N refused=M outcomes=K …`.
+
+### One ETA authority per fleet (`fleet.etaAuthority`, #10498)
+
+Exactly one host computes and emits ETAs, so SigNoz holds one series per item,
+not one per host.
+
+- **The rule** (re-read every pass, no restart):
+  1. `fleet.etaAuthority: "<host id>"` (or `LOOM_ETA_AUTHORITY`) names it:
+     reason `explicit`. This is the override, and is how the authority is
+     later moved to the captain.
+  2. Else the fleet refresher: the declared `fleet.captain`, or, with none
+     declared, this host when its own `autonomous.eta.fleetRefresh.enabled` is
+     on: reason `fleet_refresh`.
+  3. Several candidates and no explicit key: the lowest host id wins (reason
+     `lowest_id_fallback`) and the others log one warning per change naming the
+     conflict.
+  4. No candidate and no explicit key: no authority (`no_candidate`); `eta
+     doctor` warns.
+- **How a host learns its peers' state: it does not.** There is no peer
+  roster, and a network read in a per-pass gate would turn a peer outage into
+  an ETA outage. The candidate set uses this host's own inputs plus the
+  committed `fleet.captain` / `fleet.etaAuthority`. `fleetRefresh.enabled`
+  defaults to `true`, so two default hosts with no captain and no
+  `fleet.etaAuthority` each think they are the authority. On a multi-host
+  fleet declare one of the two keys. A fleet where no host has fleetRefresh on
+  and no key is set has no ETA emitter at all.
+- **The authority** runs the tracker passes that emit `eta.estimate`,
+  `eta.outcome` and `eta.snapshot`, and is the only host that fits
+  (`eta-fit/v1`), **locally, even when `fleet.captain` names another host**: it
+  never takes a published fit in place of its own. Published fits (#10395)
+  stay for redundancy. Every `eta.estimate` / `eta.outcome` carries
+  `loom.eta.authority`, the authority's host id.
+- **Every other host** makes no forge read for the ETA pass, emits no
+  `eta.estimate`, `eta.outcome`, `eta.snapshot` or `eta.fit`, and **drops its
+  pending-estimate store** (`.loom/state/eta/pending.jsonl`) on start and on
+  demotion, so it never scores a stale outcome. Its stage journal still
+  records what it saw, and the `eta` CLI keeps working read-only.
+- **Observability.** `eta doctor` prints the authority host and why
+  (`config.authority`). A non-authority host that reaches the ETA sink anyway
+  drops the records and counts
+  `loom.daemon.task_faults{task=eta_pass,reason=eta_non_authority_emit}`.
 
 ### Fleet refresh task (`autonomous.eta.fleetRefresh`, #10263)
 
