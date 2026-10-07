@@ -2930,31 +2930,24 @@ _remove_loom_worktree() {
   # as `requires-daemon: cargo-target-dir optional` above).
   local target_dir_resolved="$("${LOOM_DAEMON_BIN:-loom-daemon}" cargo-target-dir resolve "$worktree_path" 2>/dev/null || true)"
   info "Removing worktree: $worktree_path"
-  # #6372: capture the actual git error (was silently discarded via 2>/dev/null)
-  # and, on first failure, try one `git worktree prune` + retry cycle before
-  # giving up — a stale worktree registration (administrative metadata out of
-  # sync with the actual directory) can make the first removal attempt fail
-  # even though nothing is genuinely holding the worktree open, and `prune`
-  # clears exactly that kind of staleness. Confirmed via reproduction: the
-  # original report recovered manually with `git worktree prune && rm -rf
-  # <path>`, and `git worktree prune` alone (no `rm -rf`) is sufficient when
-  # the directory itself is intact — only the registration was stale.
-  local remove_err="" removed=false pruned=false
-  if remove_err="$(git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>&1)"; then
-    removed=true
-  elif git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1; then
-    pruned=true
-    if remove_err="$(git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>&1)"; then
-      removed=true
-    fi
+  # The removal itself — `git worktree remove --force`, #6372's one `git
+  # worktree prune` + retry on failure (a stale registration can fail the first
+  # attempt with nothing holding the worktree open), and the success/failure
+  # report naming git's real error and the remediation — is `loom-daemon
+  # merge-pr worktree-teardown` (Rust, loom-daemon/src/merge_pr/
+  # worktree_teardown.rs, #8191 slice). Best-effort like all cleanup: a failed
+  # removal is a warning, never error(), because the merge already succeeded.
+  # Fails CLOSED: a verb that did not run (missing/older daemon, or a first line
+  # that is neither verdict) removes nothing and skips the success-only steps.
+  local tear tear_rc=0
+  tear="$(_mp_worktree worktree-teardown --repo-root "$REPO_ROOT" --path "$worktree_path")" || tear_rc=$?
+  if [[ $tear_rc -ne 0 || ( "${tear%%$'\n'*}" != "LOOM-WORKTREE-TEARDOWN REMOVED" && "${tear%%$'\n'*}" != "LOOM-WORKTREE-TEARDOWN FAILED" ) ]]; then
+    warning "Could not remove worktree at $worktree_path (best-effort cleanup — the merge itself already succeeded and is unaffected): 'loom-daemon merge-pr worktree-teardown' exited $tear_rc without a LOOM-WORKTREE-TEARDOWN verdict (a loom-daemon predating #8191's slice has no such verb), so no removal was attempted. Remediation: git worktree prune && git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)")"; return 0
   fi
-
-  if [[ "$removed" == "true" ]]; then
-    if [[ "$pruned" == "true" ]]; then
-      success "Worktree removed (after pruning a stale worktree registration)"
-    else
-      success "Worktree removed"
-    fi
+  while IFS=$'\t' read -r level text; do
+    case "$level" in SUCCESS) success "$text" ;; WARNING) warning "$text" ;; esac
+  done <<<"${tear#*$'\n'}"
+  if [[ "${tear%%$'\n'*}" == "LOOM-WORKTREE-TEARDOWN REMOVED" ]]; then
     # #5950: attribute the removal in the shared ledger. `attached_branch` is
     # only resolved on the unmanaged/explicit-override path; on the default
     # issue/PR path the branch is already `PR_BRANCH`, so fall back to that
@@ -2992,17 +2985,6 @@ _remove_loom_worktree() {
         ?*) info "$text" ;;
       esac
     fi
-  else
-    # Best-effort by design (#6372): the merge itself already succeeded and is
-    # unaffected by cleanup failing, so this stays a warning rather than an
-    # error() (which would exit 1 and misreport the merge as failed). But
-    # unlike a bare "could not remove" with no context, name the actual git
-    # failure and give an explicit remediation — matching the quality of the
-    # existing partial-increment message elsewhere in this function.
-    warning "Could not remove worktree at $worktree_path (best-effort cleanup — the merge itself already succeeded and is unaffected):"
-    warning "$remove_err"
-    warning "Remediation: git worktree prune && git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force"
-    warning "If that still fails: rm -rf \"$worktree_path\" && git -C \"$REPO_ROOT\" worktree prune"
   fi
 }
 

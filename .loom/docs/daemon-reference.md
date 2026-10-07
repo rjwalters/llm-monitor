@@ -10296,6 +10296,26 @@ loop is not reusable as the reporter). It has three cooperating parts:
    — **and, since #5391, recovers**: see "The watchdog recovers, it is not a
    report-only detector" below.
 
+**Host opt-out: `autonomy-disabled` (#10179).** The strongest state, above the
+marker and the `.stopped` operator-stop record (#9588). `loom-daemon host disable
+--reason "<why>"` writes `<loom_dir>/autonomy-disabled` (`reason=`/`who=`/`when=`;
+the machine-level `~/.loom`, so it covers every repo on the host; a
+`LOOM_AUTONOMY_MARKER` override moves it too), removes `autonomy-desired`, and runs
+`loom-daemon-stop.sh` to stop the daemon and its launchd/systemd daemon + watchdog
+jobs. While it exists each of these exits non-zero naming reason, who, when and
+`loom-daemon host enable`, with no side effects: `daemon-start` /
+`loom-daemon-start.sh`, the watchdog tick (no recovery, no page), the watchdog
+provisioning guard, `daemon-update` (restart / relaunch / provision, and so the
+auto-update roll), daemon startup itself (supervised relaunch), and
+`resync-installed.sh` / `install-loom.sh` (via `loom-daemon host check`, which
+exits **10** when disabled; the shell guards refuse only on 10, so an older binary
+that exits 1/2 for the unknown `host` subcommand never reads as an opt-out).
+`heal_marker` never re-arms the marker, and `loom-daemon status` / `health` print
+`disabled by operator: <reason> (<when>)` and exit 0 instead of reporting an
+outage. An unreadable marker still counts as disabled (fail closed).
+`loom-daemon host enable` removes it (idempotent) and starts nothing; `host status`
+prints the state. Agents must never start or repair a daemon on a marked host.
+
 **The watchdog recovers, it is not a report-only detector (#5391).** Through
 #5118 the only automatic remediation was two deliberately narrow gates
 (#4232 launchd / #4862 systemd) covering ONE signature: "job loaded + down +

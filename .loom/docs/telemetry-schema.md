@@ -2042,7 +2042,8 @@ closes those estimates stay pending.
 `merge_hold` stage, so `merge_hold` is a possible `stage` /
 `stage_at_estimate` value (and a `stage_marks[]` / `stages[]` stage) on
 `eta.estimate` and `eta.outcome`, but **only from a heuristic that models the
-hold**: today the shadow `land-2026-10-04-twin-otter`. Every path-engine
+hold**: today the shadow `land-2026-10-04-twin-otter-b` and the hold-aware
+wrappers over it (`land-2026-10-04-twin-otter` itself is retired, #10528). Every path-engine
 heuristic refuses it as `blocked`, exactly as before. In `eta.snapshot` it
 never becomes a row's `stage` while `current.land` is one of them; a shadow's
 estimate appears only under the row's `alternates[]` (stage-less, #10390). Once a hold-aware
@@ -2281,7 +2282,7 @@ snapshot. Each alternate:
 
 | Field | Type | Notes |
 |---|---|---|
-| `heuristic` | string | e.g. `land-2026-10-04-twin-otter` |
+| `heuristic` | string | e.g. `land-2026-10-04-twin-otter-b` |
 | `tier` | string, optional | `baseline` or `candidate` (#10525); the ETA chooser offers only `candidate`. Absent only for an id the emitting build does not know, or from a build before tiers |
 | `estimate_id` | string | that heuristic's own `eta.estimate` id, for "why this ETA?" |
 | `as_of` | RFC 3339 | the alternate's own `as_of`, which may differ from the row's; the ETA anchor for `p50` |

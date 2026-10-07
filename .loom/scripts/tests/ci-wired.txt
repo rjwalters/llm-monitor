@@ -176,6 +176,7 @@ test-resolve-tier-model.sh
 test-resync-installed-agent-skills-guard.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
+test-resync-installed-host-optout.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-dogfood-symlink.sh
