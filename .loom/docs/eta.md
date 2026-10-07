@@ -1447,8 +1447,11 @@ for a fit or backtest to report.
   destination, and refuses a non-v2 file on this lane. The v2 outcome is in
   `fit-pub/status-v2.json`; v1's `status.json`, paths, envelope and loaders
   (`fit::read`, `fit::load_latest`) are unchanged, and a v1 failure does not
-  stop v2 nor the reverse. A captain with no v2 file publishes nothing on
-  this lane, and a store with no `eta/fit/v2/` is an `absent` outcome: the
+  stop v2 nor the reverse. `eta doctor` shows the v2 lane as its own
+  `fit.published_fit_v2` check beside v1's `fit.published_fit` (a warning
+  on a failed or stale v2 fetch or publish, a skip when nothing is
+  published); the two never mask each other. A captain with no v2 file
+  publishes nothing on this lane, and a store with no `eta/fit/v2/` is an `absent` outcome: the
   host keeps whatever v2 file it has (or none) and v1 is unaffected.
 
 ### Friction predictors and cumulative stage age (#10521)

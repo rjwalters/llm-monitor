@@ -3683,6 +3683,18 @@ best-effort step after pushing to a `feature/issue-<N>` branch. **Dependency
 auto-detection**, **diamonds / multi-parent**, and **auto-detach** remain **out
 of scope** (deferred items of the v2 epic #3747).
 
+**Remote-branch delete safety (#9372)**: a bare ref delete (what `merge-pr.sh`
+does when the repo has `delete_branch_on_merge=false`) makes GitHub *close*
+every open PR based on that branch, unrecoverably (no reopen, no retarget).
+Before that delete, `merge-pr.sh` runs `loom-daemon merge-pr retarget-children`:
+a fresh `gh pr list --base <parent> --state open`, a `gh pr edit --base
+<parent's base>` per child, and a re-check. Only exit 0 (nothing targets the
+branch) authorizes the delete; any uncertainty (query error, failed retarget,
+unknown base, old binary) keeps the branch with a warning naming the manual
+remedy. It is independent of the #9259 reconcile defer and is not bypassed by
+`--allow-stacked-children`. Repos with `delete_branch_on_merge=true` are
+unaffected by the script, but GitHub's own flow retargets there.
+
 ## Epic supervisor (#3842)
 
 The **epic supervisor** (epic #3842) drives every open `loom:epic` issue
