@@ -37,6 +37,9 @@ class PopoverHeightManager: ObservableObject {
     /// Height of a single account row: caption text (~16) + 6pt vertical
     /// padding × 2. Keep in sync with `SummaryRow`'s `.padding(.vertical, 6)`.
     static let rowHeight: CGFloat = 28
+    /// Extra footer height while the calibration notice line (#243) is shown:
+    /// one `.caption` line (~14) + its 4pt vertical padding × 2.
+    static let calibrationNoticeHeight: CGFloat = 22
     /// Height for the setup/empty/error state (no table rows to size against).
     static let setupHeight: CGFloat = 360
 
@@ -57,6 +60,7 @@ class PopoverHeightManager: ObservableObject {
     /// Sentinel `userHeight`: as tall as the rows need, limited only by the screen.
     private static let showAllRows: CGFloat = 100_000
     private var rowCount = 0
+    private var showsCalibrationNotice = false
     private var dragStartHeight: CGFloat?
     private var dragStartMouseY: CGFloat = 0
     /// The popover content's screen rect when the drag began.
@@ -74,13 +78,21 @@ class PopoverHeightManager: ObservableObject {
     /// setup height is used so the guide isn't cramped.
     func fittedHeight(rowCount: Int) -> CGFloat {
         guard rowCount > 0 else { return Self.setupHeight }
-        let content = Self.chromeHeight + CGFloat(rowCount) * Self.rowHeight
+        let content = contentHeight(rowCount: rowCount)
         return content.clamped(to: Self.minHeight...Self.maxHeight)
     }
 
     /// Unclamped height that shows every row without scrolling.
     private func contentHeight(rowCount: Int) -> CGFloat {
-        Self.chromeHeight + CGFloat(rowCount) * Self.rowHeight
+        Self.chromeHeight + (showsCalibrationNotice ? Self.calibrationNoticeHeight : 0)
+            + CGFloat(rowCount) * Self.rowHeight
+    }
+
+    /// Account for the popover footer's calibration notice line (#243).
+    func setCalibrationNotice(_ shown: Bool) {
+        guard shown != showsCalibrationNotice else { return }
+        showsCalibrationNotice = shown
+        apply()
     }
 
     /// Tallest the user may drag the popover: the screen's usable height,
@@ -430,7 +442,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         var percent: Int = 0
         var isWeeklyLimit = false
-        var calibrationAlertActive = false
 
         // Menubar follows the user's pinned account, or falls back to most-available.
         let targetAccount = usageStore.accounts.first(where: { $0.id == usageStore.effectivePrimaryAccountId })
@@ -456,21 +467,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     percent = Int(account.latestPercent ?? 0)
                     isWeeklyLimit = true
                 }
-                // Pool-wide quota-calibration step-change alert (#199) —
-                // suppressed under the identical rule as the percent readout
-                // above: a badge combining "no current reading" with "there's
-                // a warning" would be a contradiction, not useful signal.
-                calibrationAlertActive = oauthPoller.hasActiveCalibrationAlert
             }
         }
 
         // Create Stats-style image with "LLM" label and percentage
-        button.image = createStatsStyleImage(
-            percent: percent, isWeeklyLimit: isWeeklyLimit, calibrationAlertActive: calibrationAlertActive)
+        button.image = createStatsStyleImage(percent: percent, isWeeklyLimit: isWeeklyLimit)
         button.title = ""
     }
 
-    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool, calibrationAlertActive: Bool = false) -> NSImage {
+    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool) -> NSImage {
         let labelFont = NSFont.systemFont(ofSize: 7, weight: .light)
         let valueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
 
@@ -515,13 +520,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 2pt padding on each side for breathing room
         let contentWidth = ceil(blockWidth) + 4
 
-        // A calibration step-change alert (#199) gets its own small dot to the
-        // right of the label/percentage block, in a color no `PercentSeverity`
-        // band ever uses (red/orange/black-or-white) — a distinct visual
-        // channel, not a fourth shade competing with the existing three.
-        let badgeDiameter: CGFloat = 5
-        let badgeGap: CGFloat = 3
-        let width = contentWidth + (calibrationAlertActive ? badgeDiameter + badgeGap : 0)
+        let width = contentWidth
 
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
             let xOffset = (contentWidth - blockWidth) / 2
@@ -533,14 +532,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let valueRect = CGRect(x: xOffset, y: 3, width: blockWidth, height: 13)
             let valueStr = NSAttributedString(string: percentText, attributes: valueAttrs)
             valueStr.draw(with: valueRect)
-
-            if calibrationAlertActive {
-                let badgeRect = CGRect(
-                    x: contentWidth + badgeGap, y: height - badgeDiameter - 2,
-                    width: badgeDiameter, height: badgeDiameter)
-                NSColor.systemTeal.setFill()
-                NSBezierPath(ovalIn: badgeRect).fill()
-            }
 
             return true
         }
