@@ -2336,6 +2336,7 @@ of what is on disk and never needs a refetch.
 | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` (floor 60) |
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
+| `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true` (#10492): the captain's nightly walk-forward backtest folds ([below](#nightly-backtest-folds-autonomousetanightlyfolds-10492)). Runs only with `enabled` too; read at start |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
 | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (`current` + 12 alternates, #10549), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
@@ -2558,6 +2559,61 @@ them with a daemon restart.
   host: every writer replaces whole files atomically, and the last writer
   wins. A `LOOM_ETA_FLEET_SNAPSHOT_DIR` shared between hosts works. Declare
   `fleet.captain` so only one of them refreshes it; the others fit from it.
+
+### Nightly backtest folds (`autonomous.eta.nightlyFolds`, #10492)
+
+The promotion gate's backtest half (#10233: at least 7 walk-forward daily
+folds) used to run only when someone invoked `eta backtest` / `eta promote`.
+A daemon task now computes it every day, on the **fleet captain**, after 00:30
+UTC (`observability::eta_nightly_folds`; checked hourly, folds once per UTC
+day, catches up at most 7 missed days oldest first).
+
+- **Gate.** Each check passes `fleet.captain` first; the captain arms the
+  `eta-nightly-folds` singleton job and folds, every other host stands down and
+  emits nothing. With no captain declared **no host folds** (fail-closed, like
+  ci-telemetry; logged at `warn` and listed in
+  `host.health.captainless_singleton_jobs`), so set `fleet.captain` for the
+  scoreboard to exist. Records are keyed on `(heuristic, day)`, so a duplicate is detectable.
+- **Records** (OTLP-only, `loom.eta.backtest.*` attributes, body = the JSON):
+  - `eta.backtest.fold` — one per registered `land` heuristic per UTC day,
+    over that day's **cohort**: the cases first known (resolved) on it,
+    whichever day they were predicted on, so a case crossing midnight is
+    folded exactly once, on the day it resolves:
+    `heuristic`, `day`, `n_cases`, `answer_rate`, `pinball4_loss_sec`,
+    `cov_25_75`, `late_surprise`, the paired deltas against `current`
+    (`delta_pinball4_loss_sec`, `delta_answer_rate`, `delta_late_surprise`,
+    `paired_pairs`, `win`) and `fit_id`. A rate over no cases is omitted, not `0`.
+  - `eta.backtest.summary` — one per non-`current` heuristic: the rolling
+    per-day wins against `current` (`days`, `wins`, `ties`), the 95% Wilson
+    bounds, `gate_ready` and the gate's own `gate_detail`. Every case is
+    scored as its daily fold scored it, with its prediction day's coefficient
+    file; cases predicted before the oldest retained file (the fitter keeps
+    14) are left out and counted (`fitted_from`, `cases_before_fit`), not
+    charged a `no_model` refusal. `gate_ready` uses
+    the same gate function as `eta promote` (`shadow::backtest_gate`), not the
+    same data: the summary also replays fleet snapshots and the offline PR
+    cache, `eta promote` local data only.
+  - Both give `land-2026-10-06-calm-plover` the replay calibration evidence
+    `eta backtest` / `eta promote` do (`backtest::with_replay_calibration`,
+    built from the already-cut cases), so it is not folded as plain `land-v2`.
+- **Strictly point-in-time.** Before replaying, the run drops every input
+  observed at or after the day's cutoff (the end of the day): outcome
+  envelopes, journal rows, history samples, and cases not yet resolved. Each
+  case's coefficient file is the newest cut off strictly before its prediction
+  day began, and its estimate reads only history before its own `as_of`.
+  Perturbing post-cutoff data leaves the day's records bit-identical (pinned by
+  a test). A case still open at the cutoff joins the cohort of the day it
+  resolves.
+- **No forge call.** Inputs are this host's journals, the cached fleet
+  snapshots (through `historyScope`) and, if present, the offline merged-PR
+  cache `.loom/state/eta/backtest/pr-history.json` (what
+  `eta backtest --forge-pr-cases --save-pr-history` writes); without it only
+  cases a local sweep witnessed are replayed.
+- **State.** `.loom/state/eta/backtest/fold-<day>.json` (one per day; its
+  existence makes a restart idempotent) and `summary.json` (the newest run).
+- **`eta doctor`** prints the `backtest` link: the newest fold day, then one
+  `scoreboard <heuristic>` line per challenger (wins/days, lower bound,
+  READY / not ready, the gate's reason).
 
 ### SigNoz in-sweep half (`fleetRefresh.signoz`, #9758)
 

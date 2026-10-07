@@ -2190,6 +2190,33 @@ Provenance is required, as for `eta.estimate`, and exports as
 | `resolution_sec` | integer | how late `resolved_at` can be: `0` for a merge, the listing interval for a close (polling time) |
 | `loom` | object | the observing daemon's provenance (required) |
 
+### `eta.backtest.fold` and `eta.backtest.summary`
+
+The fleet captain's nightly walk-forward backtest (Issue #10492; see
+[eta.md](eta.md#nightly-backtest-folds-autonomousetanightlyfolds-10492)).
+Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`). Scalars
+ride as `loom.eta.backtest.fold.*` / `loom.eta.backtest.summary.*` attributes
+(in `ETA_LOG_ATTRIBUTE_KEYS`, allowlisted in the collector's
+`transform/privacy`); the body is the record's JSON. The record time is the
+fold's cutoff (the end of its UTC day). Ids are derived from `(heuristic, day)`
+alone. Provenance is required and exports as `loom.eta.version` / `revision` /
+`tree_state` / `provenance_complete`. **Absent is never zero.**
+
+`eta.backtest.fold` (one per registered `land` heuristic per day; the day's
+cohort is the cases first known on it, each scored with its prediction day's
+coefficient file): `fold_id`,
+`heuristic`, `kind`, `day`, `cutoff`, `compared_to` (the `current` heuristic),
+`is_current`, `n_cases`, `n_answered`, `answer_rate?`, `pinball4_loss_sec?`,
+`cov_25_75?`, `late_surprise?`, `paired_pairs`, `delta_pinball4_loss_sec?`,
+`delta_answer_rate?`, `delta_late_surprise?`, `win?`, `fit_id?`, `loom`.
+
+`eta.backtest.summary` (one per non-`current` heuristic): `summary_id`,
+`heuristic`, `kind`, `compared_to`, `as_of_day`, `cutoff`, `cases`, `days`,
+`wins`, `ties`, `win_rate?`, `ci_low?`, `ci_high?` (95% Wilson), `min_folds`,
+`gate_ready`, `gate_detail`, `fitted_from?` (the first prediction day with a
+retained coefficient file; absent with none), `cases_before_fit` (cases
+predicted earlier, left out), `fit_id?`, `loom`.
+
 ### `eta.snapshot`
 
 This host's **live** ETA estimate set (Issue #9329) — one row per
