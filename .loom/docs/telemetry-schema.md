@@ -1640,8 +1640,9 @@ Never an issue number, sha or path.
 Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
 Gauges on the collector pass, emitted only on a host that is the armed captain
 or a dispatcher with `fleet.captainGauges.standDown`. `task` is the singleton job
-name (`stage-dwell`), the same label key the task-liveness gauges use; never a
-repo or issue. Configuration is in
+name (`stage-dwell`, and `star-facts` / `queue-blocked` where those switches
+are on), the same label key the task-liveness gauges use; never a repo or
+issue. Configuration is in
 [`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12).
 
 | Metric | Unit | Labels | Meaning |
@@ -1773,7 +1774,7 @@ GitHub rate limit (Issue #10022):
 | `github.ratelimit.breaker_skips` | delta `Sum` | `{pass}`; label `reason` | job passes skipped because the breaker was suppressing, flushed on the 60 s tick |
 | `github.ratelimit.{remaining,used,reset}` per bucket | `Gauge` | as above | one series per believed reading of the forge bucket book (W1), exported once per 60 s tick after the probe: every App installation's pool this host spends, keyed `(account, owner, resource)`; `role` is `writer` for the workspace's writer App, else `reader`. Fed by the free `x-ratelimit-*` headers of `gh api --include` calls, by one free `gh api rate_limit` probe per published credential directory after each 5-minute reader-refresh pass, and by the 60 s probe (#10343). A reading counts only while its window is open and it is under 10 minutes old. Since #10343 no `github.ratelimit.*` point leaves without `owner`; one label set is not yet guaranteed to be one bucket (#10571) |
 | `loom.forge.calls` | delta `Sum` | `{request}`; labels `caller`, `op`, `role`, `account`, `cred_owner`, `target_owner`, `resource`, `outcome` | requests the `gh` facade sent since the previous point (W1), flushed on the 60 s tick. A `--paginate --include` call counts its pages; `run download` counts 2. The free `gh api rate_limit` probe is counted under `resource` = `other` (a request observation, never a charge). `outcome` ∈ `ok`, `not_modified`, `rate_limited`, `error`, `shed` (reserved for a budget gate). Past 2048 distinct label sets between flushes, a new set is folded into one series per `outcome` with every other label `overflow`, so totals are kept and the point count stays bounded. Accumulated only while an ops sink is registered |
-| `loom.forge.facade.events` | delta `Sum` | `{event}`; label `reason` = the counter name | named `gh`-facade events that are not forge calls, since the previous point, flushed on the same tick: `facade.cwd_route.disagree` (a checkout whose local sources name different repositories, so its untargeted reads stay on the writer — counted once per call, whether W1's accounting or W4-C's derivation saw it), `repo_facts.redirected`, `repo_facts.resolver_disagree`, and the dispatch guard's W9 counters: `guard.open_pr.refused_memo` / `guard.open_pr.refused_probed` (an open-PR refusal at the 2.5 memo short circuit / at the 2.6 probe; the 2.6 probe of an ordinary dispatch can itself be answered from the memo and still counts as `refused_probed`), `guard.open_pr.refused_distinct` (the first refusal of an `(issue, PR)` pair in a workspace this UTC hour) and `guard.issue_view.fallback` (a conditional 2.5/2.7 issue read fell back to the unconditional one). Only counters that moved emit a point. Exported only while an ops sink is registered |
+| `loom.forge.facade.events` | delta `Sum` | `{event}`; label `reason` = the counter name | named `gh`-facade events that are not forge calls, since the previous point, flushed on the same tick: `facade.cwd_route.disagree` (a checkout whose local sources name different repositories, so its untargeted reads stay on the writer — counted once per call, whether W1's accounting or W4-C's derivation saw it), `repo_facts.redirected`, `repo_facts.resolver_disagree`, and the dispatch guard's W9 counters: `guard.open_pr.refused_memo` / `guard.open_pr.refused_probed` (an open-PR refusal at the 2.5 memo short circuit / at the 2.6 probe; the 2.6 probe of an ordinary dispatch can itself be answered from the memo and still counts as `refused_probed`), `guard.open_pr.refused_distinct` (the first refusal of an `(issue, PR)` pair in a workspace this UTC hour) and `guard.issue_view.fallback` (a conditional 2.5/2.7 issue read fell back to the unconditional one); the captain's intake pass (W7): `intake.listing_shed` (a repo's open-issue walk was shed because every reader was out of budget; the repo is skipped this pass, nothing is sent to the writer) and `intake.triage_reverted` (the label write's answer carried another `loom:*` label, so the `loom:triage` just added was removed). Only counters that moved emit a point. Exported only while an ops sink is registered |
 
 `resource` ∈ `core`, `graphql` (`search` too on a bucket point). On an
 ambient-login host's points `account` is the validated `gh` login, else
@@ -2269,6 +2270,12 @@ as "no such issue" instead. No field carries forge free text (no title, no
 label text, no comment body): every value is an enum, a number, or a
 daemon-derived id.
 
+**The contract is a golden (#10391).**
+`loom-daemon/src/telemetry/kinds/fixtures/eta-snapshot-golden.json` is the
+wire record byte for byte; changing it means re-vendoring it in the downstream loom-ui consumer.
+A vendored loom-ui consumer fixture (`fixtures/loom-ui/`) must find every key
+path it reads in the golden with a compatible type.
+
 ### `pick.decision`
 
 One OTLP-only log record per role tick and per work-finder tick (Issue #10212):
@@ -2576,7 +2583,9 @@ in `daemon-reference.md` for the full design:
   this host (i.e. each one's most recent `fleet_captain::arm_singleton_job`
   call resolved `Armed` here). Omitted/empty on a host that is not the
   captain, on a host with no declared singleton jobs at all, and on a record
-  from a pre-#8848 daemon.
+  from a pre-#8848 daemon. The in-daemon job names are `ci-telemetry-poll`,
+  `eta-fleet-refresh`, `stage-dwell` and `intake-reconcile` (W7; its absence
+  on the captain is today's only sign that the fleet has no intake producer).
 - `exporters` / `exported_kinds` (#10196) — export coverage: the exporter names
   that actually started in the emitting process (misconfigured, never-started
   entries excluded) and the sorted record `kind` tags they carry (from the kind

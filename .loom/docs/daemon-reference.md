@@ -2769,6 +2769,7 @@ visibility" below:
 | `queues` | per-root ready (`loom:issue`) counts **plus the review-side axes** (`loom:review-requested` / `loom:changes-requested` / `loom:pr`), and a per-repo *review stall* verdict | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 | `throughput` | merges across managed repos inside the window | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 | `operator_attention` | fleet-wide open PRs labeled `loom:operator` (the first-class, re-evaluable "a human is needed" hold, #5502) — count, `CONFLICTING`-mergeable sub-count, oldest age in days — plus open issues labeled `loom:operator-only` (the hard park). **Always `GREEN`** (#8091): held work is normal steady state, not a fault, so this section can never move `health`'s exit code — see "`operator_attention` is always GREEN" below | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
+| `inbox_mail` | **conditional** (#10137): only on a host meant to send operator mail (`LOOM_UI_INBOX_URL` set, or a real observability endpoint -- not a placeholder host, not `enabled: false`) that cannot resolve the inbox URL or ingest key file — Degraded, naming each missing item and its fix (paths only, never the key) | `inbox_config::collect_health` (same resolution as `loom-daemon forge inbox-config`) |
 
 #### `queues`: the review-stall rule (#5021)
 
@@ -3819,6 +3820,10 @@ label. **Requires the work finder**, which is opt-in and off by default
 finder runs, the pass is on unless `LOOM_INTAKE_RECONCILE=0`; also
 `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (300), `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (50).
 Writes are gated by `write_scope` (#9548).
+
+On a multi-host fleet the pass can run once, on the fleet captain, instead of
+on every dispatcher: set `fleet.intakeReconcile.singleton`. See
+[Intake reconcile on the captain](#intake-reconcile-on-the-captain-w7).
 
 ## Autonomous work finder (#3810)
 
@@ -7200,6 +7205,9 @@ are unchanged on every host. Code: `observability/captain_gauges.rs`.
 | `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
 | `fleet.captainGauges.publishIntervalSecs` | `600` | How often the captain writes the heartbeat |
 | `fleet.captainGauges.ref` | `fleet.etaFitRef` (`eta-fit`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
+| `fleet.captainGauges.starFacts` | `false` | Part 2 job **`star-facts`**. Captain (with `enabled`): list every operator label per repo and publish how many open starred issues each has. Dispatcher (with `standDown`): skip the starred-issue liveness evaluator for a repo the captain freshly reports as having none |
+| `fleet.captainGauges.queueBlocked` | `false` | Part 2 job **`queue-blocked`**. Captain: list `loom:blocked` per repo and publish number, creation time and label names. Dispatcher: build its `queue.snapshot` blocked rows from that instead of listing |
+| `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | The staleness bound for `star-facts` alone, in place of `maxAgeSecs`: two collector passes plus slack. A believed "no star here" is a skipped liveness pass, so this bounds how long a new star can go unevaluated when the captain stops reporting. While it produces `star-facts`, the captain republishes at least every `starFactsMaxAgeSecs − 600` s (300 s at the default) so its facts stay inside the bound |
 
 **How a dispatcher knows the captain is fresh.** Hosts have no channel to
 each other's telemetry, so the captain publishes a heartbeat to the fleet
@@ -7209,32 +7217,104 @@ per job the `as_of` of the captain's last finished pass (its points handed to
 the OTLP sink) and the repos it covered. A dispatcher reads it once per
 collector pass with `If-None-Match` (a `304` when unchanged) and stands down
 for a job and repo only when the heartbeat names the declared captain and the
-`as_of` is within `maxAgeSecs`. A read failure keeps the last heartbeat, which
-keeps ageing; a missing or malformed one counts as absent. Without
+`as_of` is within `maxAgeSecs` (`starFactsMaxAgeSecs` for `star-facts`). A
+read failure keeps the last heartbeat, which keeps ageing against the same
+bound; a missing or malformed one counts as absent. Without
 `fleet.repo` there is no heartbeat and every host produces locally. When a
 dispatcher takes a repo back it starts from a fresh baseline, so the
 transitions the captain already sampled are not replayed.
 
 | Gate | `fleet.captainGauges` | What the pass does |
 |---|---|---|
-| `Armed` | `enabled` | Arms `stage-dwell`, produces as before, publishes the heartbeat every `publishIntervalSecs` |
+| `Armed` | `enabled` | Arms `stage-dwell` (and `star-facts` / `queue-blocked` when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` (shorter while `star-facts` is produced, see `starFactsMaxAgeSecs`) and at once when its content changes |
 | `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
 | anything else | | Produces locally, exactly as before |
 
 **Captain down** shows as `loom.captain.gauge_age_seconds{task}` growing on
 every dispatcher, then `loom.captain.gauge_fallback{task} = 1` once it passes
-`maxAgeSecs` while the dispatchers produce locally: the gauges never go
-missing. Alert on `gauge_fallback == 1` or on the age passing the bound. See
-[`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+`maxAgeSecs` while the dispatchers produce locally. The hand-back has a gap:
+a dispatcher notices only after `maxAgeSecs` plus a 300 s clock-skew
+allowance plus one collector pass (about 40 minutes at the defaults), nobody
+samples stage transitions inside that window, and each dispatcher then starts
+from a baseline, so those transitions are lost, not delayed. Lower
+`maxAgeSecs` to shorten it. Alert on `gauge_fallback == 1` or on the age
+passing the bound. See [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+A captain that could not list a repo for longer than `maxAgeSecs` baselines
+it on recovery too, because the dispatchers have sampled it meanwhile.
+
+**Part 2: forge facts.** Two more per-host reads say the same thing on every
+host. Each has its own switch, so a fleet running only part 1 is unchanged.
+Code: `observability/captain_gauges/facts.rs`, `star_liveness/captain.rs`.
+
+- **`star-facts`.** The liveness evaluator lists both operator labels of
+  every managed repo every `intervalSecs` (120 s), and for a repo with no
+  open starred issue that is all it does. (The level step that runs after it,
+  #10307, lists the level 2 operator label and its inherited label in every
+  managed repo; it is not covered by this job and still runs on every host.)
+  The captain makes those listings once
+  per collector pass and publishes a count per repo. A dispatcher skips its
+  evaluator for a repo only when all of these hold: the fact is fresh and from
+  the declared captain, judged at the liveness pass's own clock; the captain
+  listed every operator label this host's level table has; this host's last
+  work-finder tick shows no starred row for the repo; and the captain's
+  listing is at least 300 s later than this host's own latest evidence of a
+  star there (a pass that found one, a tick row, a star intent it applied).
+  Skipping is exactly the local pass over an empty listing: no rows and an
+  empty inheritance list for the root. **A repo with a starred issue is
+  evaluated by every host that manages it, as before**: landing rows read the
+  host's own queue and pools, blocker inheritance is that host's dispatch
+  input and never comes from the captain, and escalation comments keep their
+  marker dedupe across hosts. **Worst-case delay for a brand-new star** in a
+  repo the captain reported star-free, before its landing row, escalation
+  and inheritance start on a dispatcher: with a healthy captain, one captain
+  pass (300 s; it publishes the changed fact at once), one dispatcher
+  heartbeat read (300 s) and one liveness pass (120 s), about 12 minutes.
+  With the captain stalled or the heartbeat unreadable, the dispatcher keeps
+  the last report only until it is `starFactsMaxAgeSecs` old, judged at each
+  liveness pass: up to `starFactsMaxAgeSecs` plus the 300 s clock-skew
+  allowance plus one liveness pass, about 22 minutes at the defaults. The
+  report's `as_of` is taken before the captain's first listing of the pass,
+  so a slow pass never overstates it. Meanwhile the starred issue is still
+  ordered first by the work finder's own listing when it is `loom:issue`,
+  and that tick row sends the repo back to local evaluation on the next
+  liveness pass.
+- **`queue-blocked`.** The captain publishes each repo's open `loom:blocked`
+  issues as number, creation time and `loom:*` / `tier:*` label names (no
+  title, body or author). A dispatcher runs them through the same row
+  builder as its own listing and appends them to its own `queue.snapshot`.
+  The rows can trail the forge by up to `maxAgeSecs`.
+
+The captain lists **the repo it publishes under**: each listing names the
+slug the collector resolves for the checkout (as `gh` does: an `upstream`
+remote first, renames followed), never the checkout's `origin` or a
+`LOOM_REPO` in the daemon's environment. On a fork checkout those differ,
+and a listing of the fork would publish its star count under the upstream's
+name. Checkouts that resolve to the same slug are listed once.
+
+A repo is covered for a job only when every listing it needs succeeded on the
+captain; a failed listing (a rate-limited or withdrawn reader included)
+leaves the repo out, the dispatchers read it themselves, and nothing is
+reported to the host-wide rate-limit breaker. The captain's reads are
+recorded under the callers they replace (`star_liveness`, `queue_blocked`),
+so `loom-daemon forge calls --by caller` shows the same reads on one host.
+Per dispatcher with R covered repos of which S have a star, that is about
+`60 × (R − S)` fewer `star_liveness` listings and up to `12 × R` fewer
+`queue_blocked` listings an hour; the captain adds `36 × R`.
 
 **Mixed-version safety.** Both switches default off and older daemons ignore
 the keys, so an unconfigured or older host keeps today's behaviour. A
 dispatcher stands down only on fresh data from the current captain, so an
-older captain (no heartbeat) leaves every dispatcher producing.
+older captain (no heartbeat) leaves every dispatcher producing. The part 2
+fields are additive under the same `captain-gauges/v1` tag: an older
+dispatcher ignores them, and an older captain publishes no `star-facts` or
+`queue-blocked` job, which every newer dispatcher reads as "not covered".
 
 **Rollout order**: deploy everywhere; set `fleet.captainGauges.enabled` and
 confirm the captain's `loom.captain.gauge_age_seconds` stays under
-`maxAgeSecs`; then set `fleet.captainGauges.standDown`. The captain needs the
+`maxAgeSecs`; then set `fleet.captainGauges.standDown`. For part 2, set
+`starFacts` / `queueBlocked` on the captain first, watch
+`gauge_age_seconds{task="star-facts"}`, then set the same key on the
+dispatchers. The captain needs the
 OTLP exporter, the fleet repos provisioned, and the writer App's
 `contents:write` on the store's publication branch (already true where the ETA
 fit is published).
@@ -7242,6 +7322,119 @@ fit is published).
 **ETA queue friction** is already a singleton: it runs inside the ETA pass,
 which only the ETA authority runs (#10498), and the authority defaults to the
 declared captain. It needs no heartbeat.
+
+#### Intake reconcile on the captain (W7)
+
+The [intake pass](#curator-intake-reconcile-10041) describes the forge, not
+the host: every dispatcher that manages a repo lists the same open issues (a
+reader-routed `Hygiene` read since W4-C, shed when the readers are out of
+budget) and attempts the same `loom:triage` label on the writer. With
+`fleet.intakeReconcile.singleton` set and a `fleet.captain` declared, the
+captain alone runs it (singleton job **`intake-reconcile`**, in
+`host.health.armed_singleton_jobs`) and no other host makes an intake call.
+Assigned, not elected: there is no standby producer. Code:
+`intake_reconcile/singleton.rs`.
+
+**What this buys, and what it costs.** The benefit is one producer instead of
+N, with a re-read and a post-write check around every label. It is not a
+saving against a fleet that already runs `LOOM_INTAKE_RECONCILE=0` on every
+host: there it is **new reader spend**, one listing walk per covered repo per
+pass, on the captain.
+
+> **Warning: the captain must cover every fleet repo.** Every other host
+> stands down for *every* repo it manages, but the captain reconciles only the
+> workspaces registered **on the captain**. A repo that a dispatcher manages
+> and the captain does not have registered gets no intake at all. The captain
+> logs the slugs it covers (`intake_reconcile: the captain covers N repo(s):
+> [...]`) when it becomes the captain and whenever the set changes; check that
+> line against the fleet's repo list.
+>
+> **A dead captain means no intake anywhere.** Unlabelled issues wait until it
+> is back. Today the only signal is `intake-reconcile` missing from the
+> captain's `host.health.armed_singleton_jobs`; there is no per-repo
+> heartbeat or age gauge yet.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fleet.intakeReconcile.singleton` | `false` | With a `fleet.captain` declared: only the captain runs intake, from its own task; every other host stops running it. Set it **fleet-wide** (identical on every host, like `fleet.captain`): a host that does not see it keeps running intake per host |
+
+| `singleton` | `fleet.captain` | This host | Intake runs |
+|---|---|---|---|
+| unset / `false` | any | any | per host, from the work finder, as before |
+| `true` | not declared | any | per host, as before (fail-open, nothing armed) |
+| `true` | declared | the captain | here only |
+| `true` | declared | another host | not here |
+
+The mode is re-read every 60 seconds, so an edit needs no restart.
+`LOOM_INTAKE_RECONCILE=0` still disables the pass on a host in every mode,
+**the captain included**: a captain that carries it logs a warning and the
+fleet has no intake. The cadence and batch cap are the same environment
+variables as before, read on the captain.
+
+**The captain's pass** runs from its own task, not the work finder, so a
+captain that dispatches nothing still runs it:
+
+- **Repo set**: the workspaces registered on the captain (the set its work
+  finder would fan out over), each by the slug of its own `origin` remote. No
+  other source is read. An unreadable registry, or no root that resolves to a
+  slug, is no pass.
+- **Listing**: each repo's open issues, oldest first, as conditional reads on
+  the reader pool with one ETag per page, classed `Hygiene`. A page whose rows
+  did not move is a `304`; on a busy repo most walks still pay a `200` for
+  each page that did, so expect `200`s, not mostly `304`s. More than 3000 open
+  items is an incomplete listing and that repo is skipped. The walk's
+  consistency check compares each page's issue numbers, not whole rows, so a
+  comment on an open issue does not abort it; an issue opened or closed
+  across a page boundary mid-walk does.
+- **Shed when out of budget**: a rate-limited or refused reader is withdrawn
+  and the next reader asked. When every reader that can see the repo is out
+  of budget the walk is shed (no request, an `o=shed` row, the facade event
+  `intake.listing_shed`) and the repo waits for the next pass. Only with no
+  reader pool at all, or readers out for a reason that is not budget (a
+  coverage miss, a stale token), does the writer serve the listing, as for any
+  W4-C deferrable read. `LOOM_READ_SHED=0` turns shedding off.
+- **Re-read**: before each label, one unconditional read of that issue (its
+  body is not cached). An issue labelled, closed or deleted since the listing
+  is left alone. This is a `Gate` read: a rate-limited reader is withdrawn and
+  the read retried once on the writer, and a failure after that reaches the
+  rate-limit breaker.
+- **Write**: one label request per issue on the writer, behind a per-repo
+  `write_scope` check that is only made when there is something to label.
+  The request answers with the issue's full label set; if it carries any other
+  `loom:*` label (someone labelled the issue after the re-read), the captain
+  removes the `loom:triage` it just added (`intake.remove_triage`, facade
+  event `intake.triage_reverted`).
+- **Rate-limit breaker**: no pass while it is open, and the pass stops between
+  repos if it opens. A failed or shed listing is not reported to it.
+
+In the forge-call ledger the pass is `intake.list_open`, `intake.recheck`,
+`intake.add_triage` and `intake.remove_triage`; with the singleton on, only
+the captain books them.
+
+**Mixed-version safety.** The key defaults off and older daemons ignore it, so
+an older host keeps running intake per host unless `LOOM_INTAKE_RECONCILE=0`
+stops it. Two hosts running intake at once costs duplicate reads, never a wrong
+label: the write is idempotent and each is preceded by a re-read.
+
+**Rollout order**, for a fleet that turned the pass off per host with
+`LOOM_INTAKE_RECONCILE=0`:
+
+1. Deploy a daemon with this feature everywhere.
+2. Verify coverage: the workspaces registered on the captain must include
+   every repo any dispatcher manages. Register the missing ones on the captain
+   first.
+3. Set `fleet.intakeReconcile.singleton: true` **fleet-wide** (the shared
+   fleet config every host reads, not only the captain's host tier), then
+   remove `LOOM_INTAKE_RECONCILE=0` from the captain's environment only. A
+   host that does not see the key runs intake per host as soon as its own
+   variable is removed.
+4. Confirm: the captain lists `intake-reconcile` in
+   `host.health.armed_singleton_jobs`, logs the covered slugs you expect, and
+   is the only host whose `loom-daemon forge calls --by caller` books
+   `intake.*` rows.
+5. Remove `LOOM_INTAKE_RECONCILE=0` from the other hosts. They stay off because
+   the key, not the environment, now stands them down. A host still on an older
+   daemon must keep the variable until it is upgraded.
 
 ### Role-runner host roster (#6704, phases A and B)
 
