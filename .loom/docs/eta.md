@@ -1505,9 +1505,13 @@ for a fit or backtest to report.
   today's `repos.yml`. `eta backtest --pr-history` / `--forge-pr-cases`
   and the nightly folds pass the cached roster history. The plain
   `cases_from_pr_records` is unchanged, and no case's other fields move.
-  Forge-fetched cases do not yet carry `linked_star`, so the star
-  inputs of the real walk-forward are known only through a PR's own labels
-  until a reader supplies it (remaining under #10508).
+  `backtest::fill_linked_stars` fills an unread `linked_star` from the
+  cached raw star events (`star::StarInputs`, the fit's own reader): each
+  record is read at its end (`merged_at`, else `closed_at`, else now), and a
+  record whose repo cache does not cover that instant stays unread, so it
+  is unknown, never unstarred. `eta backtest --pr-history` /
+  `--forge-pr-cases` and the nightly folds call it before conversion; a
+  record that already carries `linked_star` is untouched.
 - **Status.** keen-wren is registered in shadow (tier `candidate`,
   after `held-heron`, before the twin-otter pair). The captain's v2 file is
   published to the other hosts (see **Publishing the v2 file**, below).
