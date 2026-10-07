@@ -269,7 +269,7 @@ only.
 | `finish-v1` | `finish` | in-sweep phase durations (`sweep-outcome-telemetry.jsonl`) | after the in-sweep merge when at least half of the history's successful sweeps merged themselves, else at the verdict |
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
-| `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
+| `land-2026-10-06-even-lark` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled. The score is in **seconds** (`actual − q_τ`), so each quantile moves by `+ c_τ` seconds; the shift changes by at most 2 h a day. Fitted at the estimate's own `as_of` (recorded as `calibration`, `method` `split_conformal_km_seconds`; replaced the retired log-scale `land-2026-10-06-calm-plover`; #10489) | after `merge_wait` |
 | `land-2026-10-06-quick-tern` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, then each of p25/p50/p75/p90 calibrated by **IPCW** split-conformal over twin-otter-b's landed and still-open track record in a **short recent window** (6 h half-life, doubling when there are too few landings), per stage → pooled. There is no rate limit; a shift within 1.5 standard errors of zero is not applied. Fitted at the estimate's own `as_of`, recorded as `calibration` with `ipcw{…}` (#10524) | at the merge |
 | `land-2026-10-06-brisk-petrel` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, with p25/p50/p75/p90 scaled by the **latent-regime residual factor** (`eta/regime.rs`): the 3 h half-life weighted mean of `ln(actual / p50)` over twin-otter-b's scored outcomes from the last 24 h, clamped to 0.25-4. It is applied **only while the drift check (6 h CUSUM against the 7-day baseline) has tripped** for the item's stage, so a calm stream is served twin-otter-b's estimate byte for byte. It is identity below the sample floor or when the mean is within 3 standard errors of zero. Recorded as `regime_adjustment{stage, factor, n_recent, half_life}` (#10528). Shadow, tier `candidate` | at the merge |
 | `land-2026-10-06-swift-tern` | `land` | quick-tern made **drift-aware** (#10524 slice 3, #10528): when the stage's CUSUM drift check trips (residuals centred on the shift quick-tern would serve), the half-life ladder starts at 1.5 h instead of 6 h. The interval inflation the check asks for is recorded but not applied. Otherwise quick-tern's answer. Recorded as `calibration` with `ipcw.drift{…}` | at the merge |
@@ -303,6 +303,7 @@ registry would be a second mechanism for dominated heuristics).
 | `land-2026-10-04-amber-heron` | 2026-10-06 | Dominated in live outcomes (same 48 h window): pinball4 8.97 h (the worst of any heuristic that answers broadly), p25-p75 coverage 0.147, late surprise 0.649, barely better than `land-v2`'s 0.71. On the small common subset all seven answered (6 items) it is last on pinball. | #10207, #10484 |
 | `land-2026-10-04-fresh-tide` | 2026-10-06 | Failed the backtest gate: on the 52-fold backtest over verified forge history (the evidence is on #10549) it was +0.49 h [+0.30, +0.69] pinball4 against `land-v2`, winning 17 of 52 days (Wilson lower bound 0.22). Its recency idea is covered by the recent-window calibration of #10541 and the planned regime adjustment of #10528. Its module and the `eta backtest --half-life-days` replay flag (#10325) were removed with it; the engine's recency weighting stays (`recalibrate` uses it). | #10209, #10549 |
 | `land-2026-10-04-twin-otter` | 2026-10-07 | Superseded by its fixed successor `land-2026-10-04-twin-otter-b` (the #10500 train/serve skew fix), the only heuristic that passed the backtest gate (−2.39 h pinball4 against `land-v2`). It answered PR stages only, which `-b` answers identically, so the chooser loses nothing. Retired to keep `land` within the 13-heuristic budget when `land-2026-10-06-brisk-petrel` landed: a 14th alternate would exceed the 3 KB `eta.snapshot` row guard. Only the registration went: `-b`, keen-wren, held-heron and the fit still use its module (`recompute`, `adapt_input`, `visit_*`, `DRAW_ORDER`), and `-b`'s PR-stage explanations still record and replay `twin_otter`. | #10243, #10528 |
+| `land-2026-10-06-calm-plover` | 2026-10-06 | Hit its rates but failed the backtest's deciding loss: on the walk-forward replay of 600 merged-PR timelines (1,144 common `land` cases) it was +4,810 s [+580, +9,230] `pinball4` against `land-v2`, at p25–p75 coverage 49.4% and late surprise 9.8%. Its one multiplicative shift per cell widened every item's range by the same factor. Replaced in the registry by `land-2026-10-06-even-lark`, the same calibration on the seconds scale; the log-scale code stays in `eta::conformal` so persisted calm-plover explanations still recompute. | #10489 |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -425,16 +426,16 @@ The calibration log (`.loom/state/eta/calibration.jsonl`) and the
 recalibration machinery stay in the daemon. The log holds every landed
 outcome the tracker scored for a **calibration base**
 (`heuristics::CALIBRATION_BASES`): `land-v2` and, since #10524,
-`land-2026-10-04-twin-otter-b`. `land-2026-10-06-calm-plover` and
+`land-2026-10-04-twin-otter-b`. `land-2026-10-06-even-lark` and
 `land-2026-10-06-quick-tern` (below) read it, each filtering on its own base,
 so `eta view` loads it. `eta backtest` / `eta promote` derive the same
 evidence by replaying every base over the cases. That is leak-free because
 the calibration is refitted at each case's own `as_of`.
-`land-2026-10-06-calm-plover` (#10489) ships the same way: registered, not
-current, shadowed so it appears in every snapshot's `alternates` (the loom-ui
-ETA chooser), promotion only through the #10233 gate. It is a generic
-calibration layer; the registered id fixes its base at `land-v2`
-(`eta::conformal::calibrate` takes any base explanation and the base's
+`land-2026-10-06-calm-plover` (#10489) shipped the same way and was retired
+on 2026-10-06 in favour of `land-2026-10-06-even-lark` (below), which keeps
+its method except for the score scale. The method, as calm-plover shipped it,
+is a generic calibration layer; the registered id fixed its base at `land-v2`
+(`eta::conformal::calibrate_on` takes any base explanation and the base's
 observations).
 
 *Method.* A past base estimate with quantile `q_τ` and actual remaining time
@@ -495,6 +496,44 @@ three-quantile pinball delta is +336 s, with a 95% issue-bootstrap CI of
 the gate's deciding loss, is worse by 23,460 s [17,304, 29,266]: the wider
 p90 costs more than it saves. So the backtest does not make calm-plover a
 promotion candidate. The PR for #10489 records the full report.
+
+`land-2026-10-06-even-lark` (#10489) is calm-plover with one change. It ships
+registered, not current, tier `candidate`, shadowed into `alternates`, and
+promoted only through the #10233 gate. It takes calm-plover's place in the
+registry, so `land` stays at 13 registrations, exactly the default shadow
+budget (current + 12 alternates).
+
+*Why a second scale.* Calm-plover hits its rates and still loses on
+`pinball4`. On the backtest's `land` cases `land-v2`'s quantiles carry little
+information beyond a constant: a per-quantile *constant* scores about as well
+as `land-v2` itself. A single multiplicative shift per cell then has to make a
+narrow base range wide by a large factor (`merge_wait`'s p75 shift reached
+`ln 49`), and it applies that factor to every item, so a long base estimate
+becomes days. Pinball is linear in seconds, so what it prices is the time
+added, not the ratio. Even-lark scores `s = a − q_τ` (seconds) and reports
+`q_τ + c_τ`, where `c_τ` is the same censoring-aware, finite-sample-corrected
+split-conformal quantile on the same cells. Its rate limit is 2 h a day per
+quantile (`MAX_DAILY_STEP_SEC`), replayed from the same evidence-fixed anchor,
+and outputs are floored at zero and made monotone.
+
+*The record.* As calm-plover's, with `method` `split_conformal_km_seconds`;
+`shift`, `raw_shift` and `max_daily_step` are in **seconds**, so "why this
+range?" is `base_quantiles_sec + shift`.
+
+*Backtest* (2026-10-06, `eta backtest --heuristic land-2026-10-06-even-lark
+--compare land-v2`, 600 merged-PR label timelines of `rjwalters/loom`, 1,144
+common `land` cases, walk-forward daily folds). p25–p75 coverage is 50.3%
+(`land-v2`: 28.1%) and late surprise is 13.1% (`land-v2`: 29.4%). `pinball4`
+is 45,605 s against `land-v2`'s 46,901 s, a difference of −1,296 s with a 95%
+issue-bootstrap CI of [−3,818, +1,157] s: not distinguishable, and lower. The
+three-quantile pinball is +476 s [−114, +1,041]; also not distinguishable.
+`eta backtest` reports even-lark as `better`, and `land-v2` won 3 of 9 decided
+days. On the same replay calm-plover gets coverage 49.4% and late surprise
+9.8%, but `pinball4` +4,810 s [+580, +9,230] worse than `land-v2`. Two caveats.
+The scale and the 2 h step were chosen on this replay, though every step from
+30 min to unlimited met all three targets in a pre-implementation simulation.
+And it replays merged PRs only, so its most recent fold holds only the fast
+ones. Live shadow pairs through the #10233 gate are the real test.
 
 `land-2026-10-06-quick-tern` (#10524) ships the same way: registered, not
 current, tier `candidate`, shadowed into `alternates`, and promoted only
@@ -790,7 +829,7 @@ offers.
 
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
-(`land-2026-10-06-calm-plover` is calibration over `land-v2`;
+(`land-2026-10-06-even-lark` is calibration over `land-v2`;
 `land-2026-10-06-quick-tern` is IPCW calibration over, and
 `land-2026-10-06-tandem-wren` the dependency wrapper over,
 `land-2026-10-04-twin-otter-b`; `land-2026-10-06-held-heron` is
@@ -1405,13 +1444,35 @@ for a fit or backtest to report.
   revision's `repos.yml` is cached content-addressed under
   `.loom/state/eta/roster-history/`. The fit (`fit::run`) and the tracker's
   pass (`Tracker::set_fleet_history`) both load that one cache, so the two
-  sides read one history value.
+  sides read one history value. Requests go through the store's
+  `GhTransport` (reader App first, then the writer App), never the operator
+  token.
+  - *Forge budget.* The window's `since` is aligned down to UTC midnight
+    (`window_opens`), so each listing URL repeats all day. The index keeps
+    each listing's `ETag` and commits, and the next poll sends
+    `If-None-Match`. A `304` reuses the cached commits; a `304` with nothing
+    cached is an error. With `repos.yml` unchanged, a poll is two conditional
+    requests (first page and anchor) and no contents. An authorized `304`
+    does not count against GitHub's primary rate limit. A `304` poll still
+    counts as a successful poll. Each UTC day opens with one unconditional
+    listing.
   - *Knowability convention.* `committed_at` is the committer date.
     `observed_at` is set only for a commit first listed by a poll that
     follows an earlier successful poll: it is that poll's time, a bound that
     is never early. So a backdated or late-pushed edit counts only from when
     it was seen. Commits listed by a cache's first poll have no observation
     and use their commit date. `FitReport.roster_history` counts each basis.
+  - *Observation archive.* Each commit's first sighting is also appended,
+    before the index is written, to `observations.jsonl` in the cache
+    directory: store, ref, sha, committer date, blob, `first_listed_at`, and
+    `observed_at`. The archive is append-only, one line per commit, and it is
+    never pruned with the window. That keeps the record of when this host
+    saw each revision for backtests older than the window
+    (`roster_history::archive`). A listed commit takes its observation from
+    the index, else from the archive, so a lost index does not re-date a
+    commit. An archive line also proves an earlier poll, so a commit first
+    listed after an index loss is still observed at that poll. A torn or
+    corrupt line is skipped.
   - *Unknown, never today's file.* The history is `None` when there is no
     cache (no `fleet.repo`, or no successful poll yet), when any cached
     revision is unreadable or not a valid roster, or when the last
@@ -1425,6 +1486,24 @@ for a fit or backtest to report.
   `fleet_priority`, age, number. A starred, level-2, or higher-priority-repo
   issue is therefore earlier in the plan and gets an earlier start. No
   second ordering is defined for the ETA to drift from (#10528).
+- **Replayed priority inputs** (#10508). A replay case has no labels, so
+  keen-wren replayed priority-blind: its `features.priority` was absent.
+  `backtest::cases_from_pr_records_with_roster(records, history)` fills
+  `ReplayCase::priority` through the one builder
+  (`priority_inputs`), over the batch's own PR timelines: each PR's flags
+  and linked star are read strictly before the case's `as_of`, the roster
+  revision `KNOWABLE_LAG_SEC` earlier, and the neighbours are the PRs in
+  the batch standing in the case's stage at `as_of`. A `PrCaseRecord` may
+  carry `linked_star`, the instants a linked issue's star turned on and off
+  (alternating, first on). Absent means unread: an unstarred-by-label PR is
+  then unknown, never unstarred. `history = None` (no cache, stale, or
+  unreadable) leaves `repo_rank` and the fleet position unknown, never
+  today's `repos.yml`. `eta backtest --pr-history` / `--forge-pr-cases`
+  and the nightly folds pass the cached roster history. The plain
+  `cases_from_pr_records` is unchanged, and no case's other fields move.
+  Forge-fetched cases do not yet carry `linked_star`, so the star
+  inputs of the real walk-forward are known only through a PR's own labels
+  until a reader supplies it (remaining under #10508).
 - **Status.** keen-wren is registered in shadow (tier `candidate`,
   after `held-heron`, before the twin-otter pair). The captain's v2 file is
   published to the other hosts (see **Publishing the v2 file**, below).
@@ -2854,7 +2933,7 @@ day, catches up at most 7 missed days oldest first).
     the same gate function as `eta promote` (`shadow::backtest_gate`), not the
     same data: the summary also replays fleet snapshots and the offline PR
     cache, `eta promote` local data only.
-  - Both give `land-2026-10-06-calm-plover` the replay calibration evidence
+  - Both give `land-2026-10-06-even-lark` the replay calibration evidence
     `eta backtest` / `eta promote` do (`backtest::with_replay_calibration`,
     built from the already-cut cases), so it is not folded as plain `land-v2`.
 - **Strictly point-in-time.** Before replaying, the run drops every input
