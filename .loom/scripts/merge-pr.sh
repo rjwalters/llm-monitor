@@ -250,164 +250,23 @@ _head_moved_or_resync() {
   [[ -n "$_HMR_OUT" ]] && warning "$_HMR_OUT"; error_head_moved "PR #$PR_NUMBER: $1" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
 }
 
-# Function to show help
-show_help() {
-    cat << EOF
-Loom PR Merge - Worktree-safe merge using forge API (GitHub or Gitea)
-
-Usage: ./.loom/scripts/merge-pr.sh <pr-number> [options]
-
-Merges a PR via the forge API (not 'gh pr merge') to avoid
-"already used by worktree" errors when merging from inside a worktree.
-
-Supports both GitHub and Gitea forges. Forge detection is automatic
-(see forge-helpers.sh for details).
-
-Options:
-  --no-cleanup-worktree  Skip local worktree AND local branch cleanup
-                         after merge
-  --cleanup-worktree     (no-op, worktree cleanup is now the default)
-  --worktree-path <dir>  Explicit worktree path to clean up. Bypasses the
-                         .loom-managed sentinel guard (caller asserts
-                         responsibility — this is the documented opt-in
-                         for removing non-Loom worktrees). Also deletes
-                         the matching local branch via 'git branch -d'
-                         (Git refuses on unmerged commits).
-  --dry-run              Show what would happen without merging
-  --auto                 Wait (bounded) for this head's checks to settle, then
-                         merge in THIS process — immediately if they already
-                         are. NEVER arms the forge's server-side auto-merge
-                         queue, which re-reads neither the loom:pr label nor
-                         the non-required test suites once armed (#8410).
-  --allow-stacked-children
-                         Bypass the pre-merge merge-ordering guard's remaining
-                         hard-block path. By default (#7982) the guard pins
-                         the parent's tip to refs/loom/parent/<branch> and
-                         WARNS instead of blocking when open stacked CHILD PRs
-                         target the parent branch (feature/issue-N) — see
-                         #3747 item 2. It still hard-blocks only when the tip
-                         could not be pinned; this flag skips past that.
-                         Operator asserts responsibility, mirroring
-                         --worktree-path.
-  --allow-red-tree       Proceed past a failing repo-declared merge.treeChecks
-                         gate (checks run on base + PR head, #10026). Warns and
-                         records an audit PR comment. Operator asserts
-                         responsibility.
-  --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard.
-                         By default the script refuses to merge (exit 1) a
-                         PR whose current head does not carry the loom:pr
-                         label — the only forge-visible signal Judge
-                         reviewed that head (it may have been cleared by a
-                         staleness guard, e.g. after a Doctor rebase). This
-                         flag bypasses that block; the operator asserts
-                         responsibility, mirroring --allow-stacked-children.
-                         The bypass is always logged as a warning and, on a
-                         real (non-dry-run) merge, best-effort recorded as a
-                         PR comment audit trail too.
-  --redate-stale-checks  On an #8248 freshness block, re-run the stale checks in
-                         place and merge once fresh (#8914), else push a tree-
-                         identical no-op commit and exit 4 (#8508) — never a
-                         bypass; a repeat push block escalates to loom:operator.
-  --merge-method M       Request squash|merge|rebase instead of auto-detect; validated via loom-daemon against the repo's actually-allowed strategies — fails rather than silently falling back to squash if disallowed (#8845).
-  --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
-                         When the merged branch is checked out in the PRIMARY
-                         repo checkout (not a worktree), the script normally
-                         auto-checks-out the default branch and force-deletes
-                         it there ONLY when provably safe (clean tree, no
-                         stash entries, tip matches the merged PR head SHA).
-                         Pass this to always print manual instructions instead.
-  --cleanup-primary      (no-op, primary-checkout cleanup is the default)
-  -h, --help             Show this help and exit
-
-By default, the local worktree AND the local branch it held are cleaned up
-after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
-(e.g., when other terminals may have their CWD inside the worktree, or you
-want to keep a branch with unpushed commits).
-
-Cleanup is restricted to Loom-managed worktrees (those under
-.loom/worktrees/issue-N that contain a .loom-managed sentinel file written
-by worktree.sh). User-provisioned worktrees at other paths are never
-removed by the default code path. Set LOOM_PRESERVE_WORKTREE=1 to disable
-cleanup unconditionally for a session.
-
-Local branch deletion (#4100): every cleanup path — including the case
-where no worktree exists at all — attempts to delete the merged PR's local
-branch. Safety is determined by comparing the local branch tip to the
-merged PR's head SHA (not 'git branch --merged', which is always false for
-a squash merge): a matching tip uses 'git branch -D'; a non-matching tip
-(unpushed local work) falls back to 'git branch -d', which keeps the
-branch and reports it instead of force-deleting. The branch currently
-checked out (main worktree or any other) is never deleted, and the repo's
-default branch is never a delete target.
-
-Primary-checkout auto-cleanup (#5015): the one exception to "checked out
-branches are never deleted" is when the branch is checked out in the repo's
-PRIMARY checkout specifically (not a linked worktree) AND it is provably
-safe — the tip-matches-head safety check above passed, the primary
-checkout's working tree is clean, and it has no stash entries. In that case
-the script checks out the default branch there and force-deletes the merged
-branch automatically instead of just printing instructions. Pass
---no-cleanup-primary to always print the manual instructions instead.
-
-When --worktree-path <dir> is passed explicitly, the operator is taking
-responsibility for the cleanup decision: the sentinel guard is bypassed
-for that one path. The path is validated against 'git worktree list'
-and rejected if it is not a worktree of this repository.
-
-Discovery fallback: if neither .loom/worktrees/issue-N/ nor
-.loom/worktrees/pr-<PR_NUMBER>/ exists, the script walks
-'git worktree list --porcelain' looking for a worktree whose branch
-matches the merged PR head branch. It NEVER auto-removes a discovered
-user-owned worktree; it only logs the path and suggests re-running with
---worktree-path <found-path>.
-
-Precedence (highest wins):
-  1. LOOM_PRESERVE_WORKTREE=1     (always skip cleanup)
-  2. --no-cleanup-worktree        (always skip cleanup; warns if combined
-                                  with --worktree-path)
-  3. --worktree-path <dir>        (explicit path; bypasses sentinel)
-  4. default: .loom/worktrees/issue-N or pr-N + sentinel guard
-
-Exit codes:
-  0 = merged (or --help) · 1 = failed
-  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
-  4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
-  6 = deferred behind another PR's chain-head merge lock (#10167; --auto or LOOM_CHAIN_LOCK_GUARD=1; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses) — nothing written; retry later
-
-Examples:
-  ./.loom/scripts/merge-pr.sh 123
-    Merges PR #123 (squash), deletes remote branch, cleans up worktree
-
-  ./.loom/scripts/merge-pr.sh 123 --dry-run
-    Shows what would happen without merging
-
-  ./.loom/scripts/merge-pr.sh 123 --auto
-    Waits (bounded by LOOM_AUTO_MERGE_TIMEOUT) for PR #123's checks to
-    settle, then merges it here — never via a server-side merge queue
-
-  ./.loom/scripts/merge-pr.sh 123 --no-cleanup-worktree
-    Merges PR but leaves the local worktree in place
-
-  ./.loom/scripts/merge-pr.sh 123 --worktree-path ../adhoc-wt
-    Merges PR #123 and removes the worktree at ../adhoc-wt plus its
-    matching local branch (bypasses the .loom-managed sentinel guard).
-
-  ./.loom/scripts/merge-pr.sh 123 --no-cleanup-primary
-    Merges PR but always prints manual instructions instead of
-    auto-cleaning a branch checked out in the primary repo checkout.
-
-  ./.loom/scripts/merge-pr.sh 123 --allow-unapproved
-    Merges PR #123 even though it does not carry loom:pr (no forge-visible
-    Judge review signal for the current head). Logs a warning and posts a
-    PR comment recording the override.
-EOF
-}
-
 # Early help check — runs before any git/forge initialization so --help works
-# in any directory and without forge authentication.
+# in any directory and without forge authentication. The text (option list,
+# cleanup semantics, exit-code table) is `loom-daemon merge-pr usage`
+# (loom-daemon/src/merge_pr/usage.rs + usage.txt, #8191 slice), printed only
+# behind its LOOM-MERGE-PR-USAGE sentinel so no other binary's output can pass
+# for it. Resolved like _mp_worktree (LOOM_DAEMON_SELF_BIN first, #8134), so
+# a suite can pin the implementing binary without touching LOOM_DAEMON_BIN.
+# Fails OPEN toward exit 0: a missing/older daemon gets a one-line
+# usage plus a pointer on stderr. Help gates nothing, and exit 1 would read as
+# a failed merge to a caller probing the script. $_MP_NL, not an inline $'\n'
+# pattern: bash 3.2 reads the latter literally (see #8191's partial-comment slice).
 if [[ $# -gt 0 ]] && { [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; }; then
-    show_help
-    exit 0
+  _MP_NL=$'\n'; _MP_USAGE="$("${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" merge-pr usage 2>/dev/null)" || _MP_USAGE=""
+  if [[ "$_MP_USAGE" == "LOOM-MERGE-PR-USAGE$_MP_NL"* ]]; then printf '%s\n' "${_MP_USAGE#*"$_MP_NL"}"; exit 0; fi
+  echo "Usage: ./.loom/scripts/merge-pr.sh <pr-number> [--dry-run] [--auto] [--no-cleanup-worktree] [--worktree-path <dir>] [options]"
+  echo "Full help is 'loom-daemon merge-pr usage', which '${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}' could not print (missing, or predates it). Roll this host: ${BASH_SOURCE[0]%/*}/cli/loom-daemon-update.sh --fetch" >&2
+  exit 0
 fi
 
 # Find the main repository root (works from worktrees too)
@@ -3160,28 +3019,18 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # operator can re-run with --worktree-path.
       DISCOVERED_WT="$(_find_worktree_by_branch "$PR_BRANCH")"
       if [[ -n "$DISCOVERED_WT" ]]; then
-        if _is_primary_worktree_path "$DISCOVERED_WT"; then
-          # The PR branch is checked out in the PRIMARY (main) working copy,
-          # not a linked worktree at all (#4171). `git worktree remove` /
-          # `--worktree-path` can never apply here — git itself refuses to
-          # remove the main working tree — so never suggest either. The
-          # subsequent _maybe_delete_local_branch call below prints the
-          # correct two-step remediation (switch to the default branch, then
-          # delete) once the branch-delete attempt fails as "checked out".
-          info "PR branch '$PR_BRANCH' is checked out in the primary repository checkout ($DISCOVERED_WT) — not a removable worktree."
-        elif [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
-          # Rare case: Loom-managed worktree at a non-standard path. The
-          # sentinel says it's safe to remove — unless the close-target-aware
-          # gate (#4186), or the #6694 landed-branch override
-          # _worktree_cleanup_decide shares with the default-path call site
-          # above, says preserve.
-          _worktree_cleanup_decide discovered "$DISCOVERED_WT"
-        else
-          warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
-          warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
-          warning "To clean it up, re-run with: --worktree-path '$DISCOVERED_WT'"
-          warning "Or manually: git worktree remove '$DISCOVERED_WT'"
-        fi
+        # Classification (primary checkout / managed / user-owned) and its
+        # message text are `loom-daemon merge-pr discovered-worktree` (#8191
+        # slice); the primary comparison and the removal stay here. Only a
+        # positively received DECIDE can lead to a removal — a missing/older
+        # daemon yields no verdict and removes nothing.
+        _DW_OUT="$(_mp_worktree discovered-worktree --branch "$PR_BRANCH" --path "$DISCOVERED_WT" --primary "$(_is_primary_worktree_path "$DISCOVERED_WT" && echo true || echo false)")" || _DW_OUT=""; _DW_ACT="${_DW_OUT%%$'\n'*}"
+        case "$_DW_ACT" in
+          "LOOM-DISCOVERED DECIDE"|"LOOM-DISCOVERED NOTE")
+            while IFS=$'\t' read -r level text; do [[ -z "$level" ]] || { [[ "$level" == WARNING ]] && warning "$text" || info "$text"; }; done <<<"${_DW_OUT#"$_DW_ACT"}"
+            [[ "$_DW_ACT" != *DECIDE ]] || _worktree_cleanup_decide discovered "$DISCOVERED_WT" ;;
+          *) warning "Discovered worktree $DISCOVERED_WT for '$PR_BRANCH' was left in place — 'loom-daemon merge-pr discovered-worktree' gave no verdict (a loom-daemon predating #8191's slice has no such verb)." ;;
+        esac
       else
         info "No worktree found at $DEFAULT_WT_PATH (and none tracking '$PR_BRANCH' in 'git worktree list')"
       fi

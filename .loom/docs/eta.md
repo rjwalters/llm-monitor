@@ -280,6 +280,7 @@ only.
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are the twin-otter evaluation's own answer, unchanged: no history, the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)), the blend of a stage-by-stage exit-hazard Monte Carlo and a log-normal direct model (recorded as `twin_otter`; #10222, #10243). `land-2026-10-04-twin-otter` itself, which answered PR stages only, is [retired](#retired-heuristics) (#10528) | at the merge |
 | `land-2026-10-06-keen-wren` | `land` | twin-otter-b's **priority-aware** successor (#10508): pre-PR stages from the work finder's dispatch-plan position and `land-v2`'s path rules (`combination.method` is `dispatch_plan_path_prefix`); PR stages from the twin-otter evaluation over the newest **`eta-fit/v2`** file, fed the item's recorded `features.priority` (see [The `eta-fit/v2` priority inputs](#the-eta-fitv2-priority-inputs-10508)). Refuses its PR stages `no_model` until a v2 file exists. Shadow, tier `candidate` | at the merge |
 | `land-2026-10-06-tandem-wren` | `land` | `land-2026-10-04-twin-otter-b` composed over the dependency graph (#10510, [Dependency-aware ETAs](#dependency-aware-etas-10510)): a blocked or parked item starts after its parents land, a stacked or sequenced PR merges after its parent. An item with no parent that applies at `as_of` gets twin-otter-b's own explanation, bit for bit (re-identified) | at the merge |
+| `land-2026-10-06-loop-kite` | `land` | keen-wren's **friction-aware** successor (#10521): pre-PR stages exactly as keen-wren (`dispatch_plan_path_prefix`); PR stages from the twin-otter evaluation over the newest **`eta-fit/v3`** file, fed `features.priority` and the recorded friction predictors `features.loops` (review loops, approvals lost, repo Judge rejection rate, file overlap, own CI, cumulative stage age; see [Friction predictors and cumulative stage age](#friction-predictors-and-cumulative-stage-age-10521)). Refuses its PR stages `no_model` until a v3 file exists. Shadow, tier `candidate` | at the merge |
 
 ### Retired heuristics
 
@@ -366,19 +367,24 @@ fixture. A behaviour change is a new id registered beside the old one
      the candidate needs a lower mean `pinball4_loss_sec` over the cases both
      answered (an exact tie goes to the side that answered more). Its answer
      rate over the union may be at most `ANSWER_RATE_SLACK` below `current`'s,
-     and its late-surprise rate at most `LATE_SURPRISE_SLACK` above. The
-     win must also hold across the walk-forward daily folds: over at least
-     `MIN_FOLDS` (7) decided days, the 95% Wilson lower bound of its per-day
-     win rate must be above 50%. A heuristic that cannot win on history it
+     and its late-surprise rate at most `LATE_SURPRISE_SLACK` above. Then the
+     [primary test and day consistency check](#promotion-statistics-the-unit-of-independence)
+     (#10525): the paired `pinball4` difference's 95% issue-bootstrap
+     interval must lie below 0 over at least 100 distinct issues, and over at
+     least `MIN_FOLDS` (7) decided walk-forward days the candidate must win a
+     strict majority. A heuristic that cannot win on history it
      can be re-run against is not judged on a live sample nobody can replay,
      so a failure here means the live gate is not even consulted.
    - **Live** (#10233): every figure is read on the **common decidable
      subset** — a pair counts toward a figure only when *both* sides are
      decidable for it, so a candidate cannot improve its numbers by refusing
      the hard cases. All of the following, in this order:
-     - at least 50 paired observations carrying a p90 on both sides, and the
-       candidate's paired mean `pinball4_loss_sec` (q = .25, .5, .75, .9 —
-       the deciding loss) no worse than `current`'s;
+     - the **primary test** (#10525): the candidate's paired mean
+       `pinball4_loss_sec` (q = .25, .5, .75, .9 — the deciding loss) no worse
+       than `current`'s, and the paired difference's 95% item-clustered
+       bootstrap interval below 0 over at least 100 distinct items
+       (`repo#issue`). Every refresh is used, but each item counts once in the
+       uncertainty ([below](#promotion-statistics-the-unit-of-independence));
      - no **late surprise** regression: the candidate's `actual > p90` rate,
        over at least 50 pairs where both sides' late surprise is decided
        (`censored` outcomes included, see below), at most 2 points
@@ -390,11 +396,16 @@ fixture. A behaviour change is a new id registered beside the old one
        is emitted once and never refreshed while an answer is refreshed every
        few minutes;
      - its p25–p75 coverage inside `[40%, 60%]`;
-     - the win holds **day by day**: pairs are folded by the UTC day of their
-       `as_of`, a day goes to whichever side had the lower mean
+     - the **day consistency check**: pairs are folded by the UTC day of
+       their `as_of`, a day goes to whichever side had the lower mean
        `pinball4_loss_sec` (ties are left out), and over at least `MIN_FOLDS`
-       (7) decided days the 95% Wilson lower bound of the candidate's per-day
-       win rate must be above 50%. One lucky day cannot carry a pooled mean.
+       (7) decided days the candidate must win a strict majority. One lucky
+       day, or one regime, cannot carry a pooled mean. The Wilson interval of
+       the day win rate is still recorded but no longer gates (#10525).
+
+   Every decision also records the adaptation-time comparison
+   (`adaptation`): not gating today, because no build measures it yet
+   ([below](#promotion-statistics-the-unit-of-independence)).
 
    Either gate failing leaves `current` untouched, and `--apply` on a failing
    candidate is a refusal, not an override. Every evaluation writes a
@@ -758,20 +769,24 @@ Every `eta.snapshot` alternate carries its `tier`; loom-ui's chooser filters
 on it (loom-ui#2031). A retired id stays unregistered, as #10484 decided.
 `eta::shadow_fleet::RETIRED` keeps the id so it is never reused.
 
-**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 13, floor 1)
+**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 14, floor 1)
 caps the registered heuristics **per kind**, `current` included. When a
 build's registry exceeds the configured budget, the ETA tracker does not start.
 The daemon logs `eta: not started: N land heuristics are registered but
 autonomous.eta.shadow.maxActive is M; over the budget: …`, naming the
 heuristics past the budget in registration order. `eta promote` refuses the
 same way. A unit test holds the built-in registry within the default budget,
-so a fourteenth registration fails CI first. Retire a heuristic (a code
+so a fifteenth registration fails CI first. Retire a heuristic (a code
 change, as in #10484, #10549 and #10528) or raise the budget. The default is the
-kind's `current` plus the 12 alternates one `eta.snapshot` row carries (#10549,
-was 10 and 8), and a unit test holds the two together, so no heuristic within
-the default budget is silently dropped from the chooser. Raising the budget
-past 13 also needs the alternates cap raised on both sides (loom-ui's
-`MAX_ALTERNATES`; a loom-ui still slicing at 8 reads the first 8 by id).
+kind's `current` plus the 13 alternates one `eta.snapshot` row carries
+(#10521, which registered `land-2026-10-06-loop-kite` as the fourteenth land
+heuristic; 12 since #10549, was 10 and 8), and a unit test holds the two
+together, so no heuristic within the default budget is silently dropped from
+the chooser. Raising the budget also needs the alternates cap raised on both
+sides (loom-ui's `MAX_ALTERNATES`). A loom-ui still slicing at 12 reads the
+first 12 by id; with the shipped registry and the default `current`
+(`land-v1`) the 13th by id is `little-v0`, a baseline the chooser never
+offers.
 
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
@@ -784,14 +799,133 @@ is never
 an automatic cross product of wrappers × bases, so each one spends budget
 deliberately.
 
+**The promotion short-list (shipped, #10525).** `eta promote` evaluates a
+candidate only if it is one of the top 2 candidates by paired pinball against
+`current` over the newest 14 nightly fold days (`eta::shadow_lifecycle`,
+[nightly folds](#nightly-backtest-folds-autonomousetanightlyfolds-10492)).
+That limits multiple comparisons before any significance test runs. The rank
+is each candidate's pair-weighted mean `delta_pinball4_loss_sec`; ties break
+by id. It fails closed: the decision record carries the `shortlist` (ranked
+ids, newest fold day, refusals), and `current` stands when:
+
+- no nightly fold is saved on this host, or the newest is more than 2 days
+  behind the newest due day (stale);
+- a fold was compared against a different `current` (not comparable, so it is
+  left out; after a promotion nobody is short-listed until new folds exist);
+- the candidate has fewer than 3 comparable paired days (a day with a
+  non-finite delta is not a decided day and is not counted);
+- the id is unknown, a baseline, retired, or already `current`.
+
+With fewer than two rankable candidates, only those rankable are short-listed.
+Nightly folds score `land` only, so `eta promote --kind start|finish` always
+refuses until folds exist for those kinds.
+
+**Retirement proposals (shipped, #10525).** `loom-daemon eta retire` reads
+the same folds (the newest 28 days) and **proposes** a retirement, never a
+removal. Retiring stays a code change (#10484). A heuristic is proposed only
+when all of these hold:
+
+1. it is a registered `candidate` (never a baseline, a retired id or
+   `current`);
+2. over at least 14 decided fold days, its day-level paired pinball delta
+   against `current` is worse, with a 95% interval excluding 0. Each fold
+   day's cohort is a disjoint set of resolved items, so the day is the
+   independence unit here;
+3. another candidate **dominates** it over at least 14 common days: strictly
+   lower mean pinball, and coverage error (`|cov_25_75 - 0.5|`) and late
+   surprise no higher.
+
+Domination compares the folds' own aggregates, so it needs both folds to have
+scored the **whole** day cohort: a day counts only when the fold answered every
+case (`n_answered == n_cases`) and was paired on every case (`paired_pairs ==
+n_cases`, so a p90 was present). A fold that answered a subset, or lacked a p90
+somewhere, cannot be shown to share items with another, so that day refuses
+rather than comparing an easy subset to the full cohort.
+
+Missing or non-finite values refuse. Each proposal carries an `evidence_id`
+(a hash of the window, the numbers and the fold ids). The dedup key is the
+heuristic alone, so neither an unchanged window nor a slid one files a second
+issue. `eta retire --file` files each new proposal with
+`.loom/scripts/create-issue.sh` (label `loom:triage`). **Only the fleet
+captain files** (`fleet.captain`, #8848): any other host, or a fleet with no
+captain declared, refuses. Search-then-create is not atomic on the forge, so
+one owner is what prevents two hosts both finding nothing and both filing. The
+captain dedups twice:
+
+- first against its `.loom/state/eta/retirement-proposals.json`;
+- then against the forge, by a REST search for the key marker in any issue,
+  open or closed, counting only issues by a trusted author
+  (`comment-trust.md`: anyone else's copy of the marker is ignored), so a
+  declined proposal is not re-filed, and a change of captain does not re-file
+  once the first issue is indexed (GitHub's search index lags writes, so a
+  handover inside that window can still double-file).
+
+A failed search refuses the filing; it is retried on the next run.
+
+**Scheduled filing (shipped, #10525).** With
+`autonomous.eta.nightlyFolds.retirementFiling` (env
+`LOOM_ETA_RETIREMENT_FILING_ENABLED`, default **off**, read at start; needs
+`enabled` and `nightlyFolds.enabled` too), the captain's
+[nightly fold task](#nightly-backtest-folds-autonomousetanightlyfolds-10492)
+runs the same path as `eta retire --file` on each tick after the folds are
+saved. It is off by default because it is the one outward write the fold task
+makes (the folds themselves are CPU-only and local). It passes the
+`fleet.captain` gate (re-checked inside the filing, fail-closed), dedups
+through the same ledger and forge search, so reruns of an unchanged or slid
+window file nothing new, and a failed search or filing is logged at `warn` and
+retried next tick without affecting the folds. It never unregisters a
+heuristic. By hand, `eta retire --file` still works.
+
+### Promotion statistics: the unit of independence
+
+The tracker re-estimates every live item on every pass, so one landed PR
+contributes dozens of paired observations scored against the same outcome.
+Shocks such as a runner shortage also hit many consecutive hours. Counting
+refreshes, or hourly blocks, as independent multiplies `n` without adding
+evidence. On 2026-10-06 twin-otter's day-win Wilson lower bound was 0.61-0.65
+on 6-hour blocks but 0.34-0.44 on 2-3 day blocks. Both gate halves
+(`eta::shadow_stats`) therefore use:
+
+- **Primary test**: the paired `pinball4` difference (candidate minus
+  `current`) over every scored observation, with a 95% percentile bootstrap
+  that resamples whole items (`repo#issue`; 1,000 resamples, seed `0x10193`,
+  the estimator `eta backtest` and the offline evaluation share). It passes
+  only when the interval's upper bound is below 0 and there are at least 100
+  distinct items. Refreshes of one item add observations but no items, so
+  they cannot manufacture confidence. The live ledger keeps per-item sums for
+  this (`shadow.json` `items`, at most 2,000 per comparison, least recently
+  seen evicted). A ledger from before #10525 has none, so the live primary
+  test refuses until items accumulate.
+- **Why 100**: a percentile cluster bootstrap under-covers with few clusters
+  (Cameron, Gelbach and Miller 2008 report over-rejection below roughly 30-50
+  clusters), so the floor is twice the top of that range. It does not delay
+  an active repository: `rjwalters/loom` merged 16-123 PRs a day over
+  2026-09-30..10-06 (median 53), so the 7 decided days below already carry
+  several hundred items. On a quiet repository, the floor is what binds.
+- **Consistency check**: at least 7 decided UTC days, with a strict majority
+  won, so a win cannot come from one regime.
+- **Monitoring only**: hourly blocks and the nightly-fold scoreboard. They
+  are never the significance unit.
+
+Every decision records the test (`item_test` on `backtest` and on
+`live.stats`): the unit, the sampling method, distinct items, observations,
+the mean and interval, the threshold, and the verdict.
+
+**Adaptation time (#10528).** Every decision records `adaptation`, under the
+rule **no adaptation regression**: when both sides are measured, the
+candidate's `t_p50` and `t_cov` must each be no longer than `current`'s, so a
+marginal accuracy gain cannot buy slower recovery from a shift. A measured
+regression refuses the promotion. No build produces these figures yet, so
+today every decision reads `not_measured`. That status does not gate, and the
+record says so rather than implying the check passed.
+
 **Not yet built** (follow-ups on #10525):
-- Retirement proposals from the nightly walk-forward folds (#10492): an
-  auto-filed issue with the evidence, never a silent removal.
-- A top-2 short-list by nightly-fold pinball before the live gate, to limit
-  multiple comparisons.
-- Promotion statistics: an item-clustered bootstrap on the paired pinball
-  difference as the primary test, with day blocks as a consistency check.
-- Adaptation time (`t_p50`, `t_cov`) in promotion and retirement (#10528).
+
+- A producer of `t_p50` / `t_cov` per heuristic (#10528). Until one exists,
+  the adaptation check records `not_measured`. Retirement domination does not
+  yet consider adaptation either; the proposal body says so.
+- loom-ui's chooser filtering on `tier` is owned by loom-ui#2031 / #2097 and
+  is not verified here.
 
 ## Fitted coefficients (`eta-fit/v1`)
 
@@ -1329,15 +1463,39 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   `Tracker::loop_features_of`. A v3 coefficient file carries `schema:
   "eta-fit/v3"`; v1 and v2 vectors are never reinterpreted. Tests pin the
   layout, the bit-identical v2 prefix, train/serve parity for every row, and
-  that file lists and CI runs first known after `as_of` move no column. Not
-  yet built: the live file-list and SigNoz `ci.run` readers (file overlap and
-  own-CI are unknown, indicators 0, until logged), the v3 fit and its shadow
-  heuristic, and the walk-forward backtest.
-- **Not a model input yet.** None of these is in `eta-fit/v1`'s `FEATURES`
-  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. Only
-  `eta-fit/v3` carries them, and no heuristic reads a v3 file yet. A new
-  datestamped shadow heuristic adopts them under that schema once the
-  loom-experiments walk-forward backtest passes (#10550).
+  that file lists and CI runs first known after `as_of` move no column.
+- **The v3 fit.** `eta fit` and the daily refit also write
+  `<fit_dir>/v3/fit-<T>.json` (`fit::v3::fit_v3`, the v1 fitters over the v3
+  vectors of the same rows; retention keeps 14; beside an explicit `--out`
+  as `<out>.v3.json`). `FitReport` adds `v3_id`, `v3_path` and
+  `loop_coverage` (rows knowing each friction input). `fit::v3::read_v3` /
+  `load_latest_v3` are v3-only; the v1 and v2 loaders never read it.
+- **Serving: `land-2026-10-06-loop-kite`.** Every PR item's explanation
+  records `features.loops` (`Tracker::loop_features_of`, the training
+  builder). loop-kite alone reads it. The twin-otter core selects the v3
+  transform from a model's `FEATURES_V3` names and reads
+  `twin_otter.input.loops`, so a v3 explanation recomputes from its record.
+  Over the survival steps the cumulative stage age advances with the clock,
+  as `age_h` does; the other friction inputs stay frozen at `as_of`. A
+  missing `features.loops` reads as the default set (no loop, every
+  `*_known` 0). The registry loads the v3 file beside v1 and v2
+  (`Registry::load`, `Registry::with_all_fits`); the tracker rebuilds it when
+  any of the three ids changes.
+- **Paired backtest.** `eta backtest --fit-dir DIR` replays walk-forward over
+  `DIR` and its `v2/` and `v3/` subdirectories (`DatedFits::load_dir`): each
+  case gets, per schema, the newest file cut off strictly before its `as_of`.
+  So loop-kite and twin-otter-b are scored on the same cases from the files
+  each day would have served. With no v3 file, loop-kite refuses `no_model`
+  and the v1-only replay is unchanged.
+- **Still open (#10550).** The live file-list reader (forge, ETag'd, reader
+  Apps, budgeted) and the SigNoz `ci.run` reader, so file overlap and own CI
+  stay unknown (indicators 0) in training and serving alike. The
+  loom-experiments walk-forward backtest and its results (pinball against
+  twin-otter-b, late surprise with paired CIs, starred / held / sequenced
+  subsets) have not been run. Promotion is the #10233 gate's decision.
+- **v1 and v2 are unchanged.** None of these is in `eta-fit/v1`'s `FEATURES`
+  or `eta-fit/v2`'s `FEATURES_V2`, so twin-otter, twin-otter-b and keen-wren
+  rows, coefficient files and fixtures are unchanged.
 
 ### Dependency-aware ETAs (#10510)
 
@@ -2081,9 +2239,10 @@ items which are not in it at all.
 
 ## CLI (`loom-daemon eta`)
 
-Eight subcommands. All are read-only except `eta promote --apply`, which writes
+Ten subcommands. All are read-only except `eta promote --apply`, which writes
 one config key, `eta fleet backfill|refresh`, which writes only the snapshot
-cache, and `eta fit`, which writes only a coefficient file. Nothing here writes
+cache, `eta fit`, which writes only a coefficient file, and `eta retire
+--file`, which files issues and records them. Nothing here writes
 an estimate to the journal or telemetry — that is the tracker's job, described
 above. Every subcommand but `offline` (which reads only its `--input`) also
 accepts `--repo-root PATH` (default: the current directory).
@@ -2152,7 +2311,15 @@ accepts `--repo-root PATH` (default: the current directory).
   and, with `--apply` and only when both gates pass, flips
   `autonomous.eta.current.<kind>` in the host-local config tier (#9328).
   Without `--apply` it changes nothing. Either way it appends the decision
-  record that explains the outcome.
+  record that explains the outcome. Only a short-listed candidate reaches the
+  gates ([Shadow fleet management](#shadow-fleet-management), #10525).
+- **`loom-daemon eta retire [--file] [--json]`** (#10525) — the retirement
+  proposals the saved nightly folds support, with their evidence
+  ([Shadow fleet management](#shadow-fleet-management)). Without `--file` it
+  only prints. With it, and only on the fleet captain (`fleet.captain`; other
+  hosts refuse), each proposal not already filed (in `.loom/state/eta/retirement-proposals.json`
+  or on the forge) is filed via `.loom/scripts/create-issue.sh`. It never
+  unregisters a heuristic.
 - **`loom-daemon eta fleet backfill|refresh|show [--repo OWNER/NAME] [--limit N] [--as-of RFC3339] [--progress] [--dry-run] [--json]`**
   — build, top up and inspect the fleet-wide forge-derived history snapshot
   (#9343), cached at `.loom/state/eta/fleet/fleet-<owner>-<repo>.json`.
@@ -2352,8 +2519,9 @@ of what is on disk and never needs a refetch.
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true` (#10492): the captain's nightly walk-forward backtest folds ([below](#nightly-backtest-folds-autonomousetanightlyfolds-10492)). Runs only with `enabled` too; read at start |
+| `nightlyFolds.retirementFiling` | `LOOM_ETA_RETIREMENT_FILING_ENABLED` | `false` (#10525): after the folds, the captain files retirement proposals as issues ([above](#shadow-fleet-management)). Needs `nightlyFolds.enabled`; read at start |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
-| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (`current` + 12 alternates, #10549), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
+| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (`current` + 13 alternates, #10549, #10521), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
 | `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
 | `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |
