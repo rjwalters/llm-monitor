@@ -2227,10 +2227,8 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
   # cost" telemetry field rather than always reporting the configured max.
   # This reads the already-existing decision text; it does not change the
   # recheck's decision logic in any way (#6978, AC4).
-  _MSM_RETRIES_USED="$_MSM_RETRIES"
-  if [[ "$_MSM_REASON" =~ recheck\ \#([0-9]+) ]]; then
-    _MSM_RETRIES_USED="${BASH_REMATCH[1]}"
-  fi
+  # Parsed by `loom-daemon merge-pr retries-used` (#8191 slice); telemetry only, so any fault keeps the configured budget.
+  _MSM_RETRIES_USED="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr retries-used --reason "$_MSM_REASON" --configured "$_MSM_RETRIES" 2>/dev/null)" || _MSM_RETRIES_USED="$_MSM_RETRIES"
 
   # Durable telemetry (#6978, follow-up from #6156): emit one
   # merge.admission_recheck record per invocation, in addition to the

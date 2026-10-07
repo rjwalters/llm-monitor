@@ -307,6 +307,7 @@ dirty-guard open -
 worktree-contains open -
 worktree-preserve open -
 discovered-worktree open -
+retries-used open -
 cleanup-paths open -"
 
 # Shared comparison, so the controls below exercise the SAME logic the real
