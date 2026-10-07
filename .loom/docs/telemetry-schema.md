@@ -1763,7 +1763,7 @@ Tokens, providers and pools (Issues #8908, #8931):
 |---|---|---|---|
 | `loom.pool.account_marks` | delta `Sum` | `{account}`; labels `provider`, `reason` | one per account mark the daemon writes, at the seam that writes it: sweep and role-tick Codex terminal feedback (`provider=codex`), API-key pool bad marks (`provider` = the pool namespace, e.g. `zai`), and the Claude insta-crash exhaustion mark (`claude`). `reason` ∈ `rate_limited`, `exhausted`, `session_limit`, `model_credits`, `credential`, `transient`. No point when no mark is written (a native credential failure, a Codex `SUCCESS`/`TIMEOUT`, a failed write) |
 | `loom.pool.hold` span | own root trace (derived from `loom.pool.hold.pool` + hold start) | `loom.pool.hold.pool` (16-hex SHA-256 prefix of the pool directory — the pool's identity, never its path), `loom.pool.hold.post_mortem` (`true` when a real token-selection death armed it), `loom.pool.hold.accounts` | one work-finder pool dispatch hold, from arming to clearing. A hold still armed when the daemon stops emits no span |
-| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
+| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `llm.billing`, `llm.credential.kind`, `llm.provider.profile` (see [LLM billing class](#llm-billing-class-10749)); `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
 
 GitHub rate limit (Issue #10022):
 
@@ -1804,6 +1804,47 @@ span's `github.account`, `account` is `app-<app id>`,
 | `execution` | a role-runner tick's own `loom.role_attempt` root | the tick's transcript/native-store scan |
 | `attempt` | the role's `loom.role_attempt` in the execution journal (daemon child), else a `loom.role_attempt` created in the issue's story trace (operator session) | `loom-daemon usage-record`, run by the sweep prompt after each checkpoint write |
 | `attempt` | the tick's story span, **only when the tick stitched exactly one target** | the role runner; a multi-target tick is never split |
+
+#### LLM billing class (#10749)
+
+`loom.cost.usd_estimate` is the list price whatever the run was billed, so
+`loom.runtime.run` and every `loom.runtime.usage` span (sweep execution and
+attempt scope, and role-tick usage) also carry how it was billed:
+
+| Attribute | Values | Notes |
+|---|---|---|
+| `llm.billing` | `subscription` \| `api` \| `local` \| `unknown` | `api` is metered cash spend. `unknown` is stated, never guessed. |
+| `llm.credential.kind` | `oauth-pool` \| `chatgpt-seat` \| `api-key` | Omitted for `local` and `unknown`. |
+| `llm.provider.profile` | model-profile name (`zai-flash`, `quick-cerebras`, ...) | Present when the launch selected a profile. |
+
+Classification is data-driven: a Claude launch is `subscription`/`oauth-pool`,
+a Codex launch `subscription`/`chatgpt-seat`; a launch the preference walk put
+on a governed metered tap (`backstop=` in its marker) is `api`/`api-key`; a
+native-harness launch uses its model profile's optional `billing` field
+(`subscription` | `api` | `local`, e.g. `zai-flash` is the flat-rate z.ai
+coding plan) and, when absent, treats a profile that reads a provider
+credential as metered (`api`/`api-key`) and a credential-less one as
+`unknown`. An LLM-gateway route is always `api`/`api-key`. Usage spans copy
+the class from the launch's `loom.runtime.run` span (role ticks: from the
+launch record's `llmBilling`/`llmCredentialKind`, else the runtime), and only
+when that launch is established — otherwise they say `unknown`:
+
+- **`execution` scope** totals every launch of the sweep per model and cannot
+  split them, so it carries the class *all* of the execution's runs share; a
+  sweep with differently billed launches (or an unstamped run) is `unknown`,
+  and `llm.credential.kind` / `llm.provider.profile` are kept only when every
+  run shares them. For such a sweep, split cash from subscription with its
+  `attempt` spans.
+- **`attempt` scope** takes the runs in the attempt's own span ancestry (a run
+  under the `loom.role_attempt`, or the run it sits under), else a run that
+  belongs to no attempt and whose interval encloses the attempt's. Those must
+  agree; none, or a disagreement, is `unknown`. A run under another attempt is
+  never borrowed.
+
+Count `unknown` separately — never as `api` nor as `subscription`. Only this
+closed vocabulary and the profile name are emitted: no key value, account
+name or token path. Sum metered spend per day with
+`llm.billing = api` grouped by `llm.provider.profile`.
 
 A daemon sweep's `claude -p` child also runs `usage-record`, so one trace can
 hold both scopes for one `loom.sweep_id`. **Total per `loom.sweep_id` from its

@@ -526,7 +526,8 @@ versus a session limit), which the snapshot-derived `loom.pool.exhaustions`
 cannot do. Each work-finder pool hold emits a `loom.pool.hold` span when it
 clears. At a sweep's terminal transition, the execution's exact token
 breakdown is journalled as one `loom.runtime.usage` span per model and scope
-(execution/attempt) in the sweep's trace,
+(execution/attempt) in the sweep's trace, each stamped with `llm.billing` /
+`llm.credential.kind` / `llm.provider.profile` (#10749),
 and the transcript-ingest pass stamps the sweep's `session.summary` log with
 the same trace when the match is unambiguous — which needs the summary to know
 its issue, so #9445 resolves that from the session's worktree/branch as well as
