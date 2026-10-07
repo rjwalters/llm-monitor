@@ -2,6 +2,39 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-07
+
+- **Issue #243** (closed): Calibration alert: replace menu-bar dot with popover footer notice; ignore near-empty token days
+- **PR #244**: Calibration alert: popover footer notice; ignore near-empty token days (#243)
+
+### 2026-10-05
+
+- **PR #237**: feat(ui): say why a stale or never-read row is blank
+- **PR #241**: fix: keep a stored 401 sticky and stop treating a missing credential as one
+- **PR #240**: fix: persist 401 poll failures and export revoked credentials as blocked
+
+### 2026-10-03
+
+- **Issue #238** (closed): Second launch of LLMMonitor should not start a second instance
+- **PR #239**: Refuse a second LLMMonitor instance on the same data directory
+
+### 2026-10-02
+
+- **PR #236**: Resizable popover, no empty launch window, drop even-burn mark
+
+### 2026-10-01
+
+- **Issue #234** (closed): selftest push: stub ssh re-execs Bundle.main.executablePath → unbounded recursion when suite runs from a standalone binary
+- **PR #235**: fix(selftest): stop the push check re-execing a non-CLI host (#234)
+
+### 2026-09-30
+
+- **PR #229**: fix: don't compare a legacy user- Codex id with a workspace id
+- **Issue #226** (closed): UI: Add Account provider picker (Claude / z.ai / Codex)
+- **Issue #227** (closed): UI: hide Anthropic-only columns when no visible account uses them
+- **Issue #225** (closed): UI: provider-neutral copy (popover title, empty state, chart, Roll Token, Auth column)
+- **PR #228**: feat(ui): provider-neutral UI for v3 (copy, Add Account picker, column hiding)
+
 ### 2026-09-29
 
 - **Issue #230** (closed): Read Loom-profile Codex usage from 'accounts check --live' instead of rollout snapshots
