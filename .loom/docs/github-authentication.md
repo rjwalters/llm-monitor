@@ -314,9 +314,15 @@ hard-failing.
 1. Create a GitHub App (under whichever account/org owns the target repos)
    with **Contents: Read & write**, **Issues: Read & write**, **Pull
    requests: Read & write**, **Metadata: Read** permissions, plus
-   **Actions: Read** (optional: lets the #8248/#8919 freshness guard read the
-   base each required check actually tested, instead of falling back to the
-   timestamp rule). GitHub has no API for changing an App's
+   **Checks: Read** and **Commit statuses: Read** (CI verdicts:
+   `forge wait-checks` reads `commits/{sha}/check-runs` and
+   `commits/{sha}/status`; without Commit statuses the wait degrades to
+   check-runs only, #10633), and **Actions: Read & write** (Read lets the
+   #8248/#8919 freshness guard read the base each required check actually
+   tested, instead of falling back to the timestamp rule; write lets
+   `forge rerun` re-run a cancelled or flaky job in place, #10633). Reader
+   Apps in a read pool need the same read permissions: a reader refused for
+   one falls back to the writer, an extra call per read. GitHub has no API for changing an App's
    permissions: add it in the App's settings, then accept the updated
    permission request on each installation.
 2. Generate a private key for the app (downloads a `.pem` file) and copy it to
