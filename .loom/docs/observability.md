@@ -647,8 +647,9 @@ the tick's record, as for `SESSION_DOWN`. The tick carries
 `loom.admission.reason="session-mount-stale"` and records no account hold
 (the container is stale, not the account). `loom-daemon workspace add` /
 `remove` print every host-mode session container the registry change left
-drifted, with the manual recreate, until the reconciler recreates idle ones
-itself.
+drifted. The session reconciler recreates idle ones itself (busy ones on a
+later pass; see `daemon-reference.md`), so the manual recreate it prints is an
+override for a stopped daemon or an opted-out reconciler.
 
 **Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
 `auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
