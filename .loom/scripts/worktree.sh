@@ -1566,7 +1566,9 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 # `${CLAUDE_PID:-$PPID}`, NEVER `$$` (the one-shot tool-call subshell). The
 # remaining policy lives in `loom-daemon lease ensure` (ADR-0018; this file's
 # `contract` category admits no growth). $_WT_DAEMON_BIN: resolved above.
-_wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 || true; }
+# `3>&-` (#10203): fd 3 is the caller's saved stdout (`exec 3>&1`); the up-to-4h
+# renewer must not inherit it and hold a `worktree.sh N | tail` pipe open.
+_wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 3>&- || true; }
 
 # --- Issue claim-lock cross-check (#8553) ------------------------------------
 # Reads (never acquires) the daemon's per-issue sweep-claim lock before every

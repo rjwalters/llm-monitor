@@ -9172,6 +9172,44 @@ across the registered roots:
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
 
+**Seeing it: `loom-daemon status` (#10600).** `status` lists every
+session-managed Codex account across the registered roots under `Session
+containers:`, one line each: the state (`running`, `stopped`, `missing`,
+`restarting`); the mounts (`ok`, or `stale (missing N, extra M, denied K)`,
+where `denied` is a mount `session start` refuses today and is not counted in
+`extra`); the posture (`host`, `private-clone`, or `unverified` when the
+container is not running or not hardened); `held (operator stop)`; `removed
+(denied mount: <path>)` while a removal record stands; and the reconciler's
+last action in this daemon process (`started`, `recreated`, `recreated (mount
+drift)`, `deferred (in-flight)`, `backoff until <time>`, …). `status --json`
+carries the same as `session_containers`. A seat that is not running, has
+stale mounts or has a standing removal record makes the block read
+`DEGRADED`, with one line naming the accounts. So does a host whose
+containers cannot be observed. A held seat is listed but does not degrade it:
+the operator stopped it on purpose. `loom-daemon health` has the same verdict
+as its conditional `session_containers` section. A host without a
+session-managed account shows neither.
+
+`status` makes no `docker` call. It reads the snapshot the session watch
+publishes every 60 s, with the drift verdict computed there. That verdict is
+the reconciler's own definition, so a container the reconciler is about to
+remove never reads `running` (the `loom.codex_session.state` gauge and the
+`workspace add/remove` report use it too). With no snapshot, or one older than
+120 s, the block reads `unavailable`, never a container state. The watch reads
+every registered root's accounts, not only the daemon root's. It is registered
+with task liveness as `codex_session_watch` (`Task liveness:` in `status`), and
+WARNs every 15 min while seats exist and its newest snapshot is older than
+120 s. After a pass starts or recreates a container it publishes a fresh
+snapshot, so dispatch selection sees the container at once. An operator's
+`accounts session start` runs in another process and cannot publish, so
+selection sees that container at the watch's next pass, within 60 s.
+
+**Acting by hand.** The reconciler replaces the hand-recreate steps. Check
+`loom-daemon status` first. The one manual override, for a daemon that is down,
+a reconciler that is opted out, or a restart the reconciler does not make
+(changed profile control files), is in
+[`guardrail-parity-codex.md`](guardrail-parity-codex.md#restarting-or-recreating-session-containers-by-hand).
+
 **Mount drift (#10364).** A host-mode container's workspace mounts are fixed
 when it is created, so a later `loom-daemon workspace add` never reaches it
 (every Codex tick in the new repository fails `chdir to cwd`) and a later
