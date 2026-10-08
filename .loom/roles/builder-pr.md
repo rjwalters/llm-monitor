@@ -383,7 +383,7 @@ Local verification:
 - [ ] Linter run on changed files (0 errors)
 ```
 
-**Pre-PR gate (pre-flight, #10476).** If `buildGate` is configured, run `loom-daemon preflight --issue N` before `create-pr.sh`. Exit 1 = failed: it prints the output tail; fix, commit, re-run (max `buildGate.preflightMaxAttempts`, default 3). Exit 4 (`preflight_unresolved`) = stop, open NO PR (claim already released). `create-pr.sh` refuses (exit 7) a HEAD that has not passed. No `buildGate` = no-op exit 0.
+**Pre-PR gate (pre-flight, #10476).** With `buildGate` set, run `loom-daemon preflight --issue N` before `create-pr.sh`. Exit 1 = failed: fix the printed tail, commit, re-run (max `preflightMaxAttempts`, default 3). Exit 4 (`preflight_unresolved`) = stop, NO PR (claim released). Exit 5 = timeout (claim kept): re-run; at cap, NO PR. `create-pr.sh` refuses (exit 7) an ungated HEAD. No `buildGate` = no-op exit 0.
 
 ### Language-Specific Verification
 
@@ -646,10 +646,8 @@ body. `--signoff` is harmless when not required. See
 ### PR Label Rules
 
 **When creating a NEW PR:**
-- Add `loom:review-requested` during creation, plus each priority label the issue
-  carries (`loom:operator-priority`, `loom:operator-high-priority`,
-  `loom:high-priority-inherited`; #9244/#10307: the one set a role copies, never invents;
-  level list: keep in sync with operator_levels.rs LEVELS until #10311)
+- Pass only `loom:review-requested`: `create-pr.sh` copies the closing issue's
+  priority labels (the star and its levels) itself (#10518); a role never invents one
 - This is the ONLY time you add labels to a PR
 
 **After PR creation:**
@@ -967,6 +965,7 @@ still a transient credential window, never a signal to redo the work.
 ```bash
 # CORRECT way to create PR
 # Title MUST use conventional commit format: "fix:", "feat:", "refactor:", etc.
+# create-pr.sh adds the closing issue's priority labels (the star) itself (#10518)
 ./.loom/scripts/create-pr.sh --title "fix: descriptive summary of the change" --label "loom:review-requested" --body "$(cat <<'EOF'
 ## Summary
 Brief description of what this PR does and why.
