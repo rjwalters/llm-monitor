@@ -2649,9 +2649,10 @@ without an inherited marker, so that star reads as the operator's and is not
 auto-removed on unstar (it fails safe). Closing it needs a `loom-daemon`
 subcommand posting the marker, tracked in #10592.
 
-**What travels to children (#10012 §6).** One table in code
-(`star_liveness::propagation_rules`) says which labels go from a parent to
-its children, always downward. The star goes to child issues and their PRs and
+**What travels to children (#10012 §6).** Each label's `propagate` field in
+`defaults/labels.json` (#10013) says whether it goes from a parent to its
+children, always downward; `star_liveness::propagation_rules` derives its
+table from it. The star goes to child issues and their PRs and
 is removed with the parent's star. `external` goes to child issues and is
 removed when no ancestor carries it any more, so a child of an unapproved
 outside submission cannot get past the maintainer gate. A `tier:*` label is
@@ -2664,9 +2665,9 @@ human put on the child, and never after an incomplete walk. The
 (`loom:blocked`, `loom:operator`, `loom:operator-only` and its sub-kinds,
 `loom:needs-capability`), claim, lifecycle and PR-lane labels, proposal kinds,
 `loom:epic-phase`, `loom:heavy`, `points:*`, the retired `loom:urgent`, and the
-#10307 level labels, which reach blockers by their own pass. A unit test fails
-when a `defaults/labels.json` label is in neither the table nor the
-never-propagate list. The pass writes only the star so far (above); it
+#10307 level labels, which reach blockers by their own pass: all carry
+`propagate: null`, and a unit test fails if a hold, claim, lifecycle, PR-lane,
+proposal, structural, size or resource label gets a rule. The pass writes only the star so far (above); it
 writes no `external` or `tier:*` label yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`

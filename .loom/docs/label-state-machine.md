@@ -104,7 +104,8 @@ says so, and no role applies it).
   star (never an operator's own star, never because the root closed).
   Never propagated: holds, claim/lifecycle labels, `loom:heavy`, `points:*`.
   Only the star, `external` and (as a default) `tier:*` travel to children;
-  the table and full never-list: `daemon-reference.md` → "What travels to children".
+  the table is each label's registry `propagate` field; full never-list:
+  `daemon-reference.md` → "What travels to children".
 - **Starred first, every stage.** Curator curates starred issues first (a
   starred issue with no workflow label counts as `loom:triage`) and promotes
   them straight to `loom:issue`, because the star is the Tier-3 approval. A
@@ -1002,4 +1003,6 @@ registry.
 Every daemon table named by a boolean property above is derived from the
 registry; dep_classify's operator-only names stay consts, lockstep-tested
 against `requires_base`/`remove_with` (#5671). Changes go in the registry.
-`stale_after_minutes`, `lifecycle` and `propagate` are inert.
+`propagate` holds #10012's propagation table (`null` = never propagates);
+`star_liveness::propagation_rules` derives its rules from it.
+`stale_after_minutes` and `lifecycle` are inert.
