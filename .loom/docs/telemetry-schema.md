@@ -1618,6 +1618,20 @@ fixed daemon loop name: `auto_update`, `eta_fleet_refresh`, `eta_pass` or
 | `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
 | `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
 
+IPC request latency (Issue #10765, `observability/ops/ipc_latency.rs`).
+Each IPC request is timed from its line being read to its response being
+written, and exported every 60 s on its own ticker. `kind` is the request's
+wire `type` tag (a `Request` variant name such as `DaemonStatus`,
+`QuarantineList`, `ListWorkspaces`), or `invalid` for a frame that did not
+parse. A kind with no requests in the interval emits no point. Event
+subscriptions are not counted.
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.daemon.ipc.latency_max` | `s` | `kind` | the slowest request of that kind answered in the interval |
+| `loom.daemon.ipc.latency` | `s` | `kind` | a delta counter: summed latency of the requests answered |
+| `loom.daemon.ipc.requests` | `{request}` | `kind` | a delta counter: requests answered (with `latency`, gives the mean) |
+
 ETA pipeline health (Issue #10391, `observability/ops/eta_health.rs`). All
 gauges, sampled once per collector pass, so they stay alive when no
 `eta.fleet_refresh` record is emitted (a stood-down host). An unmeasurable

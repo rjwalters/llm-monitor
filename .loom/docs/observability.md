@@ -706,6 +706,15 @@ the drain state and the deciding build's version and revision. A host that
 stops converging now says why on every tick. See
 [`telemetry-schema.md` → `auto_update.tick`](telemetry-schema.md#auto_updatetick).
 
+**IPC latency (#10765).** `loom.daemon.ipc.latency_max{kind}`,
+`loom.daemon.ipc.latency{kind}` and `loom.daemon.ipc.requests{kind}` time
+every IPC request from read to response written, so a live but slow daemon is
+visible without the watchdog. A request slower than 5 s is also logged at WARN
+(`ipc: <kind> request took ...`), except `DaemonStatus` (which logs its own
+phase breakdown) and `CancelSweep` / `DispatchSweep` (slow by design: the
+SIGTERM grace and the token-capture poll). See
+[`telemetry-schema.md`](telemetry-schema.md) for the labels.
+
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 `OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in
