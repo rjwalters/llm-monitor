@@ -622,6 +622,11 @@ _check_defaults_version_bump_collision() {
 # API call — same reasoning as _check_no_open_stacked_children above.
 _check_defaults_version_bump_collision
 
+# Pre-merge workflow-scope guard (#10539): `loom-daemon merge-pr workflow-scope`.
+# Exit 1 = PR touches .github/workflows/ and the token lacks `workflow`; anything else proceeds (fail open, so an older daemon is a skip).
+_check_workflow_scope() { local out rc=0; [[ "${FORGE_TYPE:-github}" == "github" ]] || return 0; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr workflow-scope --repo "$REPO_NWO" --pr "$PR_NUMBER" 2>/dev/null)" || rc=$?; [[ $rc -eq 1 ]] || return 0; [[ "${DRY_RUN:-false}" != "true" ]] || { warning "[dry-run] Would BLOCK: $out"; return 0; }; error "$out"; }
+_check_workflow_scope
+
 # _trusted_pr_comments <nwo> <pr> -- emit the bodies of `<nwo>`'s PR <pr>`
 # comments whose authors Loom trusts as control-signal sources (#9548): a repo
 # insider by author_association, one of THIS fleet's Apps, this daemon's own
@@ -1852,6 +1857,9 @@ _recheck_mergeable_before_refusal() {
 # LOOM_ZERO_CHECKS_SETTLE_POLLS / LOOM_ZERO_CHECKS_SETTLE_INTERVAL (#9091) are
 # read and validated by `loom-daemon merge-pr zero-checks-settle`, not here.
 _wait_for_checks_then_sync_merge() {
+  # The unfetchable/pending arms' deadline-or-wait decision: `loom-daemon merge-pr poll-wait` (#8191 slice).
+  # Returns 5 on timeout, 0 to wait; callers sleep OUTSIDE the `|| exit 5` (errexit is off in that context, so a failed sleep would exit 5, not 1). A verb that cannot run keeps the deadline compare here (only the wording degrades). SELF_BIN-first (#8134), like the per-poll check-runs-rollup.
+  _mp_poll_wait() { local now o a l m; now="$(date +%s)"; o="$(printf '%s\n' "${2:-}" | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" merge-pr poll-wait --kind "$1" --pr "$PR_NUMBER" --now "$now" --deadline "$deadline" --timeout "$LOOM_AUTO_MERGE_TIMEOUT" --interval "$LOOM_AUTO_MERGE_POLL_INTERVAL" --rc "${3:-0}" 2>/dev/null)" || o=""; [[ "$o" == "LOOM-POLL-WAIT "* ]] || o="LOOM-POLL-WAIT $([[ "$now" -ge "$deadline" ]] && echo TIMEOUT || echo WAIT) warning PR #$PR_NUMBER: 'merge-pr poll-wait' unavailable (missing/older loom-daemon), polling on the deadline alone (check-runs ${1}, rc=${3:-0})"; read -r _ a l m <<<"$o"; if [[ "$a" == TIMEOUT ]]; then warning "$m"; return 5; fi; if [[ "$l" == info ]]; then info "$m"; else warning "$m"; fi; }
   local head_sha base_ref
   # Poll the SHA this run will actually MERGE, not the one the initial
   # (gh-cached) $PR_JSON fetch reported: $MERGE_PRECONDITION_SHA is the live,
@@ -1956,12 +1964,8 @@ _wait_for_checks_then_sync_merge() {
       # _wait_for_checks_then_sync_merge's reads), and this is the same idiom
       # the two `fetch_rc`/`observed_checks` assignments in this loop use.
       [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]] && warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
-      if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        # #8896: exit 5, not error()'s exit 1 — an unreadable check-runs API is
-        # a forge condition this run waited out, not a merge failure.
-        warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER — exiting 5 (not merged, not a failure: re-queue). Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."; exit 5
-      fi
-      warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$fetch_rc); treating as still-pending and continuing to poll"
+      # Wait-or-timeout (exit 5, #8896) is `_mp_poll_wait` (#8191 slice).
+      _mp_poll_wait unfetchable "" "$fetch_rc" || exit 5
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
     fi
@@ -2021,17 +2025,7 @@ _wait_for_checks_then_sync_merge() {
     fi
 
     if [[ -n "$pending" ]]; then
-      # Hoisted out of both branches below (it was computed identically in
-      # each) so the #8896 comment can land without growing the file.
-      local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
-      if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        # #8896: exit 5, not error()'s exit 1. CI outlasting the bounded wait is
-        # the re-queue signal exits 3/4 already carry — nothing merged, nothing
-        # failed, no required check went red — so it must not be
-        # indistinguishable from a genuine merge failure to Champion.
-        warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete — exiting 5 (not merged, not a failure: re-queue). Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."; exit 5
-      fi
-      info "PR #$PR_NUMBER: ${n} check(s) still running; waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
+      _mp_poll_wait pending "$pending" || exit 5
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
     fi

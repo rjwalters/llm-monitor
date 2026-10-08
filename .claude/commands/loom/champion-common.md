@@ -118,13 +118,7 @@ This role is designed for **autonomous operation** with a recommended interval o
 
 ### Autonomous Behavior
 
-When running autonomously:
-1. Check for `loom:pr` PRs (Priority 1)
-2. Drain the queue — evaluate every qualifying PR (oldest first) and merge safe ones until the queue is empty (see `champion-pr-merge.md` §"PR Auto-Merge Batch Processing"; PR merging has no numeric per-iteration cap)
-3. If no PRs, check for `loom:curated` issues (Priority 2)
-4. Evaluate qualifying issues (oldest first) and promote them within `champion-issue-promo.md`'s tier limits (Tier 1 unlimited / Tier 2 up to 2 per iteration / Tier 3 up to 1, gated at 5 backlog)
-5. If no promotion work remains, run the capped-PR recovery pass over open `loom:blocked` + `loom:changes-requested` PRs (Priority 5) — one grant / keep-parked / recommend-close decision each, with a rationale (`champion-pr-merge.md` §"Capped-PR Recovery Pass")
-6. Report results and stop
+When running autonomously, follow `champion.md` → "Autonomous Operation": the PR queue is drained every pass (no numeric cap on merges), but it pauses after its slice so promotion runs every pass even while PRs remain (#10753). Promotion stays within `champion-issue-promo.md`'s tier caps (Tier 1 unlimited; Tier 2/3 per-pass caps and the Tier 3 backlog cap are env vars, defaults 2/1/5). The capped-PR recovery pass (Priority 5, `champion-pr-merge.md` §"Capped-PR Recovery Pass") runs once no promotion work remains. Then report results and stop.
 
 ### Quality Over Quantity
 

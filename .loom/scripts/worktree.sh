@@ -1563,12 +1563,15 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 # `forge check-claim`, #8280 branch reuse, #7765/#9083 origin-branch reuse) or
 # an add that can still fail, so no nonzero exit before a real worktree exists
 # leaves a lease comment and renewer behind. `--watch-pid` is
-# `${CLAUDE_PID:-$PPID}`, NEVER `$$` (the one-shot tool-call subshell). The
+# `${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}` (#10570: the same chain as the
+# CLAUDE.md claim recipe), NEVER `$$` (the one-shot tool-call subshell). stderr is
+# left attached: `lease ensure` prints exactly one outcome line there, and a
+# declined/failed publish must stay visible, not be swallowed (#10570). The
 # remaining policy lives in `loom-daemon lease ensure` (ADR-0018; this file's
 # `contract` category admits no growth). $_WT_DAEMON_BIN: resolved above.
 # `3>&-` (#10203): fd 3 is the caller's saved stdout (`exec 3>&1`); the up-to-4h
 # renewer must not inherit it and hold a `worktree.sh N | tail` pipe open.
-_wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 3>&- || true; }
+_wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" > /dev/null 3>&- || true; }
 
 # --- Issue claim-lock cross-check (#8553) ------------------------------------
 # Reads (never acquires) the daemon's per-issue sweep-claim lock before every
