@@ -152,3 +152,28 @@ disable-auto-merge`, the claim-reconciliation revoke, and the live
 narrowed by B4 but still open, so `INVARIANT_FULLY_DEMONSTRATED` and
 `QUEUE_EXECUTION_ENABLED` stay `false`. Production enablement also needs
 Phase C qualification (`merge-queue-ci.md`).
+
+## Group-aware revocation wiring (Phase B5)
+
+`group_github` adds the GitHub adapters (queue entries via GraphQL `mergeQueue.entries`, group commit = entry `headCommit`, members = entries `1..=k`; commit-status write for `loom/merge-authorization`). `revoke_for_root` and `forge merge-queue revoke` now call `revoke_for_transition_groups`, which revokes, re-fails every live group containing the PR, then dequeues, and reports an unconfirmed re-fail as the residual window in the transition comment. Still not wired: the `merge_group` workflow running `group_check`, a durable GrantStore, `judge.md`. `QUEUE_EXECUTION_ENABLED` and `INVARIANT_FULLY_DEMONSTRATED` stay false.
+
+## Check runner (Phase B6)
+
+`forge merge-queue group-check --commit <merge-group-sha>` (module
+`group_run`) is the runner that turns `group_check` into the posted
+`loom/merge-authorization` commit status: it finds the live group for the
+commit, reads the ruleset's other required contexts (newest run per name,
+`success`/`neutral`/`skipped` only, truncated listings are errors), evaluates
+every member, and posts `success`/`pending`/`failure`. Exit 0 = success posted,
+1 = failure, 6 = pending, 3 = nothing confirmed posted; every non-zero exit
+leaves the context unsatisfied, so the merge stays blocked. A commit that is
+not a live group posts `failure`; a group-discovery outage posts nothing. The
+daemon tick also evaluates every live group (queue mode only) so a group does
+not wait on a workflow; that pass is an accelerator, not the enforcement.
+Run `group-check` from a `merge_group` workflow with `statuses: write`
+(Phase C, `merge-queue-ci.md`; no workflow is installed by this phase).
+
+Still open and why the mode stays disabled: the grant store is PR comments
+(not tamper-proof), the post-pass-to-merge window above, and no live pilot has
+confirmed the fake's model of GitHub's group semantics.
+`QUEUE_EXECUTION_ENABLED` and `INVARIANT_FULLY_DEMONSTRATED` stay `false`.
