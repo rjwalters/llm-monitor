@@ -717,9 +717,11 @@ Before #10744 this recurring provider call from every host was invisible. See
 `loom.daemon.ipc.latency{kind}` and `loom.daemon.ipc.requests{kind}` time
 every IPC request from read to response written, so a live but slow daemon is
 visible without the watchdog. A request slower than 5 s is also logged at WARN
-(`ipc: <kind> request took ...`), except `DaemonStatus` (which logs its own
-phase breakdown) and `CancelSweep` / `DispatchSweep` (slow by design: the
-SIGTERM grace and the token-capture poll). See
+(`ipc: <kind> request took ...`), except `DaemonStatus` and
+`DaemonStatusSections` (`status --json --section`, #10787; it has its own
+`kind` so cheap sectioned calls do not dilute the full build's series), which
+log their own phase breakdown, and `CancelSweep` / `DispatchSweep` (slow by
+design: the SIGTERM grace and the token-capture poll). See
 [`telemetry-schema.md`](telemetry-schema.md) for the labels.
 
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
