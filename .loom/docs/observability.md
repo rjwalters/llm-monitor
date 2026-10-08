@@ -574,7 +574,13 @@ picture from the local forge-call sink. Each `invoke github` span carries the
 same facts per call (#10343): `github.http.{status,not_modified,requests,source}`
 (`unknown` when `gh` gave no HTTP evidence — never guessed),
 `github.billing` (`ok`|`not_modified`|`rate_limited`|`error`|`not_sent`) and
-the bucket join keys `github.{resource,account,cred_owner,role}`.
+the bucket join keys `github.{resource,account,cred_owner,role}`. Since
+#10752 a span also carries `github.repo`, a write carries `github.number`, and
+a call made by a daemon pass inside its caller scope carries `github.caller`
+(the `loom:blocked` release pass: `stale_blocked_release`). That pass also
+emits a `pass.summary` log per pass and a `pass.verdict` per artifact; see
+[`telemetry-schema.md`](telemetry-schema.md) and
+`defaults/observability/signoz/pass-queries.sql`.
 
 **Shadow reconciliation (#10343).** *Shadow* spend is what GitHub billed a
 bucket that Loom did not attribute: GitHub's bill per `(account, owner,
