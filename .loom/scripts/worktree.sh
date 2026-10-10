@@ -1136,8 +1136,8 @@ Monorepo / Generated-Artifact Symlinks:
   Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
   never stages it; linking is best-effort and never aborts worktree creation. Repos
   with no nested node_modules and no worktree.linkPaths config see no change.
-  NEITHER node_modules family runs on a pnpm workspace — pnpm purges THROUGH the alias
-  into the main clone (#8944). Override: worktree.linkNodeModules true|false|"auto".
+  NEITHER node_modules family runs on a pnpm workspace (#8944; override: worktree.linkNodeModules
+  true|false|"auto"). Pre-#8944 aliases: loom-daemon worktree-link --retire-aliases (#9152).
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:

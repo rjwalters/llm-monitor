@@ -139,7 +139,7 @@
 #       reported, so merging now would move the base under it again (the
 #       #10163 livelock). Checked only under --auto or LOOM_CHAIN_LOCK_GUARD=1,
 #       before anything is written; nothing merged, nothing failed. Bounded
-#       by LOOM_CHAIN_LOCK_CAP_SECS (default 1200, max 3600);
+#       by LOOM_CHAIN_LOCK_CAP_SECS (default 7200, max 10800);
 #       LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it. Same caller contract as exits
 #       3/4/5 — re-queue, never a failure comment.
 
@@ -483,8 +483,9 @@ fi
 # existed. Labels here are verdict-gating/merge-gating data, i.e. the
 # deliberately-uncached class in docs/gh-cached.md, the same class the 15+
 # `forge_get_pr_nocache` rechecks further down already belong to.
-PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH") || \
-  error "Could not fetch PR #$PR_NUMBER"
+# A failed fetch names its cause -- status, meaning, forge message (#9192).
+_PRF_ERR="$(mktemp)"
+PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>"$_PRF_ERR") || error "Could not fetch PR #$PR_NUMBER -- $(forge_fetch_error_cause "$(cat "$_PRF_ERR"; rm -f "$_PRF_ERR")" "$PR_JSON")"; rm -f "$_PRF_ERR"; unset _PRF_ERR
 
 # Combined onto two lines (net code-line offset for the #8112 guard added
 # below — file-size-policy.md's "remove at least as much as you added"; a
