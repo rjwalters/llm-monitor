@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1019",
-  "loom_commit": "febfc4335d0554865fadbecba718245cd88c6678",
+  "loom_version": "0.19.1026",
+  "loom_commit": "09a449709f5a1c6ae81b471ef56d466247e50808",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -119,7 +119,14 @@
     ".loom/docs/telemetry-kind-pick-decision.md",
     ".loom/scripts/dep-recheck-fingerprint.sh",
     ".loom/scripts/tests/ci-wired.txt",
-    ".loom/scripts/tests/test-sweep-lease-renew-lifecycle.sh"
+    ".loom/scripts/tests/test-sweep-lease-renew-lifecycle.sh",
+    ".loom/scripts/tests/test-check-main-clean-build-trees.sh",
+    ".agents/skills/loom-builder-pr/SKILL.md",
+    ".claude/commands/loom/builder-pr.md",
+    ".loom/docs/park-record.md",
+    ".loom/roles/builder-pr.md",
+    ".loom/scripts/check-main-clean.sh",
+    ".loom/scripts/tests/ci-excluded.txt"
   ],
   "last_resync": "2026-10-10",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
