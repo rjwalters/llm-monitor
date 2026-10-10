@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1001",
-  "loom_commit": "482cf5f6c7752a799cb16b3ed5fc3bd222c418cf",
+  "loom_version": "0.19.1009",
+  "loom_commit": "8889f7bd1eccfb4bc8239e7f5669b65f9815c30e",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -24,7 +24,6 @@
     ".loom/CLAUDE.md",
     ".loom/README.md",
     ".loom/docs/daemon-reference.md",
-    ".loom/docs/eta.md",
     ".loom/docs/observability.md",
     ".loom/docs/telemetry-schema.md",
     ".loom/docs/tracing.md",
@@ -109,7 +108,18 @@
     ".loom/scripts/tests/test-spawn-claude.sh",
     ".loom/scripts/tests/test-spawn-codex-session-exec.sh",
     ".loom/scripts/tests/test-worktree-nested-symlinks.sh",
-    ".loom/scripts/worktree.sh"
+    ".loom/scripts/worktree.sh",
+    ".loom/docs/priority-model.md",
+    ".claude/commands/loom/champion-critical-file-hold.md",
+    ".claude/commands/loom/champion-pr-merge.md",
+    ".claude/commands/loom/help.md",
+    ".loom/docs/label-state-machine.md",
+    ".loom/docs/lease-record.md",
+    ".loom/docs/rollout-check.md",
+    ".loom/docs/telemetry-kind-pick-decision.md",
+    ".loom/scripts/dep-recheck-fingerprint.sh",
+    ".loom/scripts/tests/ci-wired.txt",
+    ".loom/scripts/tests/test-sweep-lease-renew-lifecycle.sh"
   ],
   "last_resync": "2026-10-10",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
