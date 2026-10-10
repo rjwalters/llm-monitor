@@ -30,6 +30,7 @@ RELEASE_TAG=""
 BINARY_PATH=""
 PREFIX="$HOME/.local"
 ACCOUNTS_ENV_PATH=""
+TRAY=false
 
 log()  { printf '\033[0;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -38,7 +39,8 @@ fail() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 Usage: install-linux.sh (--from-release [TAG] | --from-source | --binary PATH)
-                         [--prefix PATH] [--accounts-env PATH]
+                         [--prefix PATH] [--accounts-env PATH] [--tray]
+       install-linux.sh --tray [--prefix PATH]
 
 Install or upgrade the llm-monitor headless daemon on this Linux host:
 acquires a binary, refuses one that is dynamically linked, installs it,
@@ -67,6 +69,11 @@ Options:
                           README "Multiple Accounts"). Without this flag, an
                           empty 0600 placeholder is created if one doesn't
                           already exist.
+  --tray                  Also install the desktop top-bar indicator
+                          (linux-tray/llm-monitor-tray.py) and an XDG
+                          autostart entry. It reads ranking.json written by
+                          the daemon. Alone (no binary source), installs
+                          only the indicator next to an existing daemon.
   -h, --help               Show this help and exit.
 
 Examples:
@@ -74,6 +81,7 @@ Examples:
   install-linux.sh --from-source
   install-linux.sh --binary ./LLMMonitor --prefix /usr/local
   install-linux.sh --from-release v2.1.0 --accounts-env ~/accounts.env
+  install-linux.sh --from-release --tray
 EOF
 }
 
@@ -110,6 +118,10 @@ while [[ $# -gt 0 ]]; do
             ACCOUNTS_ENV_PATH="$2"
             shift 2
             ;;
+        --tray)
+            TRAY=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -120,13 +132,77 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$MODE" ]] || { usage >&2; fail "One of --from-release, --from-source, or --binary is required."; }
+[[ -n "$MODE" || "$TRAY" == true ]] || { usage >&2; fail "One of --from-release, --from-source, or --binary is required."; }
 
 # Expand a leading ~ in --prefix (the shell only does this without quotes).
 PREFIX="${PREFIX/#\~/$HOME}"
 INSTALL_DIR="$PREFIX/bin"
 INSTALL_BIN="$INSTALL_DIR/llm-monitor"
 LEGACY_BIN="$INSTALL_DIR/$LEGACY_BIN_NAME"
+
+# --- Desktop tray indicator (--tray, #246) ----------------------------------
+# A Python AppIndicator client over ranking.json; it holds no credentials and
+# never polls, so it needs no unit — XDG autostart runs it in the session.
+TRAY_SRC="$REPO_ROOT/linux-tray/llm-monitor-tray.py"
+TRAY_BIN="$INSTALL_DIR/llm-monitor-tray"
+AUTOSTART="$HOME/.config/autostart/llm-monitor-tray.desktop"
+
+install_tray() {
+    [[ -f "$TRAY_SRC" ]] || fail "Tray script not found at $TRAY_SRC."
+    "$TRAY_SRC" --selftest >/dev/null || fail "Tray selftest failed: run '$TRAY_SRC --selftest'."
+    if [[ -f "$TRAY_BIN" ]] && cmp -s "$TRAY_SRC" "$TRAY_BIN"; then
+        log "Tray indicator already up to date at $TRAY_BIN."
+    else
+        if [[ -w "$INSTALL_DIR" ]] || { [[ ! -e "$INSTALL_DIR" ]] && [[ -w "$(dirname "$INSTALL_DIR")" ]]; }; then
+            mkdir -p "$INSTALL_DIR" && install -m 755 "$TRAY_SRC" "$TRAY_BIN"
+        else
+            sudo mkdir -p "$INSTALL_DIR" && sudo install -m 755 "$TRAY_SRC" "$TRAY_BIN"
+        fi
+        log "Installed tray indicator at $TRAY_BIN"
+    fi
+
+    mkdir -p "$(dirname "$AUTOSTART")"
+    local rendered
+    rendered="$(cat <<EOF
+[Desktop Entry]
+Type=Application
+Name=LLM Monitor
+Comment=LLM subscription usage in the top bar
+Exec=$TRAY_BIN
+Icon=utilities-system-monitor
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+EOF
+)"
+    if [[ -f "$AUTOSTART" ]] && [[ "$(cat "$AUTOSTART")" == "$rendered" ]]; then
+        log "Autostart entry already up to date at $AUTOSTART."
+    else
+        printf '%s\n' "$rendered" > "$AUTOSTART"
+        log "Installed autostart entry at $AUTOSTART (starts at login)."
+    fi
+
+    if ! python3 -c "import gi; gi.require_version('AyatanaAppIndicator3', '0.1')" 2>/dev/null \
+        && ! python3 -c "import gi; gi.require_version('AppIndicator3', '0.1')" 2>/dev/null; then
+        warn "The tray needs the AppIndicator GObject bindings. Install them with:"
+        warn "  sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1"
+        warn "On GNOME the 'Ubuntu AppIndicators' extension must be enabled (it is by default on Ubuntu)."
+        return 0
+    fi
+
+    if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        log "No graphical session here — the tray starts at your next desktop login."
+    else
+        # The tray holds a single-instance lock, so this is a no-op when one
+        # is already running (restart it to pick up an upgrade).
+        nohup "$TRAY_BIN" >/dev/null 2>&1 &
+        log "Started the tray indicator (if it was not already running)."
+    fi
+}
+
+if [[ -z "$MODE" ]]; then
+    install_tray
+    exit 0
+fi
 
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -392,3 +468,8 @@ log "Running selftest..."
 echo
 echo "== systemctl --user status $UNIT_NAME (head) =="
 systemctl --user status "$UNIT_NAME" --no-pager 2>&1 | head -n 10 || true
+
+if [[ "$TRAY" == true ]]; then
+    echo
+    install_tray
+fi

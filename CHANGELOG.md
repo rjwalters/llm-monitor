@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Linux desktop tray** (#246). `linux-tray/llm-monitor-tray.py` is an
+  AppIndicator client that shows the usage % in the Ubuntu top bar (or any
+  StatusNotifierItem desktop), with a per-account dropdown covering Claude,
+  Codex and z.ai. It reads only `ranking.json`, holds no credentials and never
+  polls. `install-linux.sh --tray` installs it with an XDG autostart entry,
+  either alongside the daemon or on its own.
+
 ### Changed
 
 - **The UI no longer assumes Claude** (#225). The popover is titled "LLM
