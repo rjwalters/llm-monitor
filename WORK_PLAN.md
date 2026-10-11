@@ -44,6 +44,7 @@ _None._
 Issues carrying `loom:curated`.
 
 - **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)*
+- **#246**: Linux: top-bar tray indicator (AppIndicator) reading ranking.json *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,7 +64,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 1 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
