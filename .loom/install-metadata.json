@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1071",
-  "loom_commit": "dcab8265613676d08b763cddc911b93c7ab7d9d4",
+  "loom_version": "0.19.1072",
+  "loom_commit": "9bf6aabe632be4a126c74cb22875e12e62cd49da",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
