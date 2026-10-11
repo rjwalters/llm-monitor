@@ -1201,16 +1201,17 @@ class OAuthPoller: ObservableObject {
         )) as? String
     }
 
-    /// Register every `coding-plan-<label>.env` key in the z.ai key directory
-    /// (`ZaiKeyFile.defaultDirectory`, i.e. the chezmoi-managed `~/.zai`).
-    /// Runs on every launch alongside `syncFromAccountFiles`, so a rotated key
-    /// is picked up without a manual re-import; an unchanged key is a no-op
-    /// with no network call. Add-only: a key file that disappears never
-    /// deletes its account.
+    /// Register every z.ai key in the key directories
+    /// (`ZaiKeyFile.directories()`: the chezmoi-managed `~/.zai`, then Loom's
+    /// shared pool `~/.loom/api-keys/zai`, #249). Runs on every launch
+    /// alongside `syncFromAccountFiles`, so a rotated key is picked up without
+    /// a manual re-import; an unchanged key is a no-op with no network call.
+    /// Read-only and add-only: a key file that disappears (or is disabled
+    /// later) never deletes its account.
     @discardableResult
-    func syncZaiKeyFiles(directory: String = ZaiKeyFile.defaultDirectory) async -> [EnvImportResult] {
+    func syncZaiKeyFiles(directories: [String] = ZaiKeyFile.directories()) async -> [EnvImportResult] {
         var results: [EnvImportResult] = []
-        for file in ZaiKeyFile.scan(directory: directory) {
+        for file in ZaiKeyFile.scan(directories: directories) {
             if storedZaiKey(accountId: file.accountId) == file.apiKey { continue }
             let (_, error) = await addZaiAccount(apiKey: file.apiKey, email: file.email, label: file.label)
             if let error = error {
@@ -1594,8 +1595,9 @@ class OAuthPoller: ObservableObject {
         apply(masterAccountsPath, label: "master")
         apply(localAccountsPath, label: "local")
 
-        // z.ai keys live in their own chezmoi-managed directory rather than in
-        // the account list files; sync them on the same launch cadence.
+        // z.ai keys live in their own directories (chezmoi's ~/.zai, Loom's
+        // shared api-keys pool) rather than in the account list files; sync
+        // them on the same launch cadence.
         let zaiResults = await syncZaiKeyFiles()
         // Likewise Loom's Codex profiles, which need no network at all.
         syncCodexProfiles()
