@@ -254,7 +254,6 @@ def run_indicator():
         AppIndicator.IndicatorCategory.APPLICATION_STATUS,
     )
     ind.set_icon_theme_path(icon_dir)
-    ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
     ind.set_title("LLM Monitor")
 
     def open_url(_item, url):
@@ -304,6 +303,24 @@ def run_indicator():
 
     monitor.connect("changed", on_change)
     refresh()
+    ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+    # GNOME's ubuntu-appindicators extension ignores the label an item
+    # registers with and draws it only after a later label change (checked on
+    # Ubuntu 24.04: a change 4 s after start shows; one inside the first
+    # second, or a clear-and-set in the same main-loop turn, does not). So
+    # once the item has settled, clear the label and set it again in
+    # separate turns.
+    def clear_label():
+        ind.set_label("", "100%")
+        return False
+
+    def restore_label():
+        refresh()
+        return False
+
+    GLib.timeout_add(3000, clear_label)
+    GLib.timeout_add(3500, restore_label)
     GLib.timeout_add_seconds(REFRESH_SECONDS, refresh)
     Gtk.main()
 
