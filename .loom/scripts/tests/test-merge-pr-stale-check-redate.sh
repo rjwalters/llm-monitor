@@ -309,7 +309,7 @@ unset REDATE_STALE_CHECKS
 # T11: the flag is accepted by the argument parser and advertised in --help.
 HELP_OUT="$(bash "$MERGE_PR_SRC" --help 2>&1)"
 assert_contains "$HELP_OUT" "--redate-stale-checks" "--help advertises the flag"
-assert_contains "$HELP_OUT" "4 = stale required checks re-running in place" "--help documents exit 4"
+assert_contains "$HELP_OUT" "4 = stale required checks re-dated by a no-op push" "--help documents exit 4"
 assert_contains "$(grep -c -- '--redate-stale-checks) REDATE_STALE_CHECKS=true' "$MERGE_PR_SRC")" "1" \
     "the argument parser has exactly one arm for the flag"
 

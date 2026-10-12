@@ -110,17 +110,12 @@ guard consults.
 act" but "a human wants this landed ASAP, act now". It is the one "land this
 ASAP" signal; the older urgent label was retired (#9244) and deleted (#11105).
 
-- **Operator-derived only (#10012).** No role stars on its own judgment. The
-  daemon relays a loom-ui star intent; Builder copies it onto the PR it opens;
-  `create-issue.sh --parent N` stars a new child of a starred N (audit comment
-  `inherited_from=#N`), and, when `autonomous.operatorPriority.materializeLabels`
-  is on (the default), the star-liveness pass writes it on every open
-  child a starred issue's text links, removing it once that root loses its
-  star (never an operator's own star, never because the root closed).
-  Never propagated: holds, claim/lifecycle labels, `points:*`.
-  Only the star, `external` and (as a default) `tier:*` travel to children;
-  the table is each label's registry `propagate` field; full never-list:
-  `daemon-reference.md` → "What travels to children".
+- **Operator-derived only (#10012).** No role stars on its own judgment.
+  Builder copies it onto the PR it opens. Nothing propagates it any more: the
+  star-liveness pass that relayed loom-ui star intents and wrote inherited
+  stars on children was removed (#11104), and `create-issue.sh --parent N` no
+  longer stars a child of a starred N. The registry's `propagate` field was
+  removed (#11510).
 - **Starred first, every stage.** Curator curates starred issues first (a
   starred issue with no workflow label counts as `loom:triage`) and promotes
   them straight to `loom:issue`, because the star is the Tier-3 approval. A
@@ -133,12 +128,11 @@ ASAP" signal; the older urgent label was retired (#9244) and deleted (#11105).
 - **Levels (#10307).** Operator priority has levels, mapped in one table
   (`loom-daemon/src/operator_levels.rs`): level 1 is the star; level 2 is
   `loom:operator-high-priority` (human-only, like the star; capped at 5 open
-  issues fleet-wide by loom-ui, over-cap reported in the star-liveness digest,
-  never refused). Levels nest: level ≥ 2 counts as starred everywhere, and
-  every starred-first pass drains by effective level, highest first. An open
-  blocker of a level-2 issue carries the daemon-written
-  `loom:high-priority-inherited` and is treated exactly like level 2; no role
-  applies or removes it.
+  issues fleet-wide by loom-ui, never refused). Levels nest: level ≥ 2 counts
+  as starred everywhere, and every starred-first pass drains by effective
+  level, highest first. `loom:high-priority-inherited` was written by the
+  star-liveness pass on an open blocker of a level-2 issue; that pass is gone
+  (#11104), so nothing writes or removes it any more.
 - **Red-main fixes** are a body marker, not a label: an issue that fixes a red
   `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
   pre-existing failure confirmed on `origin/main`). Curator takes these next,
@@ -1023,9 +1017,11 @@ registry.
 Every daemon table named by a boolean property above is derived from the
 registry; dep_classify's operator-only names stay consts, lockstep-tested
 against `requires_base`/`remove_with` (#5671). Changes go in the registry.
-`propagate` holds #10012's propagation table (`null` = never propagates);
-`star_liveness::propagation_rules` derives its rules from it.
-`stale_after_minutes` and `lifecycle` are inert.
+The `propagate` table (#10012) was removed (#11510) after #11104 removed
+the star-liveness pass that read it. `stale_after_minutes` and `lifecycle`
+are inert; `lifecycle: retired` marks a label the daemon no longer reads
+(the operator-star levels and `tier:*`, #11103), kept until its forge
+migration.
 
 ## No-op hold (#10156)
 
