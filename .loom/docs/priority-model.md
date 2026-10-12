@@ -27,8 +27,8 @@ per tick, and the seed plus every draw are exported as
 `pick.decision.workspace_draw` (and the published plan's `position` is the
 draw order). The single-workspace tick uses the in-workspace order alone.
 Since #11508 the level comes only from the two labels: there is no legacy
-bridge, so `loom:operator-priority` / `loom:operator-high-priority` carry no
-dispatch weight until they are migrated (table below).
+bridge, so the retired star labels carry no dispatch weight until they are
+migrated (table below).
 
 **Priority changes order, never eligibility or admission** (operator ruling,
 #11508). A priority issue is dispatched only once it is `loom:issue` (there is
@@ -113,8 +113,12 @@ operator ruling on #11278).
 | `loom:high-priority-inherited` | retired, no mapping (it was daemon-derived) |
 | `tier:goal-advancing` / `tier:goal-supporting` / `tier:maintenance` | retired, **no automatic mapping**; Guide applies `loom:important` where warranted |
 
-Label definitions live in `defaults/labels.json` (`loom-daemon labels generate
---write` regenerates both `labels.yml` copies). Relabeling live issues is a
-forge mutation done by an operator with `./.loom/scripts/sync-labels.sh` after
-the daemon stops reading the old labels; it is deliberately not part of the
-code change.
+This table is data: the top-level `retired` array of `defaults/labels.json`
+(#11513), one `{name, replaced_by, owned, retired_in}` entry per old label
+(`replaced_by: null` = remove, no replacement). It also lists the #11105
+retirements (`loom:urgent`, `loom:heavy`, `loom:operator-objective`). It is
+never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
+re-create a retired label. `owned: false` (`priority:high`, never declared by
+Loom) means the migration adds the replacement but never removes or deletes
+the old label. Relabeling live issues is the forge-side migration (#11511),
+which reads this array; the registry change itself mutates no forge.
