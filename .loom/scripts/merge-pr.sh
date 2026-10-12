@@ -890,11 +890,26 @@ _check_loom_pr_label
 # requires-daemon: notify-cleared-blockers optional   #9102 — the post-merge close-triggered loom:blocked re-check; a daemon lacking the verb exits non-zero, `_notify_cleared_blockers` prints one warning and the merge proceeds. A delayed notice, never a failed merge: the next sweep's `check-stale-blocked` pre-wave pass reports the same stale block.
 # requires-daemon: record-rework optional   #9444 — the two in-sweep rework markers this script emits (a `rebase` when it syncs a base that moved, a `merge_conflict` when it refuses a PR that genuinely conflicts). Both calls are `>/dev/null 2>&1 || true`: a daemon lacking the verb records nothing and the merge is byte-for-byte unaffected. Pure telemetry — the cost of a missing marker is one under-reported environmental rework in `sweep.outcome`'s `rework_events`, never a merge that did or did not happen.
 #
-# _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
-# remediation for "your loom-daemon is too old for <subcommand>": the declared
-# floor, what the resolved binary actually reports, the artifact-first roll
-# command for THIS host, and the two fallbacks when no artifact carries the
-# floor yet. Written as a one-liner because merge-pr.sh is frozen by the
+# Per-verb landing versions for FAIL-OPEN verbs (#9377, via #11167). MESSAGE
+# TEXT ONLY, never gating: check-daemon-subcommand-versions.sh does not read
+# this prefix, and nothing refuses on it. A fail-open verb deliberately does not
+# raise the family `requires-daemon:` floor above, so without these the hint
+# for its failure quoted that (unrelated, fail-closed) floor — which a host can
+# already exceed while still lacking the verb (rjwalters/repo#494: told to roll
+# to 0.19.172 while running 0.19.461, which predated issue-close-gate). Each
+# version is `git show <landing commit>:VERSION` + 1. An unannotated verb falls
+# back to the family floor, which is exactly the pre-#9377 message.
+# daemon-verb-hint: merge-pr issue-close-gate >= 0.19.462   f4517bb46 (#9240), first released in v0.19.462
+# daemon-verb-hint: merge-pr-refs loom-issue-trailer-warnings >= 0.19.512   d8fafb19a (merge of #9501, #9465), first released in v0.19.512
+#
+# _mp_daemon_roll_hint <subcommand> [resolved-bin] [verb] -- the concrete,
+# host-local remediation for "your loom-daemon is too old for <subcommand>":
+# the declared floor, what the resolved binary actually reports, the
+# artifact-first roll command for THIS host, and the two fallbacks when no
+# artifact carries the floor yet. [verb] is the sub-subcommand that actually
+# failed: when it has a `daemon-verb-hint:` above, the message names
+# '<subcommand> <verb>' and that verb's own version; otherwise the family
+# floor. Written as a one-liner because merge-pr.sh is frozen by the
 # file-size ratchet (scripts/check-file-size-budget.sh) and may not grow.
 #
 # Both reads carry `|| true` deliberately. merge-pr.sh runs under `set -euo
@@ -905,7 +920,7 @@ _check_loom_pr_label
 # best-effort diagnostic must never be able to degrade the message it is
 # decorating. (The `if` over a `[[ … ]] && { … }` is for the same reason stated
 # defensively; bash exempts AND-lists from `set -e`, so that one is style.)
-_mp_daemon_roll_hint() { local sub="${1:-}" bin="${2:-}" min="" have=""; min="$(sed -n "/^# requires-daemon: ${sub} >= /{s|^# requires-daemon: ${sub} >= \\([0-9][0-9.]*\\).*|\\1|p;q;}" "${BASH_SOURCE[0]}" 2>/dev/null || true)"; if [[ -n "$bin" && -x "$bin" ]]; then have="$("$bin" --version 2>/dev/null || true)"; have="${have%%$'\n'*}"; fi; printf "REMEDIATION: this script requires loom-daemon >= %s for '%s'%s. Roll THIS host, artifact-first: %s/cli/loom-daemon-update.sh --fetch — it resolves the newest published release >= the installed version, verifies its checksum (and signature when present), provisions it and restarts the daemon under its supervisor; then re-run this merge. If no release artifact carries %s yet (releases are cut at fleet-rollable boundaries, not on every VERSION bump — see .loom/docs/release-cadence.md), either build it yourself — cargo build --release -p loom-daemon — and export LOOM_DAEMON_BIN=<repo>/target/release/loom-daemon, or pin LOOM_DAEMON_BIN to an existing build that already has '%s'. Confirm before re-running: %s --version && %s %s --help" "${min:-<undeclared>}" "$sub" "${have:+ (the resolved binary reports: $have)}" "${SCRIPT_DIR:-.loom/scripts}" "${min:-that version}" "$sub" "${bin:-loom-daemon}" "${bin:-loom-daemon}" "$sub"; }
+_mp_daemon_roll_hint() { local sub="${1:-}" bin="${2:-}" verb="${3:-}" min="" have=""; [[ -z "$verb" ]] || min="$(sed -n "/^# daemon-verb-hint: ${sub} ${verb} >= /{s|^# daemon-verb-hint: ${sub} ${verb} >= \\([0-9][0-9.]*\\).*|\\1|p;q;}" "${BASH_SOURCE[0]}" 2>/dev/null || true)"; if [[ -n "$min" ]]; then sub="$sub $verb"; else min="$(sed -n "/^# requires-daemon: ${sub} >= /{s|^# requires-daemon: ${sub} >= \\([0-9][0-9.]*\\).*|\\1|p;q;}" "${BASH_SOURCE[0]}" 2>/dev/null || true)"; fi; if [[ -n "$bin" && -x "$bin" ]]; then have="$("$bin" --version 2>/dev/null || true)"; have="${have%%$'\n'*}"; fi; printf "REMEDIATION: this script requires loom-daemon >= %s for '%s'%s. Roll THIS host, artifact-first: %s/cli/loom-daemon-update.sh --fetch — it resolves the newest published release >= the installed version, verifies its checksum (and signature when present), provisions it and restarts the daemon under its supervisor; then re-run this merge. If no release artifact carries %s yet (releases are cut at fleet-rollable boundaries, not on every VERSION bump — see .loom/docs/release-cadence.md), either build it yourself — cargo build --release -p loom-daemon — and export LOOM_DAEMON_BIN=<repo>/target/release/loom-daemon, or pin LOOM_DAEMON_BIN to an existing build that already has '%s'. Confirm before re-running: %s --version && %s %s --help" "${min:-<undeclared>}" "$sub" "${have:+ (the resolved binary reports: $have)}" "${SCRIPT_DIR:-.loom/scripts}" "${min:-that version}" "$sub" "${bin:-loom-daemon}" "${bin:-loom-daemon}" "$sub"; }
 _check_verdict_label_contradiction() { local msg rc=0; msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr verdict-contradiction --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-VERDICT-CLEAN" ]] && return 0; [[ $rc -eq 1 && "$msg" == "Merge blocked:"* ]] || msg="Merge blocked: PR #$PR_NUMBER's verdict-label contradiction guard (#8112) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr verdict-contradiction' exited $rc without the LOOM-VERDICT-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'found nothing' from 'never ran', so only a positive clean signal is accepted. $(_mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; error "$msg"; }
 _check_verdict_label_contradiction
 
@@ -1195,7 +1210,7 @@ _check_partial_increment_close_conflict() {
 
   # bt_warn/bt_rc are declared here, not next to their own assignment below,
   # purely so that assignment can own a line: see the SC2046 note below.
-  local partial_refs bt_warn bt_rc=0
+  local partial_refs bt_warn bt_rc=0 lt_warn lt_rc=0
   partial_refs="$(_partial_increment_refs "$pr_body")"
 
   # Backticked-trailer warning (#5690, ported to Rust #8831 —
@@ -1226,8 +1241,17 @@ _check_partial_increment_close_conflict() {
   # merge proceeds anyway (the `local var=$(...)` exit-status swallow that made
   # this call fail-open in practice all along). This call stays advisory-only:
   # a mode failure is reported as a skipped check, never as a refusal.
+  #
+  # #9502 (via #11167): the `Loom-Issue: owner/repo#N` trailer's own detector
+  # (`loom-issue-trailer-warnings`, #9465 — backticked or slug-less trailers)
+  # rides the SAME line, after the #5690 call, with the identical posture: a
+  # bare assignment + `|| lt_rc=$?`, a warning naming a too-old daemon (and
+  # that verb's own landing version, via its `daemon-verb-hint:`) on a
+  # non-zero exit, never a refusal. Before the early return for the same
+  # reason: a PR declaring only a Loom-Issue link has no partial refs at all.
+  # The `{ …; }` group exists only so the SC2046 disable covers both calls.
   # shellcheck disable=SC2046
-  bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run) 2>/dev/null)" || bt_rc=$?; if [[ $bt_rc -eq 0 ]]; then [[ -z "$bt_warn" ]] || warning "$bt_warn"; else warning "Skipped backticked-trailer advisory warning check: loom-daemon rejected 'merge-pr-refs backticks-partial-increment-warnings' (exit $bt_rc) -- most likely a daemon predating this mode. Not refusing; this check is advisory-only."; fi; [[ -n "$partial_refs" ]] || return 0
+  { bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run) 2>/dev/null)" || bt_rc=$?; if [[ $bt_rc -eq 0 ]]; then [[ -z "$bt_warn" ]] || warning "$bt_warn"; else warning "Skipped backticked-trailer advisory warning check: loom-daemon rejected 'merge-pr-refs backticks-partial-increment-warnings' (exit $bt_rc) -- most likely a daemon predating this mode. Not refusing; this check is advisory-only."; fi; lt_warn="$(printf '%s\n' "$pr_body" | _mp_refs loom-issue-trailer-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run) 2>/dev/null)" || lt_rc=$?; if [[ $lt_rc -eq 0 ]]; then [[ -z "$lt_warn" ]] || warning "$lt_warn"; else warning "Skipped Loom-Issue trailer advisory warning check (#9465): loom-daemon rejected 'merge-pr-refs loom-issue-trailer-warnings' (exit $lt_rc) -- most likely a daemon predating this mode. Not refusing; this check is advisory-only. $(_mp_daemon_roll_hint merge-pr-refs "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)" loom-issue-trailer-warnings)"; fi; }; [[ -n "$partial_refs" ]] || return 0
 
   # Which declared issues are open now, and which a closing reference will
   # close anyway (#4569), from three unioned signals: the body's own closing
@@ -2923,7 +2947,7 @@ _issue_is_closed_for_cleanup() {
   [[ $rc -eq 3 && "$out" == "LOOM-ISSUE-CLEANUP NEED-STATE" ]] && { state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH" 2>/dev/null || true)"; rc=0; out="$(printf '%s\n' "$close_targets" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr issue-close-gate --issue "$issue_number" --state "$state" 2>/dev/null)" || rc=$?; }
   [[ $rc -eq 0 ]] && return 0
   [[ $rc -eq 1 ]] && return 1
-  warning "The async-close-race cleanup gate for issue #$issue_number (#4186) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr issue-close-gate' exited $rc rather than 0/1 (a loom-daemon predating #8191's slice has no such verb). Preserving the worktree rather than guessing (fail-unsafe-to-preserve) — if #$issue_number is actually closed, a future check will clean it up, or remove it by hand once confirmed. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+  warning "The async-close-race cleanup gate for issue #$issue_number (#4186) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr issue-close-gate' exited $rc rather than 0/1 (a loom-daemon predating #8191's slice has no such verb). Preserving the worktree rather than guessing (fail-unsafe-to-preserve) — if #$issue_number is actually closed, a future check will clean it up, or remove it by hand once confirmed. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)" issue-close-gate)"
   return 1
 }
 
