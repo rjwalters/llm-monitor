@@ -213,7 +213,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
-| [`operator.presence`](#operatorpresence) | local journal only until #11525 | `loom-daemon presence beat` (opt-in operator hook) |
+| [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | `observability/fleet_state/outcomes.rs` (diff of two `fleet.state` views) |
@@ -3324,11 +3324,17 @@ Whether a person is at the keyboard of an operator session (Issue #11563).
 ETA could not tell operator-driven work that stalls (the operator stepped away)
 from work that is merely slow, and in-session `/loom:sweep` runs on
 workstations with no daemon emitted nothing. Envelopes carry
-`schema_version: 12`. **Not exported yet** (`otlp: NotExported`; `native: true` only because
-the registry requires a carrier, as for `queue.snapshot`): it goes to a local journal until the transport of #11525 exists, then
-the registry row flips to `otlp: Logs` with a mapping sibling. The
-`loom.presence.*` attribute names (`session_id`, `operator`, `last_input_at`,
-`last_activity_at`, `driving_count`) are reserved for that mapping.
+`schema_version: 12`. **Carried over OTLP** (`otlp: Logs`, `native: false`) now
+that #11525 settled the transport direction (direct OTLP, the same path as every
+other fact). `observability/otlp/mapping/operator_presence.rs` maps the
+`loom.presence.*` scalars (`session_id`, `operator`, `last_input_at`,
+`last_activity_at`, `driving_count`) as attributes and carries the record's JSON
+(including `driving[]`) as the body; `host` rides on the Resource as `host.id`.
+The local journal stays the durable buffer (see **Transport and journal**
+below): `presence export` maps each pending envelope through this sibling once a
+`Transport` is wired, so a beat taken while the transport is unreachable is
+never lost. Wiring that sender into `presence export` on each daemonless host is
+#11525's remaining host-provisioning follow-up.
 
 **No prompt or transcript content, by construction.** The record has no text
 field beyond ids and a forge login, and the producer reads only `session_id`
