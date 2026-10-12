@@ -1047,6 +1047,31 @@ assert_not_contains "$no_comment_log" "issue comment 123" \
 assert_contains "$no_comment_err" "was NOT posted" \
   "#8191: the skipped audit comment is reported, not swallowed"
 
+# T31b (#9264): a daemon answering `SWAP<TAB>loom:operator` (a held remainder)
+# makes the swap add loom:operator and NOT loom:issue.
+reset_log
+fake_held="$STUB_DIR/fake-loom-daemon-held"
+cat > "$fake_held" <<'FAKEDAEMON'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "merge-pr" && "${2:-}" == "partial-reset" ]]; then
+  printf 'INFO\theld\nSWAP\tloom:operator\n'
+  exit 0
+fi
+exec "$LOOM_TEST_REAL_DAEMON" "$@"
+FAKEDAEMON
+chmod +x "$fake_held"
+export LOOM_DAEMON_BIN="$fake_held"
+PARTIAL_OPEN_BEFORE_MERGE=""
+PARTIAL_CONFLICT_ISSUES=""
+PR_JSON='{"body":"Part of #123"}'
+_reset_partial_increment_labels 2>/dev/null
+held_log="$(read_log)"
+export LOOM_DAEMON_BIN="$saved_bin"
+assert_contains "$held_log" "issue edit 123 --repo owner/repo --remove-label loom:building --add-label loom:operator" \
+  "#9264: a held SWAP target adds loom:operator"
+assert_not_contains "$held_log" "--add-label loom:issue" \
+  "#9264: ...and does not return the issue to the ready queue"
+
 # T32 (#8191): on the happy path the posted body is the one the daemon
 # rendered, in both arms of its single conditional -- the plain swap, and the
 # swap that follows a #4569 reopen.
@@ -1106,9 +1131,9 @@ retired "merge-pr.sh's source contains the (Part of|Contributes to) alternation"
 # reopen ...` literals, which no longer appear in merge-pr.sh. The intent is
 # unchanged: fail loudly if a refactor drops the loom:building -> loom:issue
 # swap, the premature-auto-close revert, or the REPO_NWO scoping.
-assert_contains "$src" 'forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue"' \
+assert_contains "$src" 'forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "${text:-loom:issue}"' \
   "merge-pr.sh swaps loom:building -> loom:issue via the rate-limit-safe wrapper (#4856)"
-assert_contains "$src" '"loom:building" "loom:issue"' \
+assert_contains "$src" '"loom:building" "${text:-loom:issue}"' \
   "merge-pr.sh restores loom:issue as the swap's add-label argument"
 assert_contains "$src" "--repo \"\$REPO_NWO\"" \
   "merge-pr.sh scopes the partial-increment mutations to REPO_NWO"
