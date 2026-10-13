@@ -110,7 +110,7 @@ missing=""
 while IFS= read -r label; do
     [[ -z "$label" ]] && continue
     [[ "$json_out" == *"\"$label\""* ]] || missing+=" json:$label"
-    [[ "$jqnot_out" == *"contains([\"$label\"])"* ]] || missing+=" jq-not:$label"
+    [[ "$jqnot_out" == *"== \"$label\")"* ]] || missing+=" jq-not:$label"
     [[ "$search_out" == *"-label:\"$label\""* ]] || missing+=" search:$label"
 done <<< "$lines_out"
 

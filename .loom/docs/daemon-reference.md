@@ -26,7 +26,7 @@
 - [Token pool provisioning for managed repos (#3938)](#token-pool-provisioning-for-managed-repos-3938)
 - [Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)](#per-repo-status-breakdown--per-repo-main-health-gate-3930--phase-d)
 - [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verified_red-vs-unevaluated-3974)
-- [Per-workspace priority tiers (#3946)](#per-workspace-priority-tiers-3946)
+- [Per-workspace draw weights (#3946, #11742)](#per-workspace-draw-weights-3946-11742)
 - [Forge-side pipeline snapshot (`status --pipeline`, #3977)](#forge-side-pipeline-snapshot-status---pipeline-3977)
 - [Section-scoped status (`status --json --section`, #10787)](#section-scoped-status-status---json---section-10787)
 - [One-shot fleet vitals (`loom-daemon health`, #4761)](#one-shot-fleet-vitals-loom-daemon-health-4761)
@@ -792,7 +792,7 @@ deregister — an accepted consequence of an explicit operator `workspace remove
 On a host with several registered workspaces, the daemon is host-global
 (one binary, one socket, one `~/.loom/workspaces.json`), but every
 consumer repo still carries the full daemon-*administration* CLI surface
-— `workspace add/set-priority/remove` and `tokens bootstrap` all happily
+— `workspace add/set-weight/remove` and `tokens bootstrap` all happily
 mutate that host-global state from whatever repo they run in. A repo can
 opt out of that by declaring, in its own effective config (any tier
 resolved by `config_resolver::resolve_effective_config`):
@@ -809,7 +809,7 @@ before.
 **What is gated** (refuses with a message naming the delegate repo on
 stderr, non-zero exit):
 
-- `loom-daemon workspace add|set-priority|remove` — gated on the
+- `loom-daemon workspace add|set-weight|remove` — gated on the
   **invoking** repo (resolved from cwd, `repo_root::resolve_repo_root(".")`
   — the same resolution `calibrate`/`tokens select` already use).
 - `loom-daemon tokens bootstrap --workspace <path>` — gated on the
@@ -963,7 +963,7 @@ the plan/ordering/checklist; the per-phase shell is rendered in
    subsets).
 6. **workspace-clone** — `gh repo clone` each `--repo` + `loom-daemon init`
    (installs the `/loom:sweep` command, #4027).
-7. **workspace-register** — `loom-daemon workspace add` each repo at `--priority`.
+7. **workspace-register** — `loom-daemon workspace add` each repo at `--weight`.
 8. **daemon-unit** — a systemd `--user` unit (`Restart=always` minus the
    stay-down exit codes, `OOMPolicy=continue`,
    `Environment=LOOM_DAEMON_SUPERVISOR=systemd`, `loginctl enable-linger`) —
@@ -1456,15 +1456,15 @@ repos:
     dir: app              # clone directory under root (default: name); one path component
     remote: git@github.com:acme/app.git
     fleet: true           # the daemon manages it (default false); or `maintain`, below
-    fleet_priority: 10    # dispatch tier, lower first (default 100)
+    weight: 10            # share of repo draws, higher = more; required when fleet (0 = never)
     firewall: false       # true = never an unattended-agent target (default false)
 ```
 
 The desired workspace set is every record with `fleet: true` or
 `fleet: maintain`, and not `firewall: true`. A record with **both** is a hard
 error for the whole roster, never a silent exclusion — so is a `fleet` other
-than `true`/`false`/`maintain`, a non-boolean `firewall`, a non-integer
-`fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+than `true`/`false`/`maintain`, a non-boolean `firewall`, a `fleet` record
+with no `weight` or a non-integer one (#11742; `fleet_priority` is ignored), a duplicate `name` or `dir`, or an unsafe `dir`.
 
 **`fleet: maintain`** (#11186) makes a repo **maintain-only**: it is
 registered and kept current exactly like `fleet: true` (the per-repo Loom
@@ -1659,7 +1659,7 @@ alone. Paths are compared after the registry's own normalization.
 
 `--check` exits `1` when the registry differs. `--apply` performs the changes
 through the same code paths as `loom-daemon workspace remove` / `hold` /
-`release` / `add` / `set-priority` (removes first, then mode changes; a
+`release` / `add` / `set-weight` (removes first, then mode changes; a
 maintain-only add is registered maintain-only in the same write), and only for
 repos already cloned under
 `root` — a missing clone is reported and exits `1`, and is never cloned here
@@ -1714,8 +1714,8 @@ carries `fleet.yml` alone, and both a warning and the PR body say to run
   required. Creates `hosts:` and/or the host's own entry when either is
   missing; editing the fleet default requires that block to already exist.
   `--by` defaults to this host's identity.
-- **`propose priority <repo> <priority> [--dry-run]`** — sets the named
-  `repos[]` record's `fleet_priority`, inserting the key if the record does
+- **`propose weight <repo> <weight> [--dry-run]`** — sets the named
+  `repos[]` record's `weight` (#11742), inserting the key if the record does
   not have one yet. Every other key on that record, and every other record,
   is untouched.
 - **`propose adopt [--host H] [--dry-run]`** — turns this host's `render
@@ -1792,7 +1792,7 @@ carries the same record under `fleet_store`. Both are read host-locally from
 Admitting a repo is a fleet-store merge and nothing else. A timer pass with
 `fleet.autoApply` on **clones** a desired repo that has no clone under `root`
 yet, then registers it in the same pass, exactly as an existing clone is
-registered (its `fleet_priority`, `fleet: maintain`, `add_and_trust`; nothing
+registered (its `weight`, `fleet: maintain`, `add_and_trust`; nothing
 is written into the working tree). Without `autoApply` the missing clone is
 only reported, as before.
 
@@ -2213,6 +2213,7 @@ a second resync at the same release writes nothing.
 | `.claude/README.md`, `.github/CONFIGURATION.md` | copied, only when the repo already has the file |
 | `.claude/biome.jsonc` | copied, created when absent |
 | `.gitignore` | only the Loom-managed block is merged (as `loom-daemon update-gitignore` does), and only when the file exists. The file is never listed in `installed_files` |
+| `.github/labels.yml` | only the block between `# BEGIN LOOM LABELS` and `# END LOOM LABELS` is replaced from the release (#11033); every byte outside it is kept, so a consumer's own labels above or below survive. With no markers the block is appended; with no file the release's file is written. Malformed markers (a second BEGIN or END, END before BEGIN, a lone or near-miss marker) leave the file untouched, log a warning, and make `resync-payload` and `resync-installed.sh` exit 1. The file is never listed in `installed_files`. Live forge labels are never deleted here: that is `loom-daemon labels migrate --apply` |
 | `.loom/CLAUDE.md`, `.loom/AGENTS.md` | re-rendered from the release's template with the install date the file already carries, so an unchanged template changes nothing. Only when the file exists and has an `**Installation Date**:` line |
 | files in `defaults/.loom-retired.list` | removed when present, whether or not `installed_files` lists them |
 
@@ -2255,7 +2256,8 @@ from an older template is brought up to date.
 | forge labels | The drift check against `.github/labels.yml` is a forge read and a report, not an installed file. Run `sync-labels.sh` |
 
 Also unchanged by a resync: the root `CLAUDE.md` / `AGENTS.md` pointer sections,
-`.github/labels.yml`, `.github/workflows/` and `.claude/agents/`.
+`.github/labels.yml` outside its managed block, `.github/workflows/` and
+`.claude/agents/`.
 
 Rollout: keep running `resync-installed.sh` (or a fleet wrapper around it) until
 a release with these surfaces is the fleet floor.
@@ -3042,25 +3044,26 @@ None of this changes the VERIFIED_RED / UNEVALUATED discriminator (#3974) or
 the forge-CI corroboration (above) — it only decides whether the (expensive)
 command needs to run again at all before those checks ever see it.
 
-## Per-workspace priority tiers (#3946)
+## Per-workspace draw weights (#3946, #11742)
 
 By default the multi-repo work-finder and epic supervisor iterate
 `effective_roots()` in **registration order**, so a deep product-repo backlog can
-starve the tool repos whose fixes compound. Priority tiers add cross-repo dispatch
-ordering (superseded by the weighted draw in [`priority-model.md`](priority-model.md), #11103):
+starve the tool repos whose fixes compound. Each workspace therefore carries a
+**draw weight** (#11742, replacing the #3946 priority tier; the draw itself is
+in [`priority-model.md`](priority-model.md)):
 
-- **Registry schema** — each `~/.loom/workspaces.json` entry gains an optional
-  `priority` integer (`Workspace.priority`, `loom-daemon/src/workspace_registry.rs`):
-  **lower = higher priority**, default `100`
-  (`DEFAULT_WORKSPACE_PRIORITY`). Fully backward compatible — an entry with no
-  `priority` (every pre-#3946 file) deserializes as `100` via `#[serde(default)]`,
-  so an all-default registry orders exactly as before.
+- **Registry schema** — each `~/.loom/workspaces.json` entry has a `weight`
+  integer (`Workspace.weight`, `loom-daemon/src/workspace_registry.rs`):
+  **higher = more draws**, `0` = never drawn, default `1`
+  (`DEFAULT_WORKSPACE_WEIGHT`). An entry without one, including every file
+  written before #11742 (whose `priority` key is now ignored), reads as `1`;
+  on a fleet host the roster sync then sets the store's required `weight`.
 
 - **CLI** —
-  - `loom-daemon workspace add <path> --priority N` registers a repo in tier `N`
-    (default `100`).
-  - `loom-daemon workspace set-priority <path> N` retiers an already-registered
-    repo.
+  - `loom-daemon workspace add <path> --weight N` registers a repo at weight
+    `N` (default `1`).
+  - `loom-daemon workspace set-weight <path> N` changes an already-registered
+    repo's weight.
   - `loom-daemon workspace hold <path>` makes an already-registered repo
     **maintain-only** (#11186): its Loom install is still resynced and its
     checkout fast-forwarded, but no sweep, role or epic dispatch starts there.
@@ -3072,38 +3075,36 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
     normal, dispatched workspace. These are for hosts no fleet store drives:
     on a host with a fleet store and `fleet.autoApply`, the roster's
     `fleet: true` / `fleet: maintain` wins on its next pass, exactly as it
-    does for `priority`. A daemon older than #11186 ignores the key and
+    does for `weight`. A daemon older than #11186 ignores the key and
     dispatches into the repo, and rewriting the file with an older
     `workspace` verb drops it.
-  - `loom-daemon workspace list` prints a `PRIO` column, sorted highest-priority
-    first (mutation order on disk is preserved).
+  - `loom-daemon workspace list` prints a `WEIGHT` column, heaviest first
+    (mutation order on disk is preserved).
 
-- **Work-finder ordering** — `work_finder::tick_multi` now takes a
-  `priorities: &[u32]` slice parallel to the workspaces. Instead of dispatching
-  each repo's backlog in registration order, it gathers **every** eligible
-  candidate across all workspaces and orders them by **weighted workspace
-  draws** (#11103, [`priority-model.md`](priority-model.md)): each draw picks a
-  workspace weighted by its priority and places its next issue (level, oldest,
-  number). Since #11684 the weight is a softmax over `fleet_priority`,
-  `max(1, round(1e6 * exp(-(p - p_min) / T)))` with `p_min` the pool's top
-  priority and `T` the hyperparameter `dispatch.drawTemperature` (default 80,
-  re-read every tick); `pick.decision` records `temperature` and each draw's
-  `p_min`. It fills the single shared concurrency budget in that order. The
+- **Work-finder ordering** — `work_finder::tick_multi` takes a `weights`
+  slice parallel to the workspaces. It gathers **every** eligible candidate
+  across all workspaces and orders them by **weighted workspace draws**
+  (#11103, #11742): each draw picks a workspace with probability
+  `w / Σw`, where `w` is its weight plus the `dispatch.weightBonus*` points it
+  earns for a verified red-main fix, very-important or important work, and
+  places its next issue (red-main fix, level, oldest, number). There are no
+  tiers. `pick.decision` records each candidate's `base_weight`, `bonus` and
+  `weight`. It fills the single shared concurrency budget in that order. The
   cap/budget mechanics (#3811/#3930) are unchanged; this only orders the queue.
-  `candidate_cmp` (below) now only ranks the published ready-queue rows.
+  `candidate_cmp` (below) only ranks the published ready-queue rows.
 
 - **Epic supervisor** — `spawn_multi_supervisor_thread` reorders its cached
-  per-repo supervisors by workspace priority each tick (stable within a tier) before
-  `tick_multi`, so higher-tier epics advance/dispatch first.
+  per-repo supervisors heaviest weight first each tick (stable within a weight)
+  before `tick_multi`.
 
-- **Status** — `RepoStatus.priority` is surfaced in the `loom-daemon status`
-  **Managed repos** table (a `PRIO` column) and the `--json` `per_repo[].priority`
-  field, with the breakdown sorted highest-priority first.
+- **Status** — `RepoStatus.weight` is surfaced in the `loom-daemon status`
+  **Managed repos** table (a `WGHT` column) and the `--json` `per_repo[].weight`
+  field, with the breakdown sorted heaviest first.
 
-**Starvation stance:** since #11103 the cross-repo order is a weighted draw, not
-strict tiers: a default-priority repo is drawn less often than a tool repo, never
-starved. A repo whose next candidate is a verified red-main fix wins the draw
-outright; failing that, a repo with `loom:very-important` work next does.
+**Starvation stance:** the cross-repo order is a weighted draw, not strict
+tiers: a light repo is drawn less often than a heavy one, never starved unless
+its weight is `0`. A red-main fix or very-important work makes its repo much
+likelier to be drawn, never certain (#11742).
 Cross-repo dependency awareness stays a role judgment (label the blocker).
 
 **Retired labels do not affect dispatch order.** The tier labels and the
@@ -3126,16 +3127,13 @@ created_at → number` ([PR planning](pr-planning.md) is separate):
 
 These keys rank the published ready-queue rows (`rank`, `plan.keys`); dispatch
 follows the workspace draw, and the single-workspace tick uses the same four
-keys (passed the repo's real verified-red state). The workspace draw's pool is
-three-tier: workspaces whose next candidate is a verified red-main fix if any
-(`pool: "red-main-fix"`), else those with very-important work
-(`"very-important"`), else all (`"all"`). Within the pool the draw weighs each
-workspace by a softmax over `fleet_priority` at temperature
-`dispatch.drawTemperature` (#11684; `p_min` is taken over the pool, so its top
-workspace always weighs the full 1,000,000). #11508 removed the legacy keys: the star, its
+keys (passed the repo's real verified-red state). The workspace draw has no
+tiers (#11742): every workspace with work is drawn with probability
+`(weight + bonuses) / Σ`, where a verified red-main fix, very-important work
+and important work each add their `dispatch.weightBonus*` points. #11508 removed the legacy keys: the star, its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
-ignored), and `workspace_priority` as a rank key (it weights the workspace
+ignored), and `workspace_weight` as a rank key (it weights the workspace
 draw instead); #11547 restored the red-main-fix key above, live only while
 `main` is verified red. Each ready-queue row reports its
 `level` (`default` / `important` / `very-important`, after the cap; #11510,
@@ -4752,7 +4750,7 @@ one repo's charge, net of the reservation); the per-repo hold and the
 #### Per-repo dispatch cap + track affinity (#9090)
 
 `min(disk, ram, maxConcurrent)` is **one global budget**, filled in one
-globally-sorted order ([per-workspace priority tiers](#per-workspace-priority-tiers-3946)),
+globally-sorted order ([per-workspace draw weights](#per-workspace-draw-weights-3946-11742)),
 so nothing stops the whole budget landing in a single repo: N sweeps in one repo
 rebase against each other's merges while sibling repos sit idle behind them.
 `autonomous.workFinder.maxConcurrentPerRepo` bounds one repo's share of it.
@@ -10596,6 +10594,16 @@ Actions cron table below lists, plus `doctor` (added by #5272, see below). The
 *per-sweep* lifecycle roles (Judge/Doctor/Champion-merge dispatched **inside**
 a `/loom:sweep`) already run host-side on the rotated pool via
 `sweep_registry` and are unaffected by this loop.
+
+**Which runtime a tick runs on (#11726).** With a `runtimes.roleDraw.<role>`
+table, each tick draws its runtime (and optionally its model) by a seeded,
+weighted draw from the table for its **attempt**: `1 +` the role's consecutive
+failed or blocked launched ticks in that workspace, reset by a success. A
+blocked attempt 1 (for example a tick whose every tool call a guard hook denied)
+therefore draws from the attempt-2 table. Without a table, `rolePreference`
+decides as before. `loom-daemon roles draw --explain` shows each stage's
+effective per-attempt table on the host and the config tier that set it. See
+[role-draw.md](role-draw.md).
 
 **Doctor is dual-mode (#5272).** Every other role in `DEFAULT_ROLES` is
 *either* per-sweep (Builder) *or* standalone (this loop) — never both. Doctor

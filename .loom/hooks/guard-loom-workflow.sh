@@ -10,7 +10,7 @@
 #   1. LOOM: Prefer merge-pr.sh over 'gh pr merge'
 #   2. LOOM: Block 'pip install -e' inside worktrees (issue #2495, #4079)
 #   3. LOOM: Ask before real-registry-mutating `loom-daemon workspace
-#      add|remove|set-priority` (issue #4326)
+#      add|remove|set-weight` (issue #4326)
 #   4. LOOM: Deny Bash writes that edit an INSTALLED Loom file in place in a
 #      CONSUMER repo (issue #7995) — the Bash-idiom counterpart of the
 #      Edit/Write denial in guard-worktree-paths.sh
@@ -1571,7 +1571,7 @@ decision_log_enabled() {
 # =============================================================================
 # Workspace-registry guard toggle — default ON (issue #4326).
 #
-# The `loom-daemon workspace add|remove|set-priority` ask (below) is a useful
+# The `loom-daemon workspace add|remove|set-weight` ask (below) is a useful
 # default backstop against accidentally mutating the operator's real
 # ~/.loom/workspaces.json, but — like every other category guard in this
 # file — a repo/session can opt out via the same
@@ -1876,7 +1876,7 @@ fi
 # LOOM: Ask before registry-mutating `loom-daemon workspace` commands
 # (Issue #4326)
 #
-# `loom-daemon workspace add|remove|set-priority` mutate the machine-level
+# `loom-daemon workspace add|remove|set-weight` mutate the machine-level
 # workspace registry (Issue #3926), normally `~/.loom/workspaces.json` — a
 # SHARED file, not scoped to any one repo/worktree/session. An ad-hoc
 # verification step (a builder/auditor sweep exercising registry behavior)
@@ -1897,10 +1897,10 @@ fi
 # list` is read-only and is NEVER matched by this guard.
 # =============================================================================
 
-if echo "$COMMAND" | grep -qE '(^|[/[:space:];&|])loom-daemon[[:space:]]+workspace[[:space:]]+(add|remove|set-priority)([[:space:]]|$)'; then
+if echo "$COMMAND" | grep -qE '(^|[/[:space:];&|])loom-daemon[[:space:]]+workspace[[:space:]]+(add|remove|set-weight|set-priority)([[:space:]]|$)'; then
     if workspace_registry_guard_enabled; then
         if [[ -z "${LOOM_WORKSPACES_PATH:-}" ]] && ! echo "$COMMAND" | grep -qE 'LOOM_WORKSPACES_PATH='; then
-            ask "This mutates the machine-level workspace registry ('loom-daemon workspace add/remove/set-priority') — by default that is the operator's REAL ~/.loom/workspaces.json, shared across every repo/session (Issue #4326: a leaked test entry once sat at top dispatch priority for most of a day). If this is a test/verification step, prefix the command with LOOM_WORKSPACES_PATH=<scratch-file> to isolate it from the real registry. If this IS an intentional real-registry change, confirm to proceed."
+            ask "This mutates the machine-level workspace registry ('loom-daemon workspace add/remove/set-weight') — by default that is the operator's REAL ~/.loom/workspaces.json, shared across every repo/session (Issue #4326: a leaked test entry once sat at top dispatch priority for most of a day). If this is a test/verification step, prefix the command with LOOM_WORKSPACES_PATH=<scratch-file> to isolate it from the real registry. If this IS an intentional real-registry change, confirm to proceed."
         fi
     fi
 fi

@@ -244,7 +244,7 @@ Issues with `loom:issue` (human-approved) but missing `loom:curated`:
 # hardcoded `external` literal. Note the DOUBLE-quoted --jq so $EXCL expands.
 EXCL="$(./.loom/scripts/hard-exclusion-labels.sh --jq-not)"
 gh issue list --label="loom:issue" --state=open --limit 500 --json number,title,labels,createdAt \
-  --jq "sort_by(.createdAt) | .[] | select(([.labels[].name] | contains([\"loom:curated\"]) | not) and $EXCL) |
+  --jq "sort_by(.createdAt) | .[] | select((any(.labels[].name; . == \"loom:curated\") | not) and $EXCL) |
   \"#\(.number): \(.title)\""
 ```
 

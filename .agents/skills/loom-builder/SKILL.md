@@ -1050,7 +1050,7 @@ gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=5
 ```bash
 EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
 gh issue list --label="loom:issue" --state=open --limit=500 --json number,title,labels \
-  --jq ".[] | select(([.labels[].name] | contains([\"loom:curated\"]) | not) and $EXCL) |
+  --jq ".[] | select((any(.labels[].name; . == \"loom:curated\") | not) and $EXCL) |
   \"#\(.number): \(.title)\""
 ```
 

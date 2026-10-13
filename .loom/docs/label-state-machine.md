@@ -732,7 +732,11 @@ rationale: [`premise-gate.md`](premise-gate.md).
 **`loom:decision-malformed` (#10057)**: the operator UI bounces a
 `loom:operator-decision` issue without a valid `decision` block into this label.
 Curator repairs it (back to `loom:operator-decision`) or, if no operator call
-exists, removes it and re-routes; a repeat bounce is left alone.
+exists, removes it and re-routes; a repeat bounce is left alone. It is a
+work-finder skip label (#11480), so a bounced Decision issue is never build
+work. No daemon release path (claim release, quarantine release, no-op hold
+lift, reclaim) re-adds `loom:issue` beside it or beside any other skip or
+lane-veto label (#11480's shared `restore_veto`).
 
 **`loom:needs-revision` (#10753)**: Champion adds it with a `NEEDS REVISION`
 verdict, routing the issue to Curator instead of waiting for someone to edit
