@@ -132,10 +132,15 @@
 #   5 = --auto's settle-wait (LOOM_AUTO_MERGE_TIMEOUT, default 600s) expired
 #       (#8896); or held: this head has no concluded `CI` run yet (#10567),
 #       or a required context is missing/pending on a plain merge (#10688).
+#   6 = deferred behind another PR's chain-head merge lock (#10167): a PR on
+#       the same base was just re-dated and its required checks have not
+#       reported. Only under --auto or LOOM_CHAIN_LOCK_GUARD=1; capped by
+#       LOOM_CHAIN_LOCK_CAP_SECS (default 7200, max 10800);
+#       LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it.
 #   7 = held by a sequencing order (#11330): the PR carries loom:pr +
 #       loom:sequenced and no other blocker. Prints `LOOM-SEQUENCED-HOLD
-#       pr=<N> after=<M>`; the predecessor landing clears it (#9378). Re-queue
-#       later; it has no cap of its own (sequence-eval owns release).
+#       pr=<N> after=<M>`; the predecessor landing clears it (#9378). Treat
+#       like 6, but it has no cap of its own (sequence-eval owns release).
 
 set -euo pipefail
 
@@ -512,6 +517,17 @@ case "$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr pr-state --state "$PR_STATE" 
   "LOOM-PR-STATE MERGED") warning "PR #$PR_NUMBER is already merged"; exit 0 ;;
   "LOOM-PR-STATE CLOSED") error "PR #$PR_NUMBER is closed (not merged)" ;; "LOOM-PR-STATE OPEN") ;;
   *) [[ "$PR_MERGED" != "true" ]] || { warning "PR #$PR_NUMBER is already merged"; exit 0; }; [[ "$PR_STATE" != "closed" ]] || error "PR #$PR_NUMBER is closed (not merged)" ;; esac
+
+# Chain-head merge lock (#10167): while ANOTHER PR on this base is a re-dating
+# chain head whose required checks have not reported, defer with exit 6 BEFORE
+# anything below writes (ref pins, re-dates, comments, the merge). The decision
+# is `loom-daemon merge-pr chain-lock` (loom-daemon/src/merge_pr/chain_lock.rs):
+# trusted marker, capped at LOOM_CHAIN_LOCK_CAP_SECS, unreadable state defers
+# only within the cap. Runs under --auto (Champion) or LOOM_CHAIN_LOCK_GUARD=1,
+# so a plain hand-merge is not held; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it.
+# Any exit other than 0/6 (an older daemon without the verb) proceeds with a
+# warning: the lock only orders merges, it never judges a tree.
+_check_chain_lock() { [[ "$FORGE_TYPE" == "github" ]] && [[ "$AUTO_MERGE" == "true" || "${LOOM_CHAIN_LOCK_GUARD:-0}" == "1" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr chain-lock --pr "$PR_NUMBER" --repo "$REPO_NWO" --base-ref "${base_ref:-${DEFAULT_BRANCH_NAME:-main}}" --repo-root "${REPO_ROOT:-.}")" || rc=$?; if [[ $rc -eq 0 ]]; then [[ "$msg" == "LOOM-CHAIN-LOCK-CLEAR" ]] || warning "$msg"; return 0; fi; if [[ $rc -ne 6 ]]; then warning "Chain-head merge lock (#10167) did not run ('merge-pr chain-lock' exited $rc${msg:+: $msg}); proceeding. Roll loom-daemon to restore it."; return 0; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would DEFER merge of PR #$PR_NUMBER (exit 6): $msg"; return 0; fi; warning "$msg" >&2; warning "Exiting 6: merge deferred behind a re-dating chain head (#10167); nothing was written. Re-attempt on a later pass." >&2; exit 6; }; _check_chain_lock
 
 # ---------------------------------------------------------------------------
 # Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2; reshaped by
@@ -2167,6 +2183,9 @@ _revalidate_merge_guards() {
   # in flight) is decided here against the head about to be merged. Joined onto
   # one line as a file-size/shell-budget offset.
   _check_verdict_label_contradiction; _check_ci_result settled
+  # #10167: a chain head may have taken its lock while --auto waited. Nothing
+  # forge-side has been written yet, so exit 6 here still writes nothing.
+  _check_chain_lock
 }
 
 if [[ "$AUTO_MERGE" == "true" ]]; then
