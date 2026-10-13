@@ -77,6 +77,10 @@ auto-dispatches sweeps, and the [epic supervisor](#epic-supervisor-3842)
 drives `loom:epic` fork-joins. See [Operability](#operability--config-startstop-e2e-phase-d-3813)
 for enabling and tuning them.
 
+Every listener and every outbound client whose response can change daemon
+behavior, classified as config, forge, wake-only webhook or removed, is
+audited in [`network-inputs.md`](network-inputs.md) (#11711).
+
 ## The `LOOM_ROLE` env-var contract (#6507)
 
 `LOOM_ROLE` is a **public, stable session-identity contract**: repo-level
