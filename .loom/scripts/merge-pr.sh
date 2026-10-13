@@ -222,6 +222,9 @@ _classify_merge_response() { local _k; _k="$(printf '%s' "$1" | "${LOOM_DAEMON_B
 # is frozen by the file-size ratchet, and `shell-budget --check` refuses a
 # change that grows the portable pool at all.
 _refresh_precondition_sha() { _HEAD_SELF_SYNCED=true; return 0; }
+# _mr_say KEY -- the KEY<TAB>text line of the current `merge-pr merge-route`
+# answer ($_MR), or a generic line when the route was synthesized without one.
+_mr_say() { local l="${_MR#*$'\n'"$1"$'\t'}"; [[ "$l" != "$_MR" ]] || l="PR #$PR_NUMBER: merge retry, step $1 (no wording: 'merge-pr merge-route' unavailable)"; printf '%s' "${l%%$'\n'*}"; }
 
 # #8164: a head-SHA mismatch is retried ONCE when — and only when — this run's
 # own base-sync caused it. Returns 0 when the caller should re-attempt the
@@ -2317,22 +2320,6 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
   # make "could not classify" indistinguishable from "no marker matched".
   MERGE_RESPONSE_KIND="$(_classify_merge_response "$MERGE_RESPONSE")" || error "Merge blocked: PR #$PR_NUMBER's merge-response classifier could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr classify-response' returned no LOOM-MERGE-RESPONSE verdict (missing binary, or one predating the subcommand). The routes it chooses between are not interchangeable: one retries after syncing the base, and one must NEVER retry a head that moved past the approved SHA (#5579). An unobtainable classification therefore refuses rather than guesses. This is a helper failure, NOT a merge verdict — nothing about this PR was rejected. The forge reported: $MERGE_RESPONSE. $(_mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
 
-  # Check for "Merge already in progress" (HTTP 405)
-  # This happens when auto-merge triggers at the same time as our merge attempt
-  if [[ "$MERGE_RESPONSE_KIND" == "merge-in-progress" ]]; then
-    info "Merge already in progress (HTTP 405), waiting for completion..."
-    sleep 5
-    RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
-    RECHECK=$(echo "$RECHECK_JSON" | jq -r '.merged // false')
-    if [[ "$RECHECK" == "true" ]]; then
-      success "PR #$PR_NUMBER merged (concurrent merge completed)"
-      break
-    fi
-    # Still not merged after wait - continue retry loop
-    warning "Concurrent merge not yet complete, retrying..."
-    continue
-  fi
-
   # Head-SHA-mismatch (#5579): the PR's OWN head branch moved past
   # $MERGE_PRECONDITION_SHA — distinct from "Base branch was modified" below
   # (that means the BASE fell behind; this means the branch we're trying to
@@ -2344,50 +2331,46 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
   # Since #8164, via _head_moved_or_resync(): a mismatch caused by this run's
   # own base-sync earns exactly one re-read-and-retry; anything else is the
   # same exit-3 re-queue as before.
-  # This arm MUST precede the base-modified arm below; since #8191 that
-  # precedence lives in the classifier's own ordered match, not in the order of
-  # these two `if`s, so a reorder here cannot change which route is taken.
+  # Head-vs-base precedence lives in the classifier's own ordered match (#8191),
+  # not in statement order; and `merge-route` below refuses a head-mismatch
+  # rather than syncing it, so even a reorder here could never retry a moved head.
   if [[ "$MERGE_RESPONSE_KIND" == "head-mismatch" ]]; then
     _head_moved_or_resync "$MERGE_RESPONSE" && continue
   fi
 
-  # Check for stale branch error (base branch was modified)
-  if [[ "$MERGE_RESPONSE_KIND" == "base-modified" ]]; then
-    if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
-      info "Branch is behind base branch, updating... (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)"
-
-      # Update branch via forge API
-      UPDATE_RESPONSE=$(forge_update_branch "$REPO_NWO" "$PR_NUMBER" 2>&1) || {
-        warning "Failed to update branch: $UPDATE_RESPONSE"
-        # Continue to retry merge anyway - update may have partially succeeded
-      }
-
-      # Wait for branch to sync
-      info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
-      sleep "$MERGE_RETRY_DELAY"
-
+  # Every other route — 405 merge-in-progress, a stale base within the retry
+  # budget, and the terminal refusals — is `loom-daemon merge-pr merge-route`
+  # (#8191 slice, loom-daemon/src/merge_pr/merge_route.rs): the attempt budget,
+  # the doubling backoff and every line narrated on the way. This loop keeps
+  # only the I/O between those lines. Fail-OPEN onto the retired behaviour: a
+  # binary that cannot answer is routed here on the classified kind and the
+  # same `attempt < max` budget, so a moved head is still never retried and
+  # everything else still refuses; only the wording degrades (_mr_say).
+  _MR="$(printf '%s' "$MERGE_RESPONSE" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr merge-route --kind "$MERGE_RESPONSE_KIND" --attempt "$MERGE_ATTEMPT" --max "$MAX_MERGE_RETRIES" --delay "$MERGE_RETRY_DELAY" --pr "$PR_NUMBER" 2>/dev/null)" || _MR=""
+  [[ "$_MR" == "LOOM-MERGE-ROUTE "* ]] || { warning "PR #$PR_NUMBER: 'merge-pr merge-route' gave no route (missing/older loom-daemon); routing on the classified kind '$MERGE_RESPONSE_KIND' alone. Roll this host: $SCRIPT_DIR/cli/loom-daemon-update.sh --fetch"; _MR="FAIL"; [[ "$MERGE_RESPONSE_KIND" != merge-in-progress ]] || _MR="AWAIT 5"; [[ "$MERGE_RESPONSE_KIND" != base-modified || $MERGE_ATTEMPT -ge $MAX_MERGE_RETRIES ]] || _MR="SYNC $MERGE_RETRY_DELAY $((MERGE_RETRY_DELAY * 2))"; [[ "$_MR" != FAIL ]] || _MR+=$'\n'"Failed to merge PR #$PR_NUMBER: $MERGE_RESPONSE"; _MR="LOOM-MERGE-ROUTE $_MR"; }
+  read -r _ _MR_ROUTE _MR_SLEEP _MR_NEXT_DELAY <<<"${_MR%%$'\n'*}"
+  case "$_MR_ROUTE" in
+    AWAIT)
+      info "$(_mr_say BEFORE)"; sleep "$_MR_SLEEP"
+      RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
+      RECHECK=$(echo "$RECHECK_JSON" | jq -r '.merged // false')
+      if [[ "$RECHECK" == "true" ]]; then success "$(_mr_say MERGED)"; break; fi
+      warning "$(_mr_say PENDING)"; continue ;;
+    SYNC)
+      info "$(_mr_say BEFORE)"
+      # Update failure is not fatal: the update may have partially succeeded.
+      UPDATE_RESPONSE=$(forge_update_branch "$REPO_NWO" "$PR_NUMBER" 2>&1) || warning "Failed to update branch: $UPDATE_RESPONSE"
+      info "$(_mr_say WAIT)"; sleep "$_MR_SLEEP"
       # The sync just pushed to the head branch: re-read it, or the retry
-      # below re-gates on a SHA the forge has already superseded (#8164).
-      #
-      # …and mark it (#9444). This is the canonical "main moved under the
-      # work" event: the base advanced, so the branch had to be synced before
-      # it could merge. `--duration-sec` is the settle wait we just slept —
-      # the only part of this rework that is measured here; the forge-side
-      # merge that produced the new head is not. Appended to the line above
-      # rather than given its own so the file does not grow (it is
-      # ratcheted); `|| true` because a marker may never fail a merge.
-      _refresh_precondition_sha; "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind rebase --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "base branch was modified; synced before merge retry $MERGE_ATTEMPT/$MAX_MERGE_RETRIES" --duration-sec "$MERGE_RETRY_DELAY" >/dev/null 2>&1 || true
-
-      # Increase delay for next attempt (exponential backoff)
-      MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
-      continue
-    else
-      error "Failed to merge PR #$PR_NUMBER after $MAX_MERGE_RETRIES attempts: Branch remains behind base branch"
-    fi
-  fi
-
-  # Other merge errors - fail immediately
-  error "Failed to merge PR #$PR_NUMBER: $MERGE_RESPONSE"
+      # re-gates on a SHA the forge has already superseded (#8164) — and mark
+      # the rework (#9444; the canonical "main moved under the work" event,
+      # `--duration-sec` the settle wait just slept; `|| true`: a marker may
+      # never fail a merge).
+      _refresh_precondition_sha; "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind rebase --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "$(_mr_say REWORK)" --duration-sec "$_MR_SLEEP" >/dev/null 2>&1 || true
+      MERGE_RETRY_DELAY="$_MR_NEXT_DELAY"; continue ;;
+  esac
+  # FAIL (or a route word this script does not know): refuse, quoting the reason.
+  error "${_MR#*$'\n'}"
 done
 
 # Verify merge
