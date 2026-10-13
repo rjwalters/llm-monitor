@@ -1873,10 +1873,15 @@ defines which rows count as waiting and where dwell starts.
 An unmeasurable host reading produces no point, never a `0`. Each work-finder
 tick also emits one `loom.dispatch.tick` span. It is a new root trace per tick
 that covers candidate evaluation and dispatch. Its attributes are
-`loom.dispatch.result` (`dispatched`, `halted_main_red`, `halted_ci_billing` (#10113), `saturation_held`,
+`loom.dispatch.result` (`dispatched`, `halted_<cause>`, `halted`, `saturation_held`,
 `error`, `build_backoff_held` (#9410; only when the back-off deferred at least one candidate, #10624),
 `no_eligible_work`, `capacity_full`, `all_skipped`, first match wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
-`loom.dispatch.errors` and `loom.dispatch.max_concurrent`. Each `dispatch()` attempt in the
+`loom.dispatch.errors`, `loom.dispatch.max_concurrent` and, on a held tick, `loom.dispatch.halt_causes`.
+A held tick's result names its hold (#11649): when every held workspace has the same cause it is
+`halted_` plus that `HaltCause` token (`halted_main_red`, `halted_disk_reservation`, `halted_token_pool`,
+`halted_drain`, `halted_ci_billing` (#10113), …); when the holds have several causes it is `halted`, and
+`loom.dispatch.halt_causes` lists them comma-joined. Before #11649 every hold read `halted_main_red`
+(or `halted_ci_billing`), so older rows with that value may have been held for any reason. Each `dispatch()` attempt in the
 tick is one `loom.dispatch.admission` child span (#8907; a candidate the #8865
 open-PR pre-filter skips is not an attempt and has no admission span), with the tick's trace
 id and the tick span as its parent. Its attributes are `loom.issue`,
@@ -1983,6 +1988,7 @@ Guard denies (Issue #11582):
 | Signal | Kind | Unit / attributes | Meaning |
 |---|---|---|---|
 | `guard.cargo_target_dir.denied` span | instant; a child of the agent's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`), so only a session inside a traced execution exports one | `loom.guard.root` (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`), `loom.guard.source` (`inherited`, `inline`, `env`, `export`, `target-dir-flag`, `make-arg`), `loom.role` | one `loom:cargo-target-dir` deny: a cargo build whose target dir was under a root nothing owns ([`guard-hooks.md`](guard-hooks.md#cargo-target-dir-guard-guardscargotargetdir--loom_guard_cargo_target_dir)). Never the path or the command |
+| `build_gate.run` span | one per host-side run of `buildGate.command`; pre-flight's is a child of the sweep's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`; an attended session with no `LOOM_TRACEPARENT` emits none), the main-health gate's is its own root through the ops sink | `loom.build_gate.stage` (`preflight` / `main_health`), `loom.build_gate.tier` (`fast` / `full`), `loom.build_gate.outcome` (`pass` / `pass_flaky` / `fail` / `unresolved` / `timeout` / `unevaluated`), `loom.build_gate.duration_ms`, `loom.build_gate.attempt` (1-based within the pre-flight episode; `1` for main-health) | what host-side gating costs and how often it fails, per stage and tier (#11690: CI is the test gate, pre-flight is the fast tier). Status `error` unless `pass` / `pass_flaky`. Never the command, a path or the output |
 
 GitHub rate limit (Issue #10022):
 
@@ -3365,11 +3371,13 @@ prompt string appears in neither the journal nor the state file.
 | `last_activity_at` | RFC3339 | last tool call or Stop |
 | `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
 
-**Producer.** `loom-daemon presence beat`, called by the opt-in hook
+**Producer.** `loom-daemon presence beat`, called by the hook
 `presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
 always emits; other events emit at most once per 5 minutes. The hook is wired
-only when the operator provisions with `LOOM_OPERATOR_PRESENCE=1`
-(`scripts/install/provision-hooks.sh`); it is absent by default.
+by the installer/resync when the fleet key `operatorPresence.enabled` (or
+`LOOM_OPERATOR_PRESENCE=1`) says so, and is absent otherwise; on `Stop` the
+journal is flushed to OTLP with no daemon running. See
+[`operator-presence.md`](operator-presence.md).
 
 **In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
 journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`

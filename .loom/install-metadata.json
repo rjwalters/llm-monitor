@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1151",
-  "loom_commit": "4ec7e046f71ff70b92c88ed647cff72d6a9d1e85",
+  "loom_version": "0.19.1152",
+  "loom_commit": "2d5fe17958dca799058f16bdd74a12336990bec0",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -242,7 +242,16 @@
     ".loom/scripts/tests/test-gh-cached.sh",
     ".loom/scripts/tests/test-merge-pr-auto-blocked-settle.sh",
     ".loom/scripts/tests/test-merge-pr-head-mismatch.sh",
-    ".loom/scripts/tests/test-sweep-experiment.sh"
+    ".loom/scripts/tests/test-sweep-experiment.sh",
+    ".loom/docs/operator-presence.md",
+    ".loom/scripts/tests/test-approval-history-per-issue-events.sh",
+    ".agents/skills/loom-judge-reference/SKILL.md",
+    ".claude/commands/loom/judge-reference.md",
+    ".loom/docs/trace-identity.md",
+    ".loom/hooks/presence-beat.sh",
+    ".loom/roles/judge-reference.md",
+    ".loom/scripts/tests/test-build-gate-runner.sh",
+    ".loom/scripts/tests/test-provision-hooks.sh"
   ],
   "last_resync": "2026-10-13",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
