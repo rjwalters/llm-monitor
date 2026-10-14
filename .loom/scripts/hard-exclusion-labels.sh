@@ -61,6 +61,7 @@ set -uo pipefail
 # (derived from the registry) by a unit test there.
 # ---------------------------------------------------------------------------
 HARD_EXCLUSION_LABELS=(
+  loom:frozen
   external
 )
 

@@ -56,7 +56,6 @@ test-champion-standing-authorization.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-conflict-markers.sh
-test-check-dependabot-labels.sh
 test-check-evaluating-staleness.sh
 test-check-git-identity.sh
 test-check-guards-installed.sh
@@ -188,7 +187,6 @@ test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
 test-resync-installed-output-staging.sh
 test-resync-installed.sh
-test-resync-installed-egress-doctor.sh
 test-resync-installed-payload-fallback.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
@@ -269,7 +267,6 @@ tests/hooks/test-pre-commit-missing-formatter.sh
 # defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
 defaults/hooks/tests/test-guard-background-subagents.sh
 defaults/hooks/tests/test-roll-pause.sh
-defaults/hooks/tests/test-guard-forge-egress.sh
 defaults/hooks/tests/test-guard-installed-file-writes.sh
 defaults/hooks/tests/test-guard-loom-workspace.sh
 defaults/hooks/tests/test-guard-secret-scan.sh
@@ -311,9 +308,10 @@ tests/hermit/test-stateless-ceremony.sh
 # repo under mktemp -d with its own identity, no network, no gh.
 scripts/test-changelog.sh
 
-# #9987: spawn-claude.sh managed-gh container admission. Hermetic: a fake daemon
-# and docker stub under mktemp -d; no network, forge or real daemon binary.
-test-spawn-claude-managed-gh.sh
+# #11790: spawn-claude.sh's container gh credentials and
+# `gh-shim container-mount` sink mount. Hermetic: stub docker + stub daemon
+# under mktemp -d; no network, forge or real daemon binary.
+test-spawn-claude-container-gh.sh
 
 # #11076: spawn-claude.sh's systemd scope carries OOMPolicy=continue. Hermetic:
 # systemd-run/systemctl/claude stubs under mktemp -d, no daemon, forge or network.

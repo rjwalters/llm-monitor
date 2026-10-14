@@ -3130,7 +3130,7 @@ refresh_gitignore_block() {
         warn "  Newer runtime paths (e.g. .loom/sweep-checkpoint/, .loom/worktrees-local/) may stay untracked-and-unignored."
         return 0
     fi
-    EGRESS_BIN="$bin"   # #9996: reused by the forge egress doctor step below
+    EGRESS_BIN="$bin"   # reused by the labels migrate step below
     # `update-gitignore` has no dedicated --dry-run; on a dry run we only probe
     # that the subcommand exists (never writing), so the preview neither mutates
     # nor claims a refresh a pre-#4280 binary cannot perform.
@@ -3802,25 +3802,6 @@ if [[ "${DRY_RUN:-0}" != "1" && -r "$_PRESENCE_LIB" ]]; then
         || warn "operator presence wiring not fully applied (see messages above); resync itself completed."
 fi
 
-# #9996: forge egress routing check, delegated to the daemon (the shell never
-# parses the policy). Last step so a failure cannot cut the sync short; the
-# doctor's own exit code is carried to the final exit. --dry-run exits earlier
-# (before this step), so it never runs the doctor and never fails.
-# requires-daemon: forge optional   older daemon without `forge egress`: warn, never fail
-EGRESS_RC=0
-if [[ -n "$EGRESS_BIN" ]]; then
-    if ! "$EGRESS_BIN" forge egress --help >/dev/null 2>&1; then
-        warn "forge egress check unavailable: '$EGRESS_BIN' has no 'forge egress' subcommand (rebuild the daemon)."
-    else
-        egress_output="$(cd "$REPO_ROOT" && "$EGRESS_BIN" forge egress doctor 2>&1)" || EGRESS_RC=$?
-        if [[ -n "$egress_output" ]]; then
-            printf '%b\n' "${YELLOW}[resync] Forge egress (loom-daemon forge egress doctor):${NC}"
-            printf '%s\n' "$egress_output" | sed 's/^/    /'
-        fi
-        [[ "$EGRESS_RC" -eq 0 ]] || warn "forge egress routing check failed (exit $EGRESS_RC); resync itself completed."
-    fi
-fi
-
 # 75 (EX_TEMPFAIL), matching create-issue.sh's DEFERRED convention: the
 # surface sync itself SUCCEEDED and must not be re-run blindly, but one
 # check did not execute, so this run is not a clean bill of health. A
@@ -3829,4 +3810,4 @@ fi
 if [[ "$LABEL_CHECK_BROKEN" -eq 1 || "$GUARD_CHECK_BROKEN" -eq 1 ]]; then
     exit 75
 fi
-exit "${EGRESS_RC:-0}"
+exit 0

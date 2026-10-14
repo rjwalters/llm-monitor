@@ -1509,17 +1509,27 @@ _strip_one_closed_issue_building_label() {
 
   issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
   out="$(printf '%s\n' "$issue_json" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr closed-building 2>/dev/null)" || rc=$?
-  if [[ $rc -ne 0 || ( "$out" != "STRIP" && "$out" != "SKIP"$'\t'* ) ]]; then
+  if [[ $rc -ne 0 || ( "$out" != STRIP && "$out" != STRIP-READY && "$out" != STRIP-BOTH && "$out" != "SKIP"$'\t'* ) ]]; then
     warning "Closed-issue loom:building cleanup for issue #$issue_num did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr closed-building' exited $rc and printed '${out//$'\n'/ }' rather than STRIP or SKIP (a loom-daemon predating #8191's slice has no such verb). Advisory only — the merge already happened and #$issue_num was left untouched; if it is closed and still loom:building, drop the stale claim by hand: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
     return 0
   fi
-  [[ "$out" == "STRIP" ]] || return 0
+  local labels=()
+  case "$out" in
+    STRIP) labels=(loom:building) ;;
+    # #11517 (operator ruling 2026-10-13): a closed issue also loses loom:issue.
+    STRIP-READY) labels=(loom:issue) ;;
+    STRIP-BOTH) labels=(loom:building loom:issue) ;;
+    *) return 0 ;;
+  esac
 
-  if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" 2>/dev/null; then
-    success "Issue #$issue_num: removed stale loom:building label (closed by this merge, #6199)"
-  else
-    warning "Could not remove loom:building from closed issue #$issue_num — may need manual: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building"
-  fi
+  local label
+  for label in "${labels[@]}"; do
+    if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "$label" 2>/dev/null; then
+      success "Issue #$issue_num: removed stale $label label (closed by this merge, #6199/#11517)"
+    else
+      warning "Could not remove $label from closed issue #$issue_num — may need manual: gh issue edit $issue_num --repo $REPO_NWO --remove-label $label"
+    fi
+  done
 }
 
 # Resolve this PR's closing issue targets and strip loom:building from each

@@ -59,7 +59,9 @@ on one tap (`claude/opus`, `claude/fable`) share its availability.
 The daemon reads each config tier separately: machine defaults
 (`~/.local/share/loom/config/defaults.json`, where fleet-gitops renders
 `config.defaults` plus host-class and host overrides), `.loom/config.json`,
-`.loom-project/project.json`, then `.loom-local/local.json`. A higher tier
+`.loom-project/project.json`, the per-repo fleet tier
+`.loom-local/fleet-repo.json` (the fleet config's `repos[].config`, written by
+the fleet sync, #11738), then `.loom-local/local.json`. A higher tier
 replaces a role's table **per attempt**, so a host can replace `judge` attempt
 1 without restating attempt 2 or any other role. `null` at a higher tier clears
 that role (or, for `roleDraw: null`, every role). `excludeProviders` follows the
@@ -123,9 +125,21 @@ inputs, each roll (`Σw`, roll, pick), passed-over picks and the final pick:
 - on the `# LOOM_RUNTIME_PREFERENCE` marker as `source=role-draw draw=attempt:…,
   table:a2@repo-config,seed:…,sum:…,roll:…,pick:…`;
 - on `role_tick.outcome` as `role_draw` (see
-  [telemetry-schema.md](telemetry-schema.md)), and in SigNoz as
-  `loom.role_draw.*` attributes, so success and blocked rates group by
-  `loom.role` × `loom.role_draw.pick` × `loom.result`.
+  [telemetry-schema.md](telemetry-schema.md)), mapped to `loom.role_draw.*`
+  attributes. That record stays in the host's `role-tick-telemetry.jsonl`
+  and is not shipped to the collector.
+
+What reaches SigNoz (#11726 follow-up):
+
+- **Role ticks:** the tick's exported `loom.role_attempt` span (`loom.sweep_id`
+  `role-*`) carries `loom.role_draw.pick`, `.attempt`, `.table_attempt`,
+  `.layer` and, when the pick pins one, `.model`. Success and blocked rates
+  group by `loom.role` × `loom.role_draw.pick` × `loom.result` from that span.
+  A tick that `rolePreference` decided carries none of these keys.
+- **Sweeps:** `sweep.outcome` carries `loom.role_draw.pick` and
+  `loom.role_draw.model_pinned` (always `false` today, because a sweep does not
+  pin the drawn `/model`). Both are absent when no `roleDraw` table decided the
+  sweep.
 
 ## Explain view
 

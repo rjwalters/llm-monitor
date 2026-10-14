@@ -580,7 +580,7 @@ CANONICAL_PHASE=$(canonicalize_phase "$PHASE")
 # exactly what missed a differently-formed existing marker for the same
 # phase (#6967). The broader hit set is then narrowed precisely by
 # canonicalized comparison below, so this is strictly more inclusive, never
-# less precise.
+# less precise. Includes loom:frozen (dedup).
 CANDIDATE_PHASE_ISSUES=$(${GH_READ:-gh} issue list \
   --label="loom:epic-phase" \
   --state=all \
@@ -866,7 +866,8 @@ CANONICAL_PHASE=$(canonicalize_phase "$PHASE")
 # into each phase-issue body (see Step 3): `<!-- loom:epic:<epic>:phase:<n> -->`.
 # This is an exact, drift-free token — unlike the old natural-language
 # "Epic: #N Phase: N" phrase, which never matched the "**Epic**: #N" /
-# "**Phase**: 1 of N" prose the body template actually emits.
+# "**Phase**: 1 of N" prose the body template actually emits. Includes
+# loom:frozen (dedup).
 CANDIDATE_PHASE_ISSUES=$(gh issue list \
   --label="loom:epic-phase" \
   --state=all \

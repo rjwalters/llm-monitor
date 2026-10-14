@@ -258,7 +258,8 @@ discover_epic_children() {
   # (a) phase-marker children — the historical source (champion-epic.md Step 3).
   local a
   # `gh --jq` takes only an expression (no `--arg`), so the marker — digits and
-  # literals only — is interpolated into the program directly.
+  # literals only — is interpolated into the program directly. Includes
+  # loom:frozen children (discovery, not work).
   a=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
     --json number,state,body \
     --jq "[.[] | select(.body | contains(\"$marker\")) | {number, state}]" 2>/dev/null || echo '[]')

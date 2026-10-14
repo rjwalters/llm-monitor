@@ -327,12 +327,13 @@ PR LIFECYCLE (Builder only creates, Judge/Champion manage):
 
 A **hard exclusion** is a label that takes an issue out of the automated
 pipeline entirely — no role may curate it, build it, or promote it, and the
-daemon's work finder will not dispatch a sweep for it. `external` is the only
-one today: issues submitted by non-collaborators (or auto-labeled by an intake
+daemon's work finder will not dispatch a sweep for it. `external` marks
+issues submitted by non-collaborators (or auto-labeled by an intake
 workflow) that require maintainer approval before being worked on.
 
 - **NEVER work on a hard-excluded issue** — not even when it also carries
   `loom:issue`.
+- **Skip any item labelled `loom:frozen`**: don't read it as work, comment on it, or relabel it. Only a human removes it.
 - **The list is not hardcoded here.** Read it from the one shared source,
   `./.loom/scripts/hard-exclusion-labels.sh` (Issue #7528) — the same list
   `loom-daemon`'s work finder filters candidates on, so the daemon and this

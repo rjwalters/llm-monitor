@@ -134,14 +134,58 @@ The timer half is **detection, not convergence** by default: it reports drift
 and writes nothing unless `fleet.autoApply` is on. A change that must take
 effect without waiting for a restart still needs one.
 
+## The per-repo fleet tier (#11738)
+
+The fleet config repo can give each repo its own base config: the compiled
+`fleet.json` carries an optional `config` object on a `repos[]` record (absent
+when empty), already resolved by the fleet config repo (for example a class of
+repos sharing one base). The daemon's fleet sync materializes it as
+`<repo>/.loom-local/fleet-repo.json` for every repo the roster **desires**
+(`fleet: true` or `maintain`, never `firewall: true`) whose clone exists, and
+**removes** that file (keeping one `.fleet-store-bak-<UTC>` backup) when the
+record has no `config`, so taking a value out of the fleet config takes
+effect. `.loom-local/` is gitignored by every Loom install, so the file never
+dirties a tree.
+
+The resolver merges it **above** the repo's committed config and **below** the
+host-local file:
+
+```
+machine tier < .loom/config.json < .loom-project/project.json < .loom-local/fleet-repo.json < .loom-local/local.json
+```
+
+So a key the fleet sets for a repo wins even when the repo commits the same
+key, and a key it does not set resolves exactly as before. Same merge rules
+as every tier: objects merge, scalars and lists replace, `null` clears.
+
+When it is written: the same as the machine and host-local tiers. The startup
+pass writes it; a timer pass writes only with `fleet.autoApply` on and
+otherwise reports drift. It is read from the roster's fail-closed snapshot, so
+a pass served from the cache does not touch it. Only a store with `fleet.json`
+has per-repo config; a store that still serves `repos.yml` leaves these files
+alone. Do not edit the file by hand: it belongs to the sync, which will
+rewrite or remove it on the next write pass. A host-only override goes in
+`.loom-local/local.json`.
+
+`loom-daemon status` reports it in the `Fleet store:` block, one
+`per-repo fleet tier:` line per repo that has a config or a file (`applied`,
+`rendered`, `removed` or `DRIFT`, with the top-level keys the fleet sets), and
+`--json` carries the same as `fleet_store.repoConfig.repos[]` (`name`, `path`,
+`keys`, `present`, `drifted`, `wrote`, `removed`). Provenance tools that name a
+key's source tier (`source_of`) name `.loom-local/fleet-repo.json` when it
+supplied the value.
+
 ## Where fleet config lives
 
 Tier 1 (fleet-gitops `config.defaults` / `config.hosts.<h>`, rendered to the
 machine-level `defaults.json`) is where fleet-wide settings are decided. Config
 resolution is plain tier order and nothing else: tier 1 < `.loom/config.json`
-< `.loom-project/project.json` < `.loom-local/local.json`, deep-merged key by
-key (`loom-daemon/src/config_resolver.rs`). A repo that commits a key overrides
-the fleet value for that repo; that is the documented behaviour, not an error.
+< `.loom-project/project.json` < `.loom-local/fleet-repo.json` (the per-repo
+fleet tier, above) < `.loom-local/local.json`, deep-merged key by key
+(`loom-daemon/src/config_resolver.rs`). A repo that commits a key overrides the
+tier-1 value for that repo; that is the documented behaviour, not an error. To
+make the fleet win for a repo, set the key in that repo's per-repo config in
+the fleet config repo.
 There is no key classification and no allow-list: `loom-daemon validate` and
 `loom-daemon status` do not report per-repo overrides, and CI does not reject
 them (the classification layer added in #11441 was removed in #11739).
