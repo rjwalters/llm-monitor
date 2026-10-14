@@ -53,7 +53,7 @@ for the length of this pass's own session. Run `champion-pr-merge.md` →
 number / hold reason / `mergeable` status for every currently-held PR to the
 pinned `Champion: Merge-Risk Hold Digest` tracking issue, so a human or another
 role (e.g. Guide) can read the current pile without a Champion transcript or a
-hand-run `loom:operator` label query. This is reporting/visibility only — it
+hand-run label query. This is reporting/visibility only — it
 changes no Safety Criteria evaluation and no merge decision.
 
 **Example report**:
