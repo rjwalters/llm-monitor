@@ -142,6 +142,21 @@ PR Lifecycle:
 (created) -> loom:review-requested -> [Judge] -> loom:pr -> [Champion merges] -> (merged)
 ```
 
+### Hold set (#11795)
+
+Champion's hold filters read the registry, never a hand list: until `labels
+migrate` reaches an item it may still carry a retired hold name, which must
+still count as held (#11843 drops `--with-retired`). The fallback is for a
+daemon without the flag. Each block that filters on holds starts with:
+
+```bash
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
+```
+
+and matches with `($ENV.HOLDS | split("\n")) as $h | ... IN($h[])` (`$o` for
+`OP_HOLDS`, the operator holds alone).
+
 ---
 
 ## Notes
@@ -405,8 +420,9 @@ against the **dependent** issue/PR being evaluated in the current repo
 DEPENDENT_ISSUE=<the issue/PR being evaluated, in the CURRENT repo>
 
 # Terminal state check first — never re-comment or re-tally once a human owns this.
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS  # "Hold set" above
 ALREADY_ROUTED=$(gh issue view "$DEPENDENT_ISSUE" --json labels --jq \
-  '.labels[] | select(.name=="loom:operator-only")' 2>/dev/null)
+  '($ENV.OP_HOLDS | split("\n")) as $o | .labels[] | select(.name | IN($o[]))' 2>/dev/null)
 if [ -n "$ALREADY_ROUTED" ]; then
   # Stays unconditional HERE (#5664). champion-issue-promo.md's equivalent
   # short-circuit became conditional so a dependency-only escalation can
@@ -414,7 +430,7 @@ if [ -n "$ALREADY_ROUTED" ]; then
   # it guards says "an epic looks complete but is still open" — that resolves
   # only by a human closing or promoting the epic, never on its own. An
   # un-escalation here would loop the same escalation forever.
-  echo "#$DEPENDENT_ISSUE already routed to loom:operator-only — skip silently"
+  echo "#$DEPENDENT_ISSUE already routed to loom:operator — skip silently"
 else
   # REST, not `gh issue view` — only the REST payload has the numeric comment
   # id the PATCH below needs (the `gh issue view --json comments` id is a
@@ -448,7 +464,7 @@ Blocked by $BLOCKER_REPO#$BLOCKER_NUM
 
 ---
 *Automated by Champion role*" \
-        && gh issue edit "$DEPENDENT_ISSUE" --add-label "loom:operator-only,loom:operator-blocked"
+        && gh issue edit "$DEPENDENT_ISSUE" --add-label "loom:operator"
     else
       # Still within budget: tally the streak IN PLACE (PATCH, no new
       # comment/notification) and keep not-gating on this reference.
@@ -525,14 +541,14 @@ construction rather than by an explicit reset step.
   — they are not new behavior, so they carry none of this section's comment
   or label overhead.
 - `ALREADY_ROUTED=yes` short-circuits everything — a dependent already
-  carrying `loom:operator-only` from this mechanism is never re-tallied or
+  carrying `loom:operator` from this mechanism is never re-tallied or
   re-escalated.
-- The escalation always adds `loom:operator-blocked` alongside
-  `loom:operator-only` (#5671) — this condition is, by construction,
-  self-clearing once `$BLOCKER_REPO#$BLOCKER_NUM` closes or promotes, which is
-  exactly the distinction #5664 needs from a genuine operator decision. See
-  `.loom/docs/label-state-machine.md` "operator-only sub-kinds" for the full
-  convention, including the required `Blocked by #N` machine-readable line.
+- The escalation comment always carries the machine-readable
+  `Blocked by $BLOCKER_REPO#$BLOCKER_NUM` line beside `loom:operator`
+  (#5671, #11795): the human action waits on that epic closing or promoting,
+  which is exactly the distinction #5664 needs from a genuine operator
+  decision (no decision block). See `.loom/docs/label-state-machine.md` →
+  "Routing to a human".
 - This check must run **independently of** any body-hash-keyed idempotency
   skip a caller applies to itself (e.g. `champion-issue-promo.md`'s unrevised-
   proposal skip). A dependent's own text can stay byte-identical for weeks

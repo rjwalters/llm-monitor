@@ -217,8 +217,8 @@ missing credential may trigger one, and it requests the **name, shape, and
 provisioning path — never the value**; never print, commit, or quote a
 credential value in an issue/PR/commit. A missing credential you cannot
 provision in-session is a mechanical blocker, not a judgement call — apply
-`loom:operator-only,loom:operator-mechanical` per "Applying
-`loom:operator-only`" below rather than prompting for a value. Full
+`loom:operator` with a capability marker per "Routing to a human" below
+rather than prompting for a value. Full
 convention: `.loom/docs/credentials.md`.
 
 ## Argument Handling
@@ -228,10 +228,11 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/builder 42`):
-1. Treat that number as the target **issue** to work on
-2. **Skip** the "Finding Work" section entirely
-3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
+1. Treat that number as the target **issue** to work on; **skip** "Finding Work"
+2. **Guard before any write** (#11863): `loom-daemon forge check-claim <number>`. Exit `1`: claim. Exit `0` prints a token: `TARGET_IS_PR` (Builder is an issue role, #9929), `CLOSED`, `FROZEN` or `OPEN_PR` → refuse, writing nothing. `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS` → refuse unless your invoker holds this claim (`LOOM_SWEEP_CLAIM_OWNED` names the number, or your brief says `This /loom:sweep pre-flighted #<number>`) or the operator explicitly told you to resume or force this claim (e.g. their own crashed run): that overrides these three, as `--force-claim` does, never the four above. Any other exit is not an all-clear: stop. A hard-excluded label (Label Workflow) refuses too
+3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"` (`worktree.sh` leases it)
 4. Proceed directly to implementation
+5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=builder target=<n> class=<verdict|noop|refused|failed> reason=<token>`
 
 If no argument is provided, use the normal "Finding Work" workflow below.
 
@@ -345,50 +346,13 @@ workflow) that require maintainer approval before being worked on.
 
 ## Exception: Explicit User Instructions
 
-**User commands override the label-based state machine.**
+**User commands override the label-based state machine.** When the user names an issue ("work on issue 592 as builder", "implement issue 342", "fix bug 234"):
 
-When the user explicitly instructs you to work on a specific issue or PR by number:
+1. **Proceed immediately**: skip the label checks (e.g. `loom:curated` without `loom:issue`); the instruction is the approval
+2. **Claim**: add `loom:building` and comment "Starting work on this issue per user request"
+3. **Work and finish normally**: `./.loom/scripts/worktree.sh 592`, implement, then a PR with `loom:review-requested` (builder-pr.md § "Creating the PR")
 
-```bash
-# Examples of explicit user instructions
-"work on issue 592 as builder"
-"take up issue 592 as a builder"
-"implement issue 342"
-"fix bug 234"
-```
-
-**Behavior**:
-1. **Proceed immediately** — skip label checks
-2. **Interpret as approval** — user instruction = implicit approval
-3. **Apply working label** — add `loom:building`
-4. **Document override** — comment: "Working on this per user request"
-5. **Follow normal completion** — apply end-state labels
-
-**Example**:
-```bash
-# User says: "work on issue 592 as builder"
-# Issue has: loom:curated (not loom:issue)
-
-# Proceed immediately
-gh issue edit 592 --add-label "loom:building"
-./.loom/scripts/post-comment.sh 592 --body "Starting work on this issue per user request"
-
-# Create worktree and implement
-./.loom/scripts/worktree.sh 592
-# ... do the work ...
-
-# Complete normally with a PR — the canonical structured body template
-# (builder-pr.md § "Creating the PR") with loom:review-requested at creation.
-```
-
-**Why This Matters**: users may prioritize work outside the normal flow, test
-workflows on specific issues, or override Curator/Guide triage decisions —
-flexibility matters in manual orchestration mode.
-
-**When NOT to Override**:
-- When user says "find work" or "look for issues" -> Use label-based workflow
-- When running autonomously -> Always use label-based workflow
-- When user doesn't specify an issue/PR number -> Use label-based workflow
+Not an override: "find work" / "look for issues", no issue number, or an autonomous run. Use the label-based workflow.
 
 ## Worktree Management
 
@@ -934,52 +898,20 @@ gh issue edit <number> --remove-label "loom:building"
 
 **Guardrails (safety — do NOT skip these):**
 - **Always comment the rationale BEFORE closing.** A silent close destroys context and looks like an escape. `--reason "not planned"` marks it a judgment call, not a fix.
-- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — add `loom:blocked` (waiting on a dependency/clarification) or `loom:operator-only` **plus exactly one sub-kind label**, per "Applying `loom:operator-only`" immediately below, with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
+- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — route it per "Routing to a human" immediately below, with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
 - **"Don't need changes" is now closeable with evidence** — but only when you can point to *why* (already delivered by #N, condition gone). If you are unsure, `loom:blocked` + comment, do not close on a hunch.
 - **Never invent new labels.** Use only the existing label set.
 
-#### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
+#### Routing to a human
 
-**Park only for a PO-level decision or a human-hands step (#10001)** — a
-failed attempt or a hard bug is not one; full rule: `curator.md` → "Applying
-`loom:operator-only`". **Never apply `loom:operator-only` on its own**: apply
-exactly one sub-kind in the **same** command (additive; filters unchanged):
-
-| Sub-kind | Apply when |
-|---|---|
-| `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
-| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
-| `loom:operator-decision` | The act requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-
-```bash
-# Builder parking a claimed issue on a decision: 2-4 ranked options, each with
-# a why (.loom/docs/operator-decision.md); a one-option ask is refused:
-loom-daemon operator-decision apply <number> --input d.json \
-  --also-label loom:operator-only --remove-label loom:building
-```
-
-**Being unsure which sub-kind applies is a sign the analysis is incomplete,
-not a reason to reach for the bare label (#5826).** `loom:operator-decision`
-is **not** a safe default for "the kind is not obvious" — before you apply
-it, name the axis along which two well-informed people would still disagree
-and show it is a preference, not a fact (the falsifiability test in
-`.loom/docs/label-state-machine.md`). If you cannot name that axis, the
-"decision" is really an unfinished derivation — keep working instead of
-parking it. If the only gap is an unstated objective, file a decision whose
-options are the candidate objectives (#10000).
-
-**If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
-in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
-`Requires #N` line (the exact phrasings `detect-dependency-cycle.sh` and
-`warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
-does not satisfy this — the phrase itself must be present so a later automated
-pass can tell when the blocker clears.
-
-**If you chose `loom:operator-decision`**, the options' whys MUST name the
-disagreement axis and why it is a preference, not a fact.
-
-Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
-"`loom:operator-only` sub-kinds".
+Park only for a PO-level decision or a human-hands step (#10001) — a failed
+attempt or a hard bug is not one. The rule is
+`.loom/docs/label-state-machine.md` → "Routing to a human": a ruling →
+`loom-daemon operator-decision apply <number> --input d.json --remove-label
+loom:building` (2-4 ranked options; adds `loom:operator`); a human's hands →
+`loom:operator` + a capability marker (+ `Blocked by #N` if it waits on
+something named); automation-resolvable waiting → `loom:blocked` with a park
+record.
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close is not re-picked-up. A **rescoped** issue must have its labels reset so it is not re-dispatched in a loop with a stale scope.
 

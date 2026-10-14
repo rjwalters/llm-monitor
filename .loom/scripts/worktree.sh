@@ -1634,8 +1634,9 @@ fi
 # (builder.md: claim, then create worktree), so the issue legitimately
 # carries the caller's own `loom:building` label, lease, and possibly
 # branch -- the only legs that still refuse are OPEN_PR ("do not build a
-# duplicate") and FROZEN (#11743, `loom:frozen`: a human took the issue out
-# of every lane), the legs --force-claim can never override. Only exit 0
+# duplicate"), TARGET_IS_PR (#9929, the number is a PR), CLOSED (#11863,
+# nothing left to build) and FROZEN (#11743, `loom:frozen`: a human took the
+# issue out of every lane), the legs --force-claim can never override. Only exit 0
 # (blocked; its reason token went to >&3, its explanation to stderr)
 # refuses; a read failure, an old daemon, or any other code fails OPEN,
 # exactly like the #8553/#5783 guards above. A caller refused here adopts

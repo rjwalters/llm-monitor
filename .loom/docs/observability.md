@@ -679,10 +679,20 @@ comes from bus events the daemon already publishes: seconds from an issue
 sweep finishing to the next issue-sweep dispatch
 (`loom.dispatch.slot_turnaround` / `.samples`). The tick adds idle slots
 (`loom.dispatch.idle_slots`) and the slot-seconds left idle while ready work
-waited (`loom.dispatch.idle_slot_seconds`). Forge label-stage dwell
-(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state}`)
+waited (`loom.dispatch.idle_slot_seconds`). Busy slots by role (#11847,
+`loom.dispatch.busy_slots{role}`) split the load: `role="sweep"` is the issue
+sweeps (so `busy_slots{role="sweep"} + idle_slots = max_concurrent`), and each
+role-runner role has its own series, with the role pool's ceiling and spare
+in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
+Forge label-stage dwell
+(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`)
 covers created → curated, curated → `loom:issue`, building → review requested
-and review requested → merged. It reads ETag-cached stage listings every 5
+and review requested → merged. Beside the per-label counts, `stage_items` has
+queue states from one ETag-cached open-items walk per repo (#11847):
+`triage`, `unlabeled`, `curated_not_promoted`, `issue_open_pr`,
+`issue_no_pr`, `parked` and `pr_held`. They are absent, not `0`, for a repo
+whose walk did not complete. `stage_items` is per repo, so a per-host total is `sum by (state)`, and the
+states overlap, so never sum across them. It reads ETag-cached stage listings every 5
 minutes plus at most 8 per-item reads per sample, never per tick. With
 `fleet.captainGauges` configured, the fleet captain samples for the fleet and
 dispatchers stand down while its published data is fresh
@@ -739,9 +749,15 @@ the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`,
 `write_scope` (#9548) — so
 "which hold is this repo under" is filterable straight from the span, no
 join needed. The attribute is absent on a cause-less legacy row (a
-pre-#9017 caller); the `loom.dispatch.tick`-span join
-(`loom.dispatch.result="halted_main_red"` through `parentSpanID`) remains
-the fallback there.
+pre-#9017 caller); the fallback there is the `loom.dispatch.tick`-span join
+through `parentSpanID`, reading the tick's `loom.dispatch.halt_causes`
+(comma-separated tokens). Do not key that join on
+`loom.dispatch.result="halted_main_red"`: since #11857 the result names a
+hold only when it covered the tick's work, so a tick that held one root
+beside healthy roots with candidates carries its per-candidate result
+(`all_skipped`, `no_eligible_work`, ...). `loom.dispatch.halt_causes` is
+still emitted on such a partial hold, and `loom.dispatch.held_roots` counts
+the held roots.
 
 A runnable copy of the "why hasn't `owner/repo#N` started" query is query 5 of
 `defaults/observability/signoz/queue-dwell.sql` — that file's other four
