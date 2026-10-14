@@ -1,6 +1,6 @@
 {
   "loom_version": "0.19.1155",
-  "loom_commit": "cca1f26e75f862145bd5305b1819554494f168eb",
+  "loom_commit": "4844d0404ab018a44c679f3da55b6ff8bf61dfc3",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -288,7 +288,8 @@
     ".loom/scripts/tests/test-merge-pr-stale-check-redate.sh",
     ".loom/scripts/tests/test-resync-installed-retired-migrate.sh",
     ".loom/scripts/tests/test-worktree-lease-co-occupancy.sh",
-    ".loom/scripts/verdict-staleness-guard.sh"
+    ".loom/scripts/verdict-staleness-guard.sh",
+    ".loom/scripts/tests/check-ci-suite-manifest.sh"
   ],
   "last_resync": "2026-10-14",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
