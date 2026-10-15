@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-15
+
+- **PR #252**: Bump Repo Skills 0.19.5 -> 0.24.1
+
 ### 2026-10-07
 
 - **Issue #243** (closed): Calibration alert: replace menu-bar dot with popover footer notice; ignore near-empty token days
