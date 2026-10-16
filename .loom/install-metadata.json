@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1172",
-  "loom_commit": "e1526e68163ab310163e711859be50cdd5b76dde",
+  "loom_version": "0.19.1173",
+  "loom_commit": "12ff39ac825c3c4306e70600afa2e376ae68f065",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -403,7 +403,6 @@
     ".loom/scripts/guide-docs-telemetry.sh",
     ".loom/scripts/merge-admission-telemetry.sh",
     ".loom/scripts/tests/test-claim-staleness.sh",
-    ".loom/scripts/tests/test-create-pr-provenance.sh",
     ".loom/scripts/tests/test-epic-label-preserved-on-escalation.sh",
     ".loom/scripts/tests/test-filing-lock.sh",
     ".loom/scripts/tests/test-guide-docs-telemetry.sh",
