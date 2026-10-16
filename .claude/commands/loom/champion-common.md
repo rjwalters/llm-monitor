@@ -260,54 +260,93 @@ because the two callers need different confidence:
 
 | Tier | Sources | Who may act on it |
 |---|---|---|
-| **Strong** (containment) | (a) `loom:epic-phase` children carrying the phase marker, (b) native GitHub sub-issues, (c) `- [ ] #N` task-list entries in the epic body | Step 2's classification, and `champion-epic.md` → "Step 0" **including its autonomous close** |
-| **Weak** (prose reference) | (d) issues whose body merely names `Epic #N` | Never on its own — it may only downgrade `champion-epic.md`'s Step 0 to an operator ask, and it never affects Step 2 |
+| **Strong** (containment) | (a) `loom:epic-phase` children carrying the phase marker, (b) native GitHub sub-issues, (c) `- [ ] #N` task-list entries in the epic body, (e) issues carrying `<!-- loom:parent #N -->` (`create-issue.sh --parent`), (f) same-repo `#N` refs in a `<!-- loom:park Blocked by: #N … -->` record in the epic body | Step 2's classification, and `champion-epic.md` → "Step 0" **including its autonomous close** |
+| **Weak** (prose reference) | (d) issues whose body merely names `Epic #N`; `#N` cells in an epic-body table are deliberately **not** read at all (too loose to promote, #10935) | Never on its own — it may only downgrade `champion-epic.md`'s Step 0 to an operator ask, and it never affects Step 2 |
 
 ```bash
 # Sets EPIC_CHILD_STRONG_{OPEN,CLOSED}, EPIC_CHILD_WEAK_{OPEN,CLOSED},
-# EPIC_CHILD_SOURCES (comma list of the sources that actually contributed).
+# EPIC_CHILD_SOURCES (comma list of the sources that actually contributed),
+# EPIC_CHILD_DISCOVERY_COMPLETE (yes|no — "no" when any source read failed or a
+# list was truncated; the counts are then a lower bound, #10935).
 # $1 = "owner/repo", $2 = epic number.
 discover_epic_children() {
   local repo="$1" num="$2" marker="loom:epic:$2:phase:" srcs=""
+  EPIC_CHILD_DISCOVERY_COMPLETE=yes
+
+  page_full() { [ "$(printf '%s' "$1" | jq 'length' 2>/dev/null || echo 0)" -ge "$2" ]; }
+  local a a_raw
 
   # (a) phase-marker children — the historical source (champion-epic.md Step 3).
-  local a
-  # `gh --jq` takes only an expression (no `--arg`), so the marker — digits and
-  # literals only — is interpolated into the program directly. Includes
+  # Every `gh issue list` below is fetched UNFILTERED and filtered locally with
+  # jq: the truncation check must see the raw page, because a full page whose
+  # marker matches are few would otherwise look short (#10935). Includes
   # loom:frozen children (discovery, not work).
-  a=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
-    --json number,state,body \
-    --jq "[.[] | select(.body | contains(\"$marker\")) | {number, state}]" 2>/dev/null || echo '[]')
+  a_raw=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
+    --json number,state,body 2>/dev/null) \
+    || { a_raw='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  # A full page means the list was cut at --limit: more children may exist.
+  page_full "$a_raw" 500 && EPIC_CHILD_DISCOVERY_COMPLETE=no
+  a=$(printf '%s' "$a_raw" | jq --arg m "$marker" '[.[] | select(.body | contains($m)) | {number, state}]')
 
   # (b) native sub-issues. 404s (→ `[]`) on forges/repos without the API, which
-  # is a legitimate "no evidence", never "no children".
-  local b
+  # is a legitimate "no evidence", never "no children". Any OTHER failure (rate
+  # limit, 5xx, network) is a failed read, not an empty list (#10935).
+  local b berr
+  berr=$(mktemp)
   b=$(gh api "repos/$repo/issues/$num/sub_issues" --paginate \
-    --jq '[.[] | {number, state: (.state | ascii_upcase)}]' 2>/dev/null | jq -s 'add // []')
+    --jq '[.[] | {number, state: (.state | ascii_upcase)}]' 2>"$berr" | jq -s 'add // []')
+  if [ -s "$berr" ] && ! grep -q 'HTTP 404' "$berr"; then
+    b='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no
+  fi
+  rm -f "$berr"
 
   # (c) same-repo task-list entries in the epic body ("- [ ] #123" / "- [x] #123").
   # Resolve each ref's state; cap the fan-out so a pathological body cannot burn
-  # the API budget (a >40-item hand-written epic is already an operator problem).
-  local body refs c='[]'
-  body=$(${GH_READ:-gh} issue view "$num" --repo "$repo" --json body --jq '.body // ""' 2>/dev/null)
-  refs=$(printf '%s\n' "$body" \
+  # the API budget. The cap is never silent: refs beyond it mark discovery
+  # incomplete (#10935).
+  local body refs c='[]' all_refs
+  body=$(${GH_READ:-gh} issue view "$num" --repo "$repo" --json body --jq '.body // ""' 2>/dev/null) \
+    || { body=""; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  all_refs=$(printf '%s\n' "$body" \
     | grep -Eo '^[[:space:]]*[-*][[:space:]]*\[[ xX]\][[:space:]]*#[0-9]+' \
-    | grep -Eo '[0-9]+' | sort -un | head -40)
+    | grep -Eo '[0-9]+' | sort -un)
+  [ "$(printf '%s\n' "$all_refs" | grep -c .)" -gt 100 ] && EPIC_CHILD_DISCOVERY_COMPLETE=no
+  refs=$(printf '%s\n' "$all_refs" | head -100)
+
+  # (f) same-repo refs in the epic's own park record (park-record.md grammar:
+  # `<!-- loom:park Blocked by: #N by=… -->`). Cross-repo refs are skipped here.
+  refs=$(printf '%s\n%s\n' "$refs" "$(printf '%s\n' "$body" \
+    | grep -E '<!-- loom:park Blocked by: #[0-9]+' \
+    | sed -E 's/.*Blocked by: #([0-9]+).*/\1/')" | grep -E '^[0-9]+$' | sort -un)
   for r in $refs; do
     [ "$r" = "$num" ] && continue
     local st
-    st=$(${GH_READ:-gh} issue view "$r" --repo "$repo" --json state --jq '.state' 2>/dev/null) || continue
+    st=$(${GH_READ:-gh} issue view "$r" --repo "$repo" --json state --jq '.state' 2>/dev/null) \
+      || { EPIC_CHILD_DISCOVERY_COMPLETE=no; continue; }
     c=$(printf '%s' "$c" | jq --argjson n "$r" --arg s "$st" '. + [{number:$n, state:$s}]')
   done
+
+  # (e) `<!-- loom:parent #N -->` children. The search is a loose text match; the
+  # jq select re-checks the exact marker so #12 never matches #123.
+  # Search recall on an HTML comment is not guaranteed; `create-issue.sh --parent`
+  # also files a native sub-issue link, so source (b) is the independent fallback.
+  local e e_raw
+  e_raw=$(${GH_READ:-gh} issue list --repo "$repo" --state=all --limit=200 \
+    --search "\"loom:parent #$num\" in:body" --json number,state,body 2>/dev/null) \
+    || { e_raw='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  page_full "$e_raw" 200 && EPIC_CHILD_DISCOVERY_COMPLETE=no
+  e=$(printf '%s' "$e_raw" | jq --arg m "<!-- loom:parent #$num -->" '[.[] | select(.body | contains($m)) | {number, state}]')
 
   # (d) weak: prose references to this epic, no containment claimed.
   local d
   d=$(${GH_READ:-gh} issue list --repo "$repo" --state=all --limit=200 \
-    --search "\"Epic #$num\" in:body" --json number,state --jq '.' 2>/dev/null || echo '[]')
+    --search "\"Epic #$num\" in:body" --json number,state 2>/dev/null) \
+    || { d='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  page_full "$d" 200 && EPIC_CHILD_DISCOVERY_COMPLETE=no
 
   local strong weak
   strong=$(jq -s --argjson e "$num" 'add | map(select(.number != $e)) | unique_by(.number)' \
-    <(printf '%s' "$a") <(printf '%s' "$b") <(printf '%s' "$c"))
+    <(printf '%s' "$a") <(printf '%s' "$b") <(printf '%s' "$c") <(printf '%s' "$e"))
   weak=$(jq -s --argjson e "$num" '(.[0] | map(.number)) as $s
     | .[1] | map(select(.number != $e and (.number | IN($s[]) | not))) | unique_by(.number)' \
     <(printf '%s' "$strong") <(printf '%s' "$d"))
@@ -319,10 +358,18 @@ discover_epic_children() {
   [ "$(printf '%s' "$a" | jq 'length')" -gt 0 ] && srcs="$srcs,phase-marker"
   [ "$(printf '%s' "$b" | jq 'length')" -gt 0 ] && srcs="$srcs,sub-issues"
   [ "$(printf '%s' "$c" | jq 'length')" -gt 0 ] && srcs="$srcs,task-list"
+  [ "$(printf '%s' "$e" | jq 'length')" -gt 0 ] && srcs="$srcs,parent-marker"
   [ "$(printf '%s' "$weak" | jq 'length')" -gt 0 ] && srcs="$srcs,prose-reference"
   EPIC_CHILD_SOURCES="${srcs#,}"
 }
 ```
+
+**An incomplete discovery is never evidence of completion (#10935).** Every
+source read ends in an explicit failure branch, never `|| echo '[]'`, so a failed
+read cannot masquerade as "no children". `EPIC_CHILD_DISCOVERY_COMPLETE=no`
+means the counts are a lower bound; `champion-epic.md` Step 0a then refuses a
+completion candidate. Source (c)'s `- [ ] #N` ref list is capped at 100 and a
+longer list sets the flag instead of truncating silently.
 
 **A source finding nothing is never evidence of completion.** Every counter
 starts at 0, so "no children anywhere" is `STRONG_CLOSED == 0` and both
