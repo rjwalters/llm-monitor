@@ -740,12 +740,24 @@ must never reach it, whatever markers its thread carries (#7666). Keep
 failing structural criteria is a judgement call about shape, never a
 self-clearing dependency wait, so a `Blocked by #N` line is never right here.
 
+List what was counted (#12081): one line per posted rejection (its `html_url`), then one line for the
+unrevised re-entries, linking the verdict comment that carries the tally. The total reads
+`N posted rejection(s) + M unrevised re-entr(ies)`, never "rejected N+M times" — a re-entry
+is a counted non-verdict, and the operator must be able to tell the two apart.
+
 ```bash
 ESCALATE_MARKER="<!-- champion:epic-escalated -->"
+EVALUATIONS_TEXT=$(gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate \
+  --jq '.[] | select(.body | contains("Champion Review: Epic Needs Revision")) | "- posted rejection: " + .html_url')
+[ "$SKIP_STREAK" -gt 0 ] && EVALUATIONS_TEXT="$EVALUATIONS_TEXT
+- $SKIP_STREAK unrevised re-entry(ies), no comment (tally on the verdict comment: $(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.html_url // "link unavailable"'))"
 ./.loom/scripts/post-comment.sh <number> --body "$ESCALATE_MARKER
 **Champion: Escalating to Operator — Epic Rejected Repeatedly Without Revision**
 
-Evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS rejections plus $SKIP_STREAK silent skips of an unchanged epic), but has not been revised to address it. Re-running an identical evaluation each cycle changes nothing, and skipping it silently forever would leave it invisible; escalating is the only move that makes progress.
+Evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS posted rejection(s) + $SKIP_STREAK unrevised re-entry(ies) of an unchanged epic), but has not been revised to address it. Re-running an identical evaluation each cycle changes nothing, and skipping it silently forever would leave it invisible; escalating is the only move that makes progress.
+
+**Evaluations counted:**
+$EVALUATIONS_TEXT
 
 **Recurring findings:**
 - [Criterion that failed, repeated across rejections]: [Specific reason]
