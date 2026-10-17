@@ -2275,15 +2275,15 @@ class OAuthPoller: ObservableObject {
     private static let calibrationAlertLookbackDays = 30
 
     /// How many days a detected step-change alert (#199) stays "current" for
-    /// the menu-bar badge, counted from the alert's own day. Roughly a work
-    /// week: long enough that a badge checked once a day is never missed,
-    /// short enough that a months-old, long-resolved regime does not sit lit
-    /// forever.
+    /// the popover footer notice, counted from the alert's own day. Roughly a
+    /// work week: long enough that a notice checked once a day is never
+    /// missed, short enough that a months-old, long-resolved regime does not
+    /// sit there forever.
     private static let calibrationAlertVisibilityDays = 7
 
     /// Every step-change alert (#199) found in the last
     /// `calibrationAlertLookbackDays` of pool history, oldest first. Read by
-    /// the menu-bar badge (`hasActiveCalibrationAlert`) and by `SelfTest`;
+    /// the popover footer notice (`hasActiveCalibrationAlert`) and by `SelfTest`;
     /// headless mode never reads it — see `evaluateCalibrationAlerts`, which
     /// logs unconditionally and is the entire alert surface there.
     @Published private(set) var calibrationAlerts: [QuotaCalibration.StepChangeAlert] = []
@@ -2294,10 +2294,8 @@ class OAuthPoller: ObservableObject {
     private var lastLoggedCalibrationAlertDay: String?
 
     /// Whether the most recently detected step-change alert (#199) is still
-    /// "current" enough to warrant the menu-bar badge — see
-    /// `calibrationAlertVisibilityDays`. `main.swift` additionally suppresses
-    /// this for a stale primary account, the same rule `AccountFreshness
-    /// .shouldSuppressPercent` already applies to the percent readout.
+    /// "current" enough to show the popover footer notice — see
+    /// `calibrationAlertVisibilityDays`.
     var hasActiveCalibrationAlert: Bool {
         guard let latest = calibrationAlerts.last,
               let alertDay = QuotaCalibration.parseUTCDay(latest.day) else { return false }
@@ -2309,10 +2307,10 @@ class OAuthPoller: ObservableObject {
     /// accumulated calibration history and logs any newly-found alert.
     ///
     /// This is the **entire** alert surface in headless mode (#199): headless
-    /// has no UI to render a badge into, so the log line this writes is the
+    /// has no UI to render a notice into, so the log line this writes is the
     /// only place the alert is ever surfaced there. On macOS, `main.swift`
     /// additionally reads `calibrationAlerts`/`hasActiveCalibrationAlert` from
-    /// the same state to render the menu-bar badge — one evaluation, two
+    /// the same state to render the popover footer notice — one evaluation, two
     /// presentations.
     ///
     /// Called after a successful `recompute`; a failure here is logged and

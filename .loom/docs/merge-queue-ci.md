@@ -1,7 +1,7 @@
 # Merge-Queue CI Qualification
 
 **Issue #10257** (Phase C of #9978). With GitHub's merge queue, Loom would
-enqueue a Judge-approved PR rather than re-dating and merging it directly. That
+enqueue a Judge-approved PR rather than merging it directly. That
 only protects `main` if every suite Loom relies on validates the **combined
 merge-group tree**, meaning the base plus every PR queued ahead of this one. A
 workflow can list `merge_group` as a trigger and still skip the suites that
@@ -9,8 +9,10 @@ matter on it. This document covers the read-only tooling that proves a
 repository's workflows are qualified, the prerequisites for enabling queue mode,
 and how to roll back.
 
-**Status:** this is preparation only. Nothing in Loom enqueues yet: Phases A
-and B, #10255 and #10256, provide the queue controls and the Champion handoff.
+**Status:** queue execution is compiled on (#12323) but opt-in via
+`champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
+controls and the Champion handoff; the `merge_group` check workflow is the
+optional template `defaults/optional/github-workflows/merge-group-check.yml`.
 `rjwalters/loom` is user-owned, and GitHub documents merge queues for
 organization-owned repositories, so this repository is **not eligible** for the
 live pilot. Its `ci.yml` carries a `merge_group` trigger anyway. The trigger is
@@ -108,10 +110,17 @@ A missing or `null` field means "unknown".
 
 - `on.merge_group: types: [checks_requested]` is added. The `push` and
   `pull_request` triggers are unchanged.
-- Every path-filtered job's condition admits `merge_group` exactly like `push`:
+- Every path-filtered job's condition admits `merge_group` unconditionally:
   `github.event_name == 'push' || github.event_name == 'merge_group' ||
   needs.changes.outputs.<group> == 'true'`. A merge group therefore runs the
   full suite. `changes` stays PR-only and carries the marker.
+- The image jobs (`worker-base-image` and the three image smokes) are the one
+  exception on `push` (#10825, [ci-principles](ci-principles.md) rule 3).
+  Their condition puts `github.event_name == 'merge_group' ||` first, so a
+  merge group still runs them unconditionally, while a push runs them only
+  when the `changes` job finds an image input or fails. `changes` never runs
+  on a merge group (it carries the `pr-only` audit marker), so the audit does
+  not count it as a relied-on suite.
 - The concurrency group for a merge-group run is keyed on
   `merge_group.head_sha`, so it can never share a group with a PR run, with
   `main`, or with another merge group. `cancel-in-progress` stays true only
@@ -119,13 +128,16 @@ A missing or `null` field means "unknown".
   ([ci-principles](ci-principles.md) rule 2).
 - The PR-only steps that guard the merged tree also run on `merge_group`, over
   `merge_group.base_sha..head_sha`. These are the version-bearing-file check
-  in `Structural Checks` and the secret scan in `Daemon Checks`.
-- No checkout sets `ref:`, so every checkout lands on `github.sha`, which is
-  the merge-group head.
+  and the secret scan, both in `Lint`.
+- No checkout that runs on `merge_group` sets `ref:`, so every such checkout
+  lands on `github.sha`, which is the merge-group head. (`Detect Changes`
+  checks out the PR base, and does not run on `merge_group`.)
 - Regression tests in `loom-daemon/src/merge_group_ci/tests.rs` audit this
   repository's own workflows against `.loom/config.json`'s required checks.
   They also assert that every job still runs on `push` and may still run on a
-  PR.
+  PR. The exceptions are named explicitly: `changes` (PR and push only), and
+  the four image jobs, which must not be `Skipped` on push and must `Run` on
+  `merge_group`.
 
 ## Enablement prerequisites (all required, in order)
 
@@ -181,15 +193,18 @@ The findings:
   together. They do not reduce Loom's per-PR run count, and this design does
   not assume they do.
 - **Expected cost shape.** Per merged PR, queue mode adds one full
-  `merge_group` run of about 86 runner-minutes and removes the re-date reruns
-  that direct mode pays whenever `main` moves under an approved PR. Whether
+  `merge_group` run of about 86 runner-minutes, and in exchange tests the
+  combined tree that direct mode merges untested when `main` moves under an
+  approved PR (#12063 removed direct mode's re-date reruns). Whether
   that nets out positive is the pilot's question. GitHub fast-forwards `main`
   to the merge-group head, so the `push` run on `main` re-tests an identical
   SHA. Removing that `push` run would be a separate, evidence-gated change and
   is **not** made here: `main` verification stays (rule 2).
-- **Interaction to watch in the pilot:** `version-bump-on-merge.yml` pushes
-  directly to `main` after merges. In a queue-enabled repository, each such
-  push moves the base under every queued entry. The pilot repository must
+- **Interaction to watch in the pilot:** `version-bump-on-merge.yml` lands
+  its bump commit directly on `main` (through the fleet publisher, not a PR), at most once per `RELEASE_MIN_INTERVAL` (24 h by
+  default, #11174; see [`release-cadence.md`](release-cadence.md)). In a
+  queue-enabled repository, each such push moves the base under every queued
+  entry. The pilot repository must
   either route that bump through the queue or measure the rebuild churn it
   causes.
 

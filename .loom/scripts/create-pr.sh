@@ -55,6 +55,10 @@
 #      endpoint takes no labels. A label failure after a successful create
 #      still exits 0 with the URL (the PR exists; re-running would only adopt
 #      it) and names the unapplied labels on stderr.
+#   6. PRIORITY-LABEL COPY (#10518). The priority labels (`loom:important` /
+#      `loom:very-important`, #11103) of every issue the body closes are added
+#      to --label, so a caller passes only `loom:review-requested`. Never for
+#      `Part of #N`.
 #
 # Usage:
 #   create-pr.sh --title TITLE (--body BODY | --body-file PATH) \
@@ -94,6 +98,8 @@
 #       branch than ours (1:1 issue-to-PR review-gate guard, #9453 phase 5).
 #       Stand down instead of pushing a second PR into the same review
 #       pipeline -- message on stderr names the existing PR.
+#   7 - Refused: `buildGate` is enabled and HEAD has no passing
+#       `loom-daemon preflight` receipt (#10476). Run it, fix, re-run.
 #
 # NOTE: GitHub-specific, like create-issue.sh. On a Gitea forge it exits 2 --
 # Gitea has no GitHub App installation tokens, so it has no equivalent
@@ -106,7 +112,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 
 usage() {
-  sed -n '2,81p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,84p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -253,26 +259,22 @@ fi
 # authority -- this is a defense-in-depth pre-check, not the only gate.
 EX_REVIEW_GATE_COLLISION=6
 
-TARGET_ISSUE=""
-if [[ -n "$BODY" ]]; then
-  TARGET_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to)[[:space:]]+#[0-9]+' <<< "$BODY" \
-    | head -1 | grep -oE '[0-9]+' || true)"
-fi
+# An empty body matches nothing (grep's no-match is absorbed by `|| true`).
+TARGET_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to)[[:space:]]+#[0-9]+' <<< "$BODY" \
+  | head -1 | grep -oE '[0-9]+' || true)"
+
+# One daemon resolution, shared by every daemon call below (#10518).
+# shellcheck source=./lib/locate-daemon-bin.sh
+source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
+_cpr_loom_daemon="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
 
 if [[ -n "$TARGET_ISSUE" ]]; then
-  # shellcheck source=./lib/locate-daemon-bin.sh
-  source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
   # requires-daemon: forge optional   #9453 phase 5 -- without a resolvable daemon binary (absent, or predating `forge check-open-pr`, #8551) this pre-check is skipped and `gh pr create` remains the sole authority
-  _cpr_daemon_bin="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
-  if [[ -n "$_cpr_daemon_bin" ]]; then
+  if [[ -n "$_cpr_loom_daemon" ]]; then
     _cpr_opr_rc=0
-    _cpr_opr_pr="$("$_cpr_daemon_bin" forge check-open-pr "$TARGET_ISSUE" 2>/dev/null)" || _cpr_opr_rc=$?
+    _cpr_opr_pr="$("$_cpr_loom_daemon" forge check-open-pr "$TARGET_ISSUE" 2>/dev/null)" || _cpr_opr_rc=$?
     if [[ "$_cpr_opr_rc" -eq 0 && -n "$_cpr_opr_pr" ]]; then
-      _cpr_opr_head_args=(pr view "$_cpr_opr_pr" --json headRefName --jq '.headRefName')
-      if [[ -n "$REPO_NWO" ]]; then
-        _cpr_opr_head_args+=(--repo "$REPO_NWO")
-      fi
-      _cpr_opr_head="$(gh "${_cpr_opr_head_args[@]}" 2>/dev/null || true)"
+      _cpr_opr_head="$(gh pr view "$_cpr_opr_pr" --json headRefName --jq '.headRefName' ${REPO_NWO:+--repo "$REPO_NWO"} 2>/dev/null || true)"
       if [[ -n "$_cpr_opr_head" && "$_cpr_opr_head" != "$HEAD_BRANCH" ]]; then
         echo "create-pr.sh: issue #$TARGET_ISSUE already has an open linked PR: \
 #$_cpr_opr_pr (branch $_cpr_opr_head) — refusing to open a second PR into the \
@@ -289,6 +291,14 @@ close this branch as a duplicate." >&2
   fi
 fi
 
+# --- Pre-PR gate receipt (#10476) ---------------------------------------------
+# requires-daemon: preflight optional   no binary, or one predating `preflight`, skips this (only exit 7, or 8 = a skip-CI marker in a commit #11389, refuses)
+if [[ -n "$_cpr_loom_daemon" ]]; then
+  _cpr_pf_rc=0
+  LOOM_PR_BASE="$BASE_BRANCH" "$_cpr_loom_daemon" preflight --check || _cpr_pf_rc=$?
+  [[ "$_cpr_pf_rc" -ne 7 && "$_cpr_pf_rc" -ne 8 ]] || exit "$_cpr_pf_rc"
+fi
+
 # --- Superseded-target-issue freshness check (#6277) -------------------------
 #
 # Two workers racing on the same issue is not caught today until Judge
@@ -303,11 +313,8 @@ fi
 # partial-increment references for a family/epic issue that intentionally
 # stays open across multiple PRs -- never match this pattern, so those PRs
 # are exempt by construction; no separate carve-out is needed.
-CLOSES_ISSUE=""
-if [[ -n "$BODY" ]]; then
-  CLOSES_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$BODY" \
-    | head -1 | grep -oE '[0-9]+' || true)"
-fi
+CLOSES_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$BODY" \
+  | head -1 | grep -oE '[0-9]+' || true)"
 
 if [[ -n "$CLOSES_ISSUE" ]]; then
   # shellcheck disable=SC2054  # the comma is inside a single --json value, not an array separator
@@ -346,25 +353,24 @@ redundant." >&2
   fi
 fi
 
-# --- Provenance record (#9027, harness-ops D33) ------------------------------
-#
-# Append ONE hidden `<!-- loom:provenance v1 ... -->` line to the body. Its
-# fields, format, and the D32 story choice (from the body's closing refs) are
-# `loom-daemon provenance pr-marker`'s; no format logic lives here. A body that
-# already carries a record at the start of a line (a re-run) is left alone --
-# prose quoting the marker mid-line does not count. With no daemon that knows
-# the subcommand the record is still written, every part the literal
-# `unknown` in its field's shape -- D33 forbids omitting it.
-if [[ $'\n'"$BODY" != *$'\n<!-- loom:provenance '* ]] && source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"; then
-  _unk='<!-- loom:provenance v1 build=unknown unknown unknown prompts=unknown unknown sweep=unknown story=unknown trace=unknown host=unknown base=unknown run=unknown -->'
-  BODY+=$'\n\n'"$("$(loom_resolve_self_daemon_bin 2>/dev/null)" provenance pr-marker --body-file - ${BASE_BRANCH:+--base-ref "origin/$BASE_BRANCH"} <<< "$BODY" 2>/dev/null || echo "$_unk")"
-fi
-
 # --- Create -----------------------------------------------------------------
 
 # #9548: open the PR only on a repo this installation manages and can write,
 # and name it: with no --repo, gh would pick an `upstream` remote over origin.
 REPO_NWO="$(loom_write_repo "${REPO_NWO:-${LOOM_REPO:-}}")" || { echo "create-pr.sh: not opening a PR for $HEAD_BRANCH: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 1; }
+
+# --- Priority labels from the closing issues (#10518) ------------------------
+# The PR carries each priority label (`loom:important` / `loom:very-important`)
+# of every issue its body closes, on the GraphQL and REST paths alike. WHICH
+# issues and labels is `loom-daemon forge priority-labels`'s decision (closing
+# refs + this repo's Loom-Issue trailers; never `Part of #N`); this only
+# appends its output (deduplicated). Fail open: a failed lookup warns, naming
+# the issue; the verb's own warnings go straight to stderr.
+# requires-daemon: forge optional   #10518 -- absent or pre-#10518 binary: the priority label is not copied, with a one-line warning naming the issue
+_cpr_prio="$("${_cpr_loom_daemon:-false}" forge priority-labels --body-file - --repo "$REPO_NWO" <<< "$BODY")" || { _cpr_prio=""
+  [[ -z "$CLOSES_ISSUE" ]] || echo "create-pr.sh: WARNING: issue #$CLOSES_ISSUE was NOT checked for priority labels (no loom-daemon with \`forge priority-labels\`); if it carries loom:important or loom:very-important, add that label to this PR by hand (#10518)" >&2; }
+while IFS= read -r _l; do [[ -z "$_l" || " ${LABELS[*]-} " == *" $_l "* ]] || LABELS+=("$_l"); done <<< "$_cpr_prio"
+
 CREATE_ARGS=(pr create --head "$HEAD_BRANCH" --title "$TITLE" --body "$BODY")
 if [[ -n "$BASE_BRANCH" ]]; then
   CREATE_ARGS+=(--base "$BASE_BRANCH")

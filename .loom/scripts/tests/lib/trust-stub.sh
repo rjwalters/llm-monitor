@@ -71,6 +71,8 @@ if [[ "${1:-} ${2:-}" == "lease renewer" ]]; then
     [[ -n "${LEASE_RENEWER_DAEMON:-}" ]] && exec "$LEASE_RENEWER_DAEMON" "$@"
     d="${LOOM_TEST_STUB_DIR:-/dev/null/x}"
     echo "$*" >> "$d/renewer-args.log" 2> /dev/null
+    # #10348: `renewer-absent` makes the verb unknown, like a binary predating it.
+    [[ ! -f "$d/renewer-absent" ]] || { echo "error: unrecognized subcommand 'renewer'" >&2; exit 2; }
     case "${3:-}" in
         claim)
             [[ ! -f "$d/renewer-claim-pid" ]] || exec cat "$d/renewer-claim-pid"
@@ -78,6 +80,9 @@ if [[ "${1:-} ${2:-}" == "lease renewer" ]]; then
             echo "${2:-}"
             ;;
         check) exit "$(cat "$d/renewer-check-rc" 2> /dev/null || echo 0)" ;;
+        # #10203: a stub answers as a binary predating `sanitize-exec`, so
+        # `start` skips its re-entry and stays fail-open.
+        sanitize-exec) exit 2 ;;
     esac
     exit 0
 fi

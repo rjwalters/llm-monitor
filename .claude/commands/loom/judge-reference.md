@@ -12,7 +12,7 @@ Read the relevant section when `judge.md` points you here.
 
 ## Scoped Test Execution
 
-When running quality checks (step 7), use **scoped test execution** to run only the tests relevant to changed files. This cuts evaluation time while keeping confidence that changed code is correct.
+**CI is the test gate (#11690).** Judge step 2b already confirmed CI green before you checked anything out. Scoped tests are **optional**: run them only for a specific doubt the diff raises, and only the tests relevant to the changed files. Never run the full suite, the doctests or `buildGate.command`; when no scope can be identified, run nothing and rely on CI.
 
 ### Step 1: Detect Changed Files
 
@@ -20,37 +20,17 @@ When running quality checks (step 7), use **scoped test execution** to run only 
 # gh, not local git: avoids exit-128 when the branch is checked out in a
 # worktree or a concurrent builder holds the git lock (#2828).
 CHANGED_FILES=$(gh pr diff $PR_NUMBER --name-only 2>/dev/null)
-# Empty result = detection failed; fall through to the full suite.
+# Empty result = detection failed; run nothing, CI covers it.
 echo "$CHANGED_FILES"
 ```
 
-### Step 2: Check for Config File Changes
-
-If the PR touches configuration files that affect the entire project, **skip scoping and run the full test suite**:
-
-```bash
-# Config files that should trigger full suite
-CONFIG_PATTERNS="pyproject.toml|setup.cfg|setup.py|package.json|pnpm-lock.yaml|yarn.lock|Cargo.toml|Cargo.lock|tsconfig.json|jest.config|vitest.config|.eslintrc|Makefile|CMakeLists"
-
-if echo "$CHANGED_FILES" | grep -qE "($CONFIG_PATTERNS)"; then
-    echo "Config files changed — running full test suite"
-    # Run full suite (skip to Fallback section below)
-fi
-```
-
-### Step 3: Classify Changed Files by Language
+### Step 2: Classify Changed Files by Language
 
 Classify the changed files to determine which scoped test strategies to apply:
 
-| Extension/Path | Language | Scoped Strategy |
-|----------------|----------|-----------------|
-| `.py`, `.pyi` | Python | `pytest --testmon` or full pytest |
-| `.ts`, `.tsx` | TypeScript | `jest --changedSince` or `vitest --changed` |
-| `.js`, `.jsx`, `.mjs`, `.cjs` | JavaScript | `jest --changedSince` or `vitest --changed` |
-| `.rs` | Rust | `cargo test -p <crate>` |
-| Other | Unknown | Full test suite |
+`.py`/`.pyi` Python; `.ts`/`.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs` JS/TS; `.rs` Rust; anything else unknown (CI only).
 
-### Step 4: Run Scoped Tests by Language
+### Step 3: Run Scoped Tests by Language
 
 #### Python Repositories
 
@@ -72,19 +52,16 @@ and prepends its source root(s) to `PYTHONPATH` first. Use it everywhere you wou
 
 ```bash
 # run-tests.sh sets PYTHONPATH automatically when inside a worktree.
-# Use testmon only when its data exists and is <24h old; otherwise full pytest.
+# Use testmon only when its data exists and is <24h old; otherwise name the
+# test files you doubt (`run-tests.sh tests/test_x.py`), or run nothing.
 if ./.loom/scripts/run-tests.sh --co --testmon 2>/dev/null && [ -f .testmondata ] &&
    [ $(( $(date +%s) - $(stat -f %m .testmondata 2>/dev/null || stat -c %Y .testmondata) )) -lt 86400 ]; then
     ./.loom/scripts/run-tests.sh --testmon -x -q
     SCOPED_STRATEGY="pytest-testmon"
 else
-    ./.loom/scripts/run-tests.sh -x -q
-    SCOPED_STRATEGY="full-pytest (testmon missing/stale/not installed)"
+    SCOPED_STRATEGY="none (CI is the gate)"
 fi
 ```
-
-**Recommendation if testmon is unavailable:**
-Note in evaluation comment: "Consider installing `pytest-testmon` (`pip install pytest-testmon`) for faster scoped test execution in future reviews."
 
 #### JavaScript/TypeScript Repositories
 
@@ -97,9 +74,8 @@ if npx jest --version 2>/dev/null; then
 elif npx vitest --version 2>/dev/null; then
     npx vitest run --changed origin/main
     SCOPED_STRATEGY="vitest --changed"
-else   # no scoping tool — run whatever test script is configured
-    npm test 2>/dev/null || pnpm test 2>/dev/null || yarn test 2>/dev/null
-    SCOPED_STRATEGY="full-test-script (no scoping tool detected)"
+else   # no scoping tool: CI runs the suite
+    SCOPED_STRATEGY="none (CI is the gate)"
 fi
 ```
 
@@ -108,54 +84,33 @@ fi
 **Scope to changed crates in workspace projects:**
 
 ```bash
-# Map each changed .rs file to its crate name; fall back to the full workspace.
+# Map each changed .rs file to its crate name; MODULE_FILTER is a test-name
+# filter for the module you doubt (e.g. `preflight`).
+MODULE_FILTER="<module>"
 CHANGED_CRATES=$(echo "$CHANGED_FILES" | grep '\.rs$' | sed 's|/.*||' | sort -u |
     while read -r dir; do
         [ -f "$dir/Cargo.toml" ] && sed -n 's/^name *= *"\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1
     done)
 
-if grep -q '^\[workspace\]' Cargo.toml 2>/dev/null && [ -n "$CHANGED_CRATES" ]; then
-    for crate in $CHANGED_CRATES; do cargo test -p "$crate"; done
-    SCOPED_STRATEGY="cargo test -p ($(echo "$CHANGED_CRATES" | tr '\n' ','))"
+if [ -n "$CHANGED_CRATES" ]; then
+    for crate in $CHANGED_CRATES; do cargo test -p "$crate" --lib "$MODULE_FILTER"; done
+    SCOPED_STRATEGY="cargo test -p ($(echo "$CHANGED_CRATES" | tr '\n' ',')) $MODULE_FILTER"
 else
-    cargo test --workspace   # single crate, or changed files not in an identifiable one
-    SCOPED_STRATEGY="full-cargo-test"
+    SCOPED_STRATEGY="none (CI is the gate)"
 fi
 ```
 
-### Step 5: Fallback to Full Suite
+### Step 4: No Full-Suite Fallback
 
-Run the full test suite when:
-- Config files are changed (detected in step 2)
-- Changed files span unknown languages
-- Scoped tools are not available
-- First run in a repository with no scoping data
+There is none (#11690). Config changes, unknown languages and missing scoping tools all mean the same thing: CI's verdict stands, and `post-verdict.sh` re-checks it on the reviewed head.
 
-```bash
-# Generic fallback — use whatever the project's standard check command is
-pnpm check:ci 2>/dev/null || \
-    npm test 2>/dev/null || \
-    ./.loom/scripts/run-tests.sh 2>/dev/null || \
-    cargo test 2>/dev/null || \
-    make test 2>/dev/null
-SCOPED_STRATEGY="full-suite (fallback)"
-```
-
-### Step 6: Document Strategy in Evaluation Comment
+### Step 5: Document Strategy in Evaluation Comment
 
 **Always log which scoping strategy was used.** Include a "Test Scoping" section in your evaluation comment:
 
-```markdown
-## Test Scoping
+Fields: **Strategy**, **Changed files**, **Scoped result** (selected/passed), and a **Recommendation** only when a scoping tool is missing.
 
-**Strategy**: `pytest-testmon`   <!-- or: `full-suite` (config files changed) -->
-**Changed files**: 3 Python files in `src/utils/`
-**Scoped result**: 12 tests selected, all passed
-**Note**: Full suite has 847 tests; scoped execution covered tests affected by changes.
-**Recommendation**: (only when a scoping tool is missing) install `pytest-testmon`.
-```
-
-When falling back, give the reason on the Strategy line (`full-suite` (config files changed), `full-pytest` (testmon not installed), …) and report the full-suite result instead of a scoped one.
+When nothing ran, say so on the Strategy line (`none (CI is the gate)`).
 
 ### Merge-Base Run for a `TDD: yes` Claim
 
@@ -189,7 +144,7 @@ tdd_merge_base_run() {
 }
 ```
 
-The run command is the Step 4 scoped one narrowed to that path (`run-tests.sh <path>`, `npx vitest run <path>`, `cargo test --test <name>`, `bash <path>`).
+The run command is the Step 3 scoped one narrowed to that path (`run-tests.sh <path>`, `npx vitest run <path>`, `cargo test --test <name>`, `bash <path>`).
 
 **Reading the result.** `VERIFIED` is necessary, not sufficient: confirm from the tail that it failed *for the reason the fix addresses*, not an unrelated import error. `CONTRADICTED` blocks; `UNRUNNABLE` is advisory — name what blocked the run, never record it as verified.
 
@@ -199,11 +154,20 @@ The run command is the Step 4 scoped one narrowed to that path (`run-tests.sh <p
 |----------|----------|
 | PR touches only docs/markdown | Skip test execution entirely (no code changes) |
 | PR touches files in multiple languages | Run scoped tests for each language independently |
-| Scoped tests pass but you suspect missed coverage | Note in evaluation; do not block approval |
 | No test framework detected | Note absence in evaluation; check if project has tests at all |
-| PR touches shared utilities | Scoped tools may miss downstream tests — note this risk in evaluation |
+| PR touches shared utilities | Scoped tools may miss downstream tests — note the risk; suspected missed coverage alone does not block approval |
 
 **Key principle**: Scoped execution is an optimization, not a replacement for CI — the full suite still runs there (step 8 verifies CI status); this just gives the Judge faster local feedback. Duration/confidence comparison: `.loom/docs/judge-reference-rationale.md`.
+
+---
+
+## Rollout check
+
+**Applies only to host-move PRs** (#10917): the diff moves work between hosts or changes who emits a fleet signal (authority, captain, singleton jobs, gating, capability routing; #10498 is the model case). Docs-only, single-host refactor, and ordinary PRs are NOT flagged.
+
+**Request changes** when `## Rollout check` is missing, or vague ("verify in prod"). A passing section names a runnable production signal (SigNoz query, metric, daemon command) and its expected value after the fleet rolls.
+
+On approval, comment it on the linked issue under `<!-- loom:rollout-check-pending pr=<PR> -->`; Champion runs it after the roll. Format and escalation: `.loom/docs/rollout-check.md`.
 
 ---
 

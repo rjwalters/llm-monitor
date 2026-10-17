@@ -506,6 +506,20 @@ struct UsagePopoverView: View {
 
     /// Row count used to size the popover. The setup/empty/error states show a
     /// guide instead of the table, so they size against zero rows.
+    /// The footer's calibration step-change notice (#243), or nil when no alert
+    /// is within its visibility window. The ratio is the recent-window average
+    /// ending on `alert.day`, not that day's own reading, hence the wording.
+    private var calibrationNotice: (text: String, help: String)? {
+        guard oauthPoller.hasActiveCalibrationAlert, let alert = oauthPoller.calibrationAlerts.last else { return nil }
+        let text = "Quota calibration: recent tokens/point fell to "
+            + String(format: "%.2f", alert.ratio) + "\u{00D7} baseline (through \(alert.day.dropFirst(5)))."
+        let help = "Each weekly rate-limit point appears to be costing fewer tokens than the prior "
+            + "baseline median, so quota may have tightened. Points are pool-wide, but tokens come only "
+            + "from this host's Claude Code transcripts, so heavy work on other hosts can look similar. "
+            + "See the Calibration chart for an account."
+        return (text, help)
+    }
+
     private var effectiveRowCount: Int {
         (store.error != nil || store.accounts.isEmpty) ? 0 : store.accounts.count
     }
@@ -729,6 +743,21 @@ struct UsagePopoverView: View {
 
             Divider()
 
+            // Quota-calibration step-change alert (#243) — its own compact
+            // line above the buttons, so the footer's controls and the resize
+            // handle are untouched. `PopoverHeightManager` reserves the height.
+            if let notice = calibrationNotice {
+                Text(notice.text)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.vertical, 4)
+                    .help(notice.help)
+            }
+
             // Footer
             HStack {
                 Button(action: { onAddAccount?() }) {
@@ -785,11 +814,15 @@ struct UsagePopoverView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             heightManager.setVisibleProviders(visibleProviders)
+            heightManager.setCalibrationNotice(calibrationNotice != nil)
             heightManager.update(rowCount: effectiveRowCount)
             clipboardHasAccounts = Self.clipboardContainsAccounts()
         }
         .onReceive(clipboardTimer) { _ in
             clipboardHasAccounts = Self.clipboardContainsAccounts()
+        }
+        .onChange(of: calibrationNotice != nil) { _, shown in
+            heightManager.setCalibrationNotice(shown)
         }
         .onChange(of: effectiveRowCount) { _, newCount in
             heightManager.update(rowCount: newCount)

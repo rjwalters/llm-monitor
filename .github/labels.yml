@@ -12,14 +12,15 @@
 # Sync with: .loom/scripts/sync-labels.sh (from the installed repo root)
 # Or manually: gh label create/edit commands
 #
-# SOURCE OF TRUTH / PARITY CONTRACT (#3896):
+# SOURCE OF TRUTH / PARITY CONTRACT (#3896, #10013):
+#   THIS FILE IS GENERATED from defaults/labels.json (the label registry, the
+#   single source of truth for label semantics). Do NOT edit it by hand: edit
+#   defaults/labels.json, then run `loom-daemon labels generate --write`.
 #   .github/labels.yml (this repo's live label registry) and
 #   defaults/.github/labels.yml (the installer template copied into fresh
-#   installs) are kept BYTE-IDENTICAL. A fresh install must ship exactly the
-#   label set Loom itself uses, so there are NO intentional differences between
-#   the two files. Edit ONE file, then mirror the change to the other so they
-#   match exactly. CI enforces parity via defaults/scripts/check-labels-drift.sh
-#   (installer-tests job) — the build fails on any drift.
+#   installs) are both generated and therefore BYTE-IDENTICAL. CI enforces it
+#   via defaults/scripts/check-labels-drift.sh (installer-tests job) and the
+#   label_registry unit tests — the build fails on any drift.
 
 # Core Workflow States
 - name: loom:triage
@@ -27,10 +28,10 @@
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: "Approved for work. Applied by: humans, Champion, or sweep Approval gate — see curator.md for rule."
+  description: "Approved for work. Applied by: humans, Champion, sweep gate — see curator.md."
   color: "3B82F6"  # blue-500
 
-# DEPRECATED: loom:in-progress removed (use role-specific labels)
+# Role-specific claim labels (they replaced one shared in-progress label):
 # - loom:building (Builder implementing issue)
 # - loom:curating (Curator enhancing issue)
 # - loom:reviewing (Judge reviewing PR)
@@ -87,11 +88,11 @@
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:reviewing
-  description: "Judge is reviewing this PR. Applied by: Judge only. Stale after LOOM_STALE_REVIEWING_MINUTES (30m)."
+  description: "Judge is reviewing this PR. Applied by: Judge only. Stale after LOOM_STALE_REVIEWING_MINUTES (45m)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:evaluating
-  description: "Champion is evaluating this proposal (claim label, stale after 15m). Applied by: Champion only."
+  description: "Champion is evaluating this proposal (claim label, stale after 45m). Applied by: Champion only."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:review-requested
@@ -106,8 +107,21 @@
   description: "PR has merge conflicts requiring resolution"
   color: "DC2626"  # red-600 - indicates broken state
 
+# loom:sequenced (#9378) is the durable "approved, but not yet" ordering hold:
+# NOT an escalation (loom:operator means a human must rule; a landing order
+# does not) and NOT loom:blocked (an issue-status label that is not a merge
+# gate). The label is refused by merge-pr.sh's verdict-contradiction guard
+# beside loom:pr, with the same no-override treatment. The condition it waits
+# on lives in a trusted `<!-- loom:sequence after=… pred_head=… follower_head=…
+# plan=… -->` marker on the PR, evaluated by `loom-daemon merge-pr
+# sequence-eval`; clearing is REMOVING THE LABEL once the recorded predecessor
+# has landed at the recorded head — a mechanical condition, never a memory.
+- name: loom:sequenced
+  description: "Approved, but sequenced behind another PR. Applied by: the sequencing pass or an operator."
+  color: "A16207"  # yellow-700 - a scheduling hold, one shade apart from the in-progress ambers and the operator orange
+
 - name: loom:auto-merge-ok
-  description: Override a Champion merge-risk hold (applied by Judge or human)
+  description: "Override a Champion merge-risk hold (applied by Judge or human)"
   color: "10B981"  # emerald-500 - signals safe to proceed
 
 - name: loom:ci-failure
@@ -132,7 +146,7 @@
   color: "d93f0b"  # red - indicates runtime/build issue
 
 - name: loom:auditor-capability-request
-  description: Auditor capability request for enhanced validation tooling
+  description: "Auditor capability request for enhanced validation tooling"
   color: "6366F1"  # indigo-500 - indicates meta/tooling request
 
 - name: loom:curated
@@ -140,117 +154,121 @@
   color: "10B981"  # emerald-500
 
 # Status Labels
+# loom:blocked: waiting on something named, released when it resolves. Applied
+# with `loom-daemon park-record apply` (a park record in the body). Two shapes
+# need no other change to clear (#11861): a capability-only park (a
+# <!-- loom:capability=<name> --> marker, no named blocker, no decision block),
+# which a host holding that capability may attempt in propose-only mode
+# (#6893); and Champion's merge-risk / critical-file PR hold, the ONE shape in
+# which loom:pr may coexist with loom:blocked (a reason-only park record plus
+# Champion's hold-state marker comment). Champion re-evaluates and releases
+# that hold; merge-pr.sh still refuses to merge while it stands.
 - name: loom:blocked
-  description: Implementation blocked, needs help or clarification
+  description: "Waiting on something named (another change, a capability); released once it resolves"
   color: "EF4444"  # red-500
 
-- name: loom:urgent
-  description: Critical/blocking issue requiring immediate attention
-  color: "DC2626"  # red-600
+# loom:blocked-unnamed (#10558): a queue marker, NOT a park label. It coexists
+# with loom:blocked. Applied by the daemon tick to an open loom:blocked issue
+# that names no blocker and states no reason; removed by Curator after it names
+# the blocker, records a reason, or releases the block.
+- name: loom:blocked-unnamed
+  description: "loom:blocked names no blocker: queued for Curator to name it or release it"
+  color: "F87171"  # red-400
 
 - name: loom:abort
-  description: Signal to abort the sweep for this issue (returns to loom:issue)
+  description: "Signal to abort the sweep for this issue (returns to loom:issue)"
   color: "F97316"  # orange-500 - warning/signal color
 
-# loom:operator-only vs loom:blocked: operator-only = a human must act or rule
-# OUTSIDE automation (credentials, infra, hardware, or an owner-gated decision
-# on owner-tracked code) and sweep skips it entirely;
-# blocked = waiting on a dependency but otherwise automatable. Keep the
-# description at/under GitHub's 100-char label-description limit so sync-labels.sh
-# can create it (a longer description fails with HTTP 422 and the label never syncs).
-- name: loom:operator-only
-  description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
-  color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
+- name: loom:decision-malformed
+  description: "Decision bounced for a missing/invalid decision block; Curator repairs or re-routes (#10057)"
+  color: "C2410C"  # orange-700 - the decision family
 
-# loom:needs-capability (#5817): a narrower claim than loom:operator-only —
-# blocked on a missing tool/agent capability, not an operator-by-right
-# decision. Skips sweep identically to loom:operator-only today (same
-# hard-skip rows in sweep.md and the same warn-operator-gated.sh
-# dependency-declared check); the routing convention for when to apply this
-# vs. loom:operator-only is out of scope here (see #5818). Keep the
-# description at/under GitHub's 100-char label-description limit — see the
-# comment above loom:operator-only.
-- name: loom:needs-capability
-  description: "Blocked on a missing tool/agent capability, not operator-by-right; link the capability-request issue"
-  color: "FDE68A"  # amber-200 - distinct from the operator-only orange family
-
-# loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was
-# carrying at least four meanings with no mechanical way to tell them apart —
-# these four ALWAYS accompany `loom:operator-only` (never replace it; every
-# existing filter/skip that keys off the base label is unaffected) and record
-# WHICH kind at the point of application. Exactly one of the four is applied
-# per issue/PR. See .loom/docs/label-state-machine.md "operator-only sub-kinds"
-# for the full decision table and the machine-readable-blocker convention.
-# NOTE (#5826): loom:operator-decision is no longer the safe unsure-default —
-# being unsure is a sign the analysis is incomplete, not a reason to apply the
-# label. Only apply loom:operator-only once a specific sub-kind fits.
-# NOTE (#6881, updated #6893): loom:operator-mechanical's "no judgement
-# required" describes the WORK. The base loom:operator-only label's hard skip
-# still wins for every sub-kind by default -- with ONE narrow, fail-closed
-# exception since #6893: a mechanical item whose body declares
-# `<!-- loom:capability=<name> -->` marker(s) (#6892) that the executing HOST
-# holds (LOOM_WORKER_CAPABILITIES, env-only) is routed to a PROPOSE-ONLY lane
-# instead of parked -- it emits the commands / a PR for an operator to
-# approve, never a live credentialed action. The other three sub-kinds are
-# unchanged and hard-skip unconditionally, marker or no marker.
-- name: loom:operator-blocked
-  description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
-  color: "FDBA74"  # orange-300 - lightest: transient, expected to clear on its own
-
-# A loom:operator-mechanical item may additionally declare the capability(ies)
-# it needs via `<!-- loom:capability=<name> -->` marker(s) in its body (#6892)
-# -- meaningful only alongside THIS sub-kind, ignored by the other three. See
-# .loom/docs/label-state-machine.md "Capability-declaration convention" for
-# the closed vocabulary and parser contract, and its "Dispatch path (#6893)"
-# subsection for the four gates that consume it.
-- name: loom:operator-mechanical
-  description: "operator-only sub-kind: no judgement needed; parks unless a declared capability is held (#6893)"
-  color: "FB923C"  # orange-400
-
-- name: loom:operator-decision
-  description: "operator-only sub-kind: preference/authority axis named; not a safe default (#5826)"
-  color: "C2410C"  # orange-700 - darkest
-
-- name: loom:operator-objective
-  description: "operator-only sub-kind: determined once operator states objective; lists candidates"
-  color: "FED7AA"  # orange-200 - lightest of all: clears on a single stated preference
-
-# loom:operator is the first-class "a human is needed" pipeline state (#5502):
-# the engine (any role, plus sweep/shepherd dispatch) will not act on this
-# item further until a human does. It differs from BOTH neighbors above:
-# vs. loom:operator-only — operator-only tells sweep/shepherd to SKIP the item
-# entirely; loom:operator does not — the item stays in the normal
-# re-evaluation queue so a role's own exit rule (e.g. Champion's head-SHA
-# precheck, an explicit human comment, or a new artifact) can still clear it
-# automatically. vs. loom:blocked — blocked means "waiting on a dependency,
-# still automatable"; loom:operator means "the engine has stopped and only a
-# human moves it forward." See .loom/docs/label-state-machine.md for the full
-# entry/exit model.
+# Holds (#11795): three labels, one meaning each. loom:blocked = waiting on
+# something named (another change, a capability), released automatically;
+# loom:operator = a human must act or decide now; loom:frozen = not now.
+#
+# loom:operator is the "a human is needed" state (#5502). It is a no-op for
+# every role (#11861): a park on issues AND pull requests, so no dispatch
+# route and no Curator, Champion, Judge, Doctor or Builder step acts on it
+# until a human removes the label. What the human must do comes from the
+# body, not a sub-label: a ```decision block (#10057) makes it a decision. It
+# folds the retired loom:operator-only, -decision, -mechanical and -blocked
+# labels (a named blocker stays in the body text).
+# Applied by any role escalating to a human, by `loom-daemon operator-decision
+# apply`, by merge-pr.sh's #8508 escalation
+# (defaults/docs/merge-pr-exit-code-exceptions.md) and by its
+# partial-increment reset (#9264) when the issue body carries a
+# `loom:remainder-hold` marker. Removed by a human. Champion's merge-risk and
+# critical-file PR holds are loom:blocked, not this label (#11861).
+# Requires a stated reason class: defaults/docs/label-state-machine.md
+# § "Routing to a human".
 - name: loom:operator
-  description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
-  color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
+  description: "A human must act or decide; the body's decision block says what. Only a human removes it."
+  color: "EA580C"  # orange-600 - operator-action signal
+
+# loom:frozen (#11743) means "not now, don't touch": nothing is pending, so
+# nothing re-evaluates it. Unlike loom:blocked (waiting on something, released
+# automatically) no agent or daemon path reads it as work, comments on it,
+# relabels it or dispatches it. A human applies it and only a human removes it.
+# It is a park, a skip and a hard exclusion (hard-exclusion-labels.sh).
+- name: loom:frozen
+  description: "Not now, don't touch: no agent or daemon path acts on it. Humans apply and remove it."
+  color: "94A3B8"  # slate-400 - inert, not an action signal
+
+# loom:important (#11103) is the middle of Loom's three priority levels (none /
+# important / very important). Within a workspace the queue order is level,
+# then oldest createdAt, then issue number. NOT a hold, never inherited by the
+# daemon: whoever sets the priority labels a blocker too. Applied by / removed
+# by: the operator, Guide and Champion alike.
+- name: loom:important
+  description: "Priority 2 of 3: taken before unlabeled work, not a hold. Applied by: operator, Guide, Champion."
+  color: "CA8A04"  # yellow-600 - the middle priority level
+
+# loom:very-important (#11103) is the top priority level. A workspace holding
+# dispatchable very-important work wins the workspace draw. Capped at one per
+# workspace (#11509): only the oldest open one counts, the rest rank as
+# loom:important, enforced at dispatch (see priority-model.md). NOT a hold,
+# never inherited by the daemon. Applied by / removed by: the operator, Guide
+# and Champion alike.
+- name: loom:very-important
+  description: "Priority level 3 of 3: wins the workspace draw. Capped at 1 per workspace; extras rank important."
+  color: "B45309"  # amber-700 - one shade above important
 
 # Epic Labels
 - name: loom:epic
-  description: Multi-phase epic proposal (decomposes into implementation issues)
+  description: "Multi-phase epic proposal (decomposes into implementation issues)"
   color: "7C3AED"  # violet-600 - distinguishes from regular proposals
 
 - name: loom:epic-phase
-  description: Issue is part of an epic phase (references parent epic)
+  description: "Issue is part of an epic phase (references parent epic)"
   color: "8B5CF6"  # violet-500 - lighter variant for child issues
 
-# Tier Labels (Goal Alignment)
-- name: tier:goal-advancing
-  description: Directly implements a milestone deliverable or unblocks goal work
-  color: "0E8A16"  # green - highest priority
+# Story-Point Size Labels (#9431, epic #9429; restarted by #11659).
+# Projected by loom-daemon curation-complete from the Curator's points marker.
+# The rubric lives in .loom/docs/story-points.md.
+- name: points:1
+  description: "Story-point size class 1. Applied by: Curator via loom-daemon curation-complete."
+  color: "06B6D4"  # cyan-500 - story-point size family
 
-- name: tier:goal-supporting
-  description: Infrastructure, testing, or docs for milestone features
-  color: "FBCA04"  # yellow - medium priority
+- name: points:2
+  description: "Story-point size class 2. Applied by: Curator via loom-daemon curation-complete."
+  color: "06B6D4"  # cyan-500 - story-point size family
 
-- name: tier:maintenance
-  description: Cleanup, refactoring, or improvements not tied to current goals
-  color: "D4C5F9"  # purple - lower priority
+- name: points:3
+  description: "Story-point size class 3. Applied by: Curator via loom-daemon curation-complete."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:5
+  description: "Story-point size class 5. Applied by: Curator via loom-daemon curation-complete."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:8
+  description: "Story-point size class 8. Applied by: Curator via loom-daemon curation-complete."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:13
+  description: "Story-point size class 13, the largest. Applied by: Curator via loom-daemon curation-complete."
+  color: "06B6D4"  # cyan-500 - story-point size family
 
 # External Contribution Gate
 # Not part of the loom: workflow. A non-collaborator submission needs maintainer

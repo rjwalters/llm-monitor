@@ -1069,19 +1069,21 @@ enum QuotaCalibration {
     ///   - minBaselineDays: minimum populated baseline days required before a
     ///     day is evaluated at all (default 7, half of `baselineWindowDays`).
     ///   - threshold: the alert threshold (default 1.5, #199's ask).
+    ///   - eligibilityFraction: see `alertEligibilityFraction`; `0` disables
+    ///     the eligibility filter (the pre-#243 rule).
     static func evaluateStepChangeAlerts(
         poolRows: [DailyRow],
         recentWindowDays: Int = 3,
         baselineWindowDays: Int = 14,
         minBaselineDays: Int = 7,
-        threshold: Double = 1.5
+        threshold: Double = 1.5,
+        eligibilityFraction: Double = alertEligibilityFraction
     ) -> [StepChangeAlert] {
         guard threshold > 0, recentWindowDays > 0, baselineWindowDays > 0 else { return [] }
 
-        let values: [(day: String, value: Double)] = poolRows
-            .filter { $0.scope == .pool }
-            .sorted { $0.day < $1.day }
-            .compactMap { row in row.rawTokensPerPoint.map { (row.day, $0) } }
+        let values = alertEligibleValues(
+            poolRows: poolRows, baselineWindowDays: baselineWindowDays,
+            minHistory: minBaselineDays, fraction: eligibilityFraction)
 
         guard values.count >= recentWindowDays else { return [] }
         let disarmRatio = 1.0 / threshold
@@ -1114,6 +1116,53 @@ enum QuotaCalibration {
             }
         }
         return alerts
+    }
+
+    /// A positive tokens/point below this fraction of the prior eligible
+    /// median is not an observation of quota cost at all (#243): points are
+    /// pool-wide but `token_usage` holds only *this* host's transcripts, so a
+    /// day whose work ran elsewhere shows points going with almost no tokens
+    /// (reported: 3.4k against a ~2M baseline, i.e. ~0.2%). 1% sits well
+    /// under any real step the alert exists to catch (the ordinary threshold
+    /// is 1/1.5 = 67%) and well over that incident's ~0.2%. It is an
+    /// engineering threshold, not a measured coverage guarantee.
+    static let alertEligibilityFraction = 0.01
+
+    /// The alert's *inputs*: pool rows' `rawTokensPerPoint`, oldest first,
+    /// minus ineligible observations. Stored rows, charts and exports are
+    /// never filtered — only what `evaluateStepChangeAlerts` sees.
+    ///
+    /// Excluded: a missing, zero, negative or non-finite ratio, and (when
+    /// `fraction > 0`) a positive ratio below `fraction` of the median of
+    /// the up-to-`baselineWindowDays` most recent *eligible* earlier
+    /// observations — judged only against earlier days, and only once
+    /// `minHistory` of them exist (before that nothing can be judged, so
+    /// everything positive is kept). Equal to the cutoff is eligible.
+    ///
+    /// Windows are then built over the eligible sequence, not calendar days:
+    /// a gap (a day with no eligible reading) is simply closed up, so the
+    /// recent window may span more than three calendar days. Skipped days
+    /// never touch the alert latch; only eligible values can arm or disarm it.
+    ///
+    /// Limitations: a relative cutoff cannot see an extreme *real* drop below
+    /// 1% of baseline (it is dropped as partial coverage), and cannot detect
+    /// persistently partial coverage — once the baseline itself is low, low
+    /// readings are the norm. A day excluded here never raises the baseline
+    /// either, so a long run of ineligible days leaves the prior median in
+    /// force.
+    static func alertEligibleValues(
+        poolRows: [DailyRow], baselineWindowDays: Int, minHistory: Int, fraction: Double
+    ) -> [(day: String, value: Double)] {
+        var eligible: [(day: String, value: Double)] = []
+        for row in poolRows.filter({ $0.scope == .pool }).sorted(by: { $0.day < $1.day }) {
+            guard let value = row.rawTokensPerPoint, value.isFinite, value > 0 else { continue }
+            if fraction > 0, eligible.count >= minHistory {
+                let prior = eligible.suffix(baselineWindowDays).map(\.value)
+                if value < fraction * median(prior) { continue }
+            }
+            eligible.append((row.day, value))
+        }
+        return eligible
     }
 
     /// The median of `values`. `values` must be non-empty (every call site

@@ -160,6 +160,9 @@ enum SelfTest {
         testCalibrationStepChangeAlertFiresOnceOnReferenceSeries()
         testCalibrationStepChangeAlertIgnoresSubThresholdMove()
         testCalibrationStepChangeAlertNoDataNoAlert()
+        testCalibrationAlertIgnoresNearEmptyTokenDays()
+        testCalibrationAlertEligibilityBoundaries()
+        testCalibrationAlertLatchRearmsAndIgnoresSkippedDays()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
         testExportAccountsEnvExcludesTokenlessCodexAccount()
@@ -5390,6 +5393,133 @@ enum SelfTest {
         }
         expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: sparse).count, 0,
                     "fewer days than the recent window itself produces no alerts")
+    }
+
+    // MARK: - Calibration alert input eligibility (#243)
+
+    /// A pool row whose ratio is *derived* from its totals, as `makeRow` does
+    /// (`tokens / points`, absent when there are no tokens), so fixtures stay
+    /// internally consistent instead of assigning a ratio from nowhere.
+    private static func calibrationPoolRow(
+        day: String, points: Double, tokens: Double?
+    ) -> QuotaCalibration.DailyRow {
+        let ratio: Double? = tokens.flatMap { $0 > 0 && points > 0 ? $0 / points : nil }
+        return QuotaCalibration.DailyRow(
+            day: day, scope: .pool, accountId: nil, pointsConsumed: points,
+            accountsReporting: 20, pointsPerAccount: points / 20,
+            tokens: nil, costUSD: nil, costEquivalentTokens: nil,
+            rawTokensPerPoint: ratio, costEquivalentTokensPerPoint: nil, costUSDPerPoint: nil,
+            weightsVersion: "test", computedAt: "")
+    }
+
+    /// `count` consecutive UTC days starting at `start` (`YYYY-MM-DD`).
+    private static func calibrationDays(from start: String, count: Int) -> [String] {
+        let first = QuotaCalibration.parseUTCDay(start)!
+        return (0..<count).map { QuotaCalibration.utcDayString(first.addingTimeInterval(Double($0) * 86_400)) }
+    }
+
+    /// Rows with the given tokens/point, one per day from `start`.
+    private static func calibrationRatioRows(from start: String, _ ratios: [Double?]) -> [QuotaCalibration.DailyRow] {
+        zip(calibrationDays(from: start, count: ratios.count), ratios).map { day, ratio in
+            var row = calibrationPoolRow(day: day, points: 100, tokens: ratio.map { $0 * 100 })
+            if let ratio, !ratio.isFinite || ratio <= 0 {
+                row = QuotaCalibration.DailyRow(
+                    day: day, scope: .pool, accountId: nil, pointsConsumed: 100, accountsReporting: 20,
+                    pointsPerAccount: 5, tokens: nil, costUSD: nil, costEquivalentTokens: nil,
+                    rawTokensPerPoint: ratio, costEquivalentTokensPerPoint: nil, costUSDPerPoint: nil,
+                    weightsVersion: "test", computedAt: "")
+            }
+            return row
+        }
+    }
+
+    /// The reported 2026-10-03..10-06 shape (#243) after an adequate
+    /// prehistory (14 days at the logged 2,143,750.3 tokens/point). The
+    /// pre-#243 rule (`eligibilityFraction: 0`) alerts on 10-05 at ratio
+    /// 0.5039; the near-empty 10-05 day (0.76M tokens for 221 points) is
+    /// excluded by the default rule, which then stays quiet. The stored rows
+    /// are not touched either way.
+    private static func testCalibrationAlertIgnoresNearEmptyTokenDays() {
+        var rows = calibrationDays(from: "2026-09-19", count: 14).map {
+            calibrationPoolRow(day: $0, points: 200, tokens: 2_143_750.3 * 200)
+        }
+        rows += [
+            calibrationPoolRow(day: "2026-10-03", points: 192, tokens: 210_000_000),
+            calibrationPoolRow(day: "2026-10-04", points: 162, tokens: nil),
+            calibrationPoolRow(day: "2026-10-05", points: 221, tokens: 760_000),
+            calibrationPoolRow(day: "2026-10-06", points: 377, tokens: 2_360_000_000),
+        ]
+        let original = QuotaCalibration.evaluateStepChangeAlerts(poolRows: rows, eligibilityFraction: 0)
+        expectEqual(original.map(\.day), ["2026-10-05"],
+                    "without the eligibility filter, the near-empty 10-05 day raises the false alert")
+        if let ratio = original.first?.ratio {
+            expect(abs(ratio - 0.5039) < 0.001, "the unfiltered false alert's ratio is ~0.504, got \(ratio)")
+        }
+        expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: rows).count, 0,
+                    "the near-empty 10-05 day (and the day with no tokens) must not feed the alert")
+        expectEqual(rows.count, 18, "the filter never removes stored rows")
+        expect(rows[16].rawTokensPerPoint != nil, "the near-empty day's stored ratio is retained")
+    }
+
+    /// Pins `alertEligibleValues`' edges: missing/zero/negative/non-finite
+    /// ratios, the cutoff itself (equal is eligible), and too little prior
+    /// eligible history to judge anything.
+    private static func testCalibrationAlertEligibilityBoundaries() {
+        func eligible(_ ratios: [Double?]) -> [Double] {
+            QuotaCalibration.alertEligibleValues(
+                poolRows: calibrationRatioRows(from: "2026-01-01", ratios),
+                baselineWindowDays: 14, minHistory: 7,
+                fraction: QuotaCalibration.alertEligibilityFraction).map(\.value)
+        }
+        let prior = [Double?](repeating: 100, count: 7)
+
+        expectEqual(eligible(prior + [nil, 0, -5, .nan, .infinity, -.infinity]), prior.compactMap { $0 },
+                    "missing, zero, negative and non-finite ratios are never eligible")
+        expectEqual(eligible(prior + [1.0]).count, 8,
+                    "exactly 1% of the prior median is eligible (the cutoff is strict <)")
+        expectEqual(eligible(prior + [0.999]).count, 7,
+                    "just below 1% of the prior median is excluded")
+        expectEqual(eligible(prior + [0.999, 100]).count, 8,
+                    "an excluded day does not enter the baseline, later days are judged normally")
+        expectEqual(eligible([Double?](repeating: 100, count: 6) + [0.001]).count, 7,
+                    "with fewer than minHistory prior eligible days nothing is judged, so a small value is kept")
+        expectEqual(QuotaCalibration.alertEligibleValues(
+                        poolRows: calibrationRatioRows(from: "2026-01-01", prior + [0.001]),
+                        baselineWindowDays: 14, minHistory: 7, fraction: 0).count, 8,
+                    "fraction 0 disables the filter")
+
+        // Insufficient eligible history: 3 recent + only 6 eligible baseline
+        // days (the rest near-empty/missing) never evaluates, however steep.
+        let thin = calibrationRatioRows(
+            from: "2026-02-01", [100, 100, 100, 100, 100, 100, nil, nil, 1, 1, 1])
+        expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: thin).count, 0,
+                    "fewer than minBaselineDays eligible baseline observations suppresses evaluation")
+    }
+
+    /// A genuine drop alerts once, recovery re-arms the latch, a second
+    /// genuine drop alerts again, and ineligible days sprinkled in while
+    /// disarmed neither re-arm it nor fire anything of their own.
+    private static func testCalibrationAlertLatchRearmsAndIgnoresSkippedDays() {
+        let healthy = [Double?](repeating: 100, count: 20)
+        let drop = [Double?](repeating: 40, count: 5)
+        let recovery = [Double?](repeating: 100, count: 20)
+
+        let twice = calibrationRatioRows(from: "2026-03-01", healthy + drop + recovery + drop)
+        expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: twice).count, 2,
+                    "a second genuine drop after a full recovery alerts again")
+
+        // Skipped days inside the depressed run: 0.5 is < 1% of the ~100
+        // median, so it is excluded; nil/NaN are excluded outright.
+        let noisy = calibrationRatioRows(
+            from: "2026-03-01", healthy + [40, 0.5, nil, .nan, 40, 0.5, 40, 40, 40])
+        let alerts = QuotaCalibration.evaluateStepChangeAlerts(poolRows: noisy)
+        expectEqual(alerts.count, 1,
+                    "skipped observations neither re-arm the latch nor raise a second alert")
+        // Near-empty days alone on a healthy series never alert.
+        let sparse = calibrationRatioRows(
+            from: "2026-03-01", healthy + [0.5, 0.5, 0.5, 0.5, nil, 0, .nan])
+        expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: sparse).count, 0,
+                    "only near-empty/invalid days after a healthy baseline raise nothing")
     }
 
     // MARK: - OpenAI import account resolution

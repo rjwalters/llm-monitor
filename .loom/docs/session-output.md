@@ -127,7 +127,7 @@ contract-tested against the collector allowlist by
 | `loom.session.output.redaction` | Producer redaction policy that produced the body. |
 | `loom.session.output.producer_lag_ms` | `observed_at - source_at` for this one record. |
 | `loom.session.output.lag_p50_ms` / `.lag_p95_ms` / `.lag_max_ms` / `.lag_samples` / `.lag_historical_excluded` | Run-level producer-lag distribution. **Status records only.** See [Latency](#latency). |
-| `loom.session.output.launch` | `daemon` · `attended`: who started the agent. Present on every record; a payload queued before #10116 decodes as `daemon`. See [Attended runs](#attended-runs-10116). |
+| `loom.session.output.launch` | `daemon` · `attended`: who started the agent. Present on every record; a payload queued before #10116 decodes as `daemon`. A record already exported before #10116 has no `launch` attribute at all, so a consumer filtering on `launch = daemon` should treat an absent attribute as `daemon`. See [Attended runs](#attended-runs-10116). |
 
 ### Ordering and de-duplication
 
@@ -208,15 +208,16 @@ out instead of keeping a healthy run's p95 red forever.
 
 ### Querying end-to-end latency
 
-In SigNoz (ClickHouse `signoz_logs`), use `created_at` — the backend's **own
-insert clock** — as the observation time. Three clocks are in play and only two
+In SigNoz (ClickHouse `signoz_logs`), use `inserted_at_unix_milli` — the backend's
+**own insert clock** (`Int64` epoch ms; the store owner adds it, see `telemetry-replay.md`;
+SigNoz's stock logs tables have none, checked 2026-10-11) — as the observation time. Three clocks are in play and only two
 of them are the producer's:
 
 | Column | Clock | Meaning |
 |---|---|---|
 | `timestamp` | source | when the agent emitted it |
 | `observed_timestamp` | producer | when the producer read it |
-| `created_at` (or `inserted_at`) | backend | when it became queryable |
+| `inserted_at_unix_milli` | backend | when it became queryable |
 
 > **Do not use `now64()` as the observation time.** `now64() - timestamp`
 > measures how *old the row is at query time*, not how long it took to arrive —
@@ -226,7 +227,7 @@ of them are the producer's:
 
 ```sql
 -- Source-to-queryable latency, end to end AND pipeline-only, over the last hour.
--- `created_at` is the backend's insert clock, so the result does not drift with
+-- `inserted_at_unix_milli` is the backend's insert clock, so the result does not drift with
 -- when the query is run.
 --
 -- Both time filters are load-bearing. The `timestamp` bound keeps a replayed
@@ -241,8 +242,8 @@ SELECT
   round(quantile(0.95)(pipeline_ms))  AS pipeline_p95_ms
 FROM (
   SELECT
-    toUnixTimestamp64Milli(created_at) - intDiv(timestamp, 1000000)          AS e2e_ms,
-    toUnixTimestamp64Milli(created_at) - intDiv(observed_timestamp, 1000000) AS pipeline_ms
+    inserted_at_unix_milli - intDiv(timestamp, 1000000)          AS e2e_ms,
+    inserted_at_unix_milli - intDiv(observed_timestamp, 1000000) AS pipeline_ms
   FROM signoz_logs.distributed_logs_v2
   WHERE attributes_string['loom.session.output.event_id'] != ''
     AND attributes_string['loom.session.output.category'] IN ('output','tool_start','tool_finish')
@@ -475,6 +476,15 @@ as a `backlog_skipped` gap, exactly as the daemon does.
 **How it ends.** With a `coverage = ended` record, at the first of:
 
 - the end of its lines (above);
+- for a foreground subagent, its parent recording its result: the
+  `tool_result` for the `toolUseId` in the subagent's `.meta.json` appears in
+  the parent's transcript, written after the tailer attached (#10125). The
+  watched pid is the operator's session, which outlives the subagent, so
+  without this a finished subagent's run stayed open until the idle limit.
+  Measured on 377 foreground subagents, the parent writes the result 0.04 s
+  (median) to 0.17 s (max) after the subagent's last line. A background
+  subagent's result is written at launch, so only `requestShape = foreground`
+  is watched;
 - the watched session process (`--watch-pid`, `lease ensure`'s own) exiting;
 - 30 minutes with no change to the transcript;
 - 4 hours, the lease renewer's cap.
@@ -482,7 +492,12 @@ as a `backlog_skipped` gap, exactly as the daemon does.
 The tailer then lets go of the transcript, so a newer claim can take it over
 at once. It drains for at most 5 s and removes its queue, lock and claim
 files. Queue files are per tailer process. A tailer also removes any queue
-files that an earlier, dead tailer of the same transcript left behind. A tail it could not deliver is dropped with its queue: a tailer has no
+files that an earlier, dead tailer of the same transcript left behind, and
+every configured start sweeps the state directory for a killed tailer's
+leftovers: lock files whose `flock` is free, queue files whose tailer process
+is gone, and claim files older than 4 hours whose lock is free. A held lock
+is never removed. A start whose spawn fails removes the lock it probed (#10125).
+A tail it could not deliver is dropped with its queue: a tailer has no
 next boot to drain it on. After a run ends at the agent's next task, coverage
 resumes only when the agent runs a claim step again.
 
@@ -500,7 +515,11 @@ resumes only when the agent runs a claim step again.
 | `loom.session_kind` | `sweep` (the run names an issue) |
 
 **When it does nothing.** Each of these is a silent no-op with one stderr
-line naming the reason, and the session carries on unchanged:
+line naming the reason, and the session carries on unchanged. `worktree.sh`
+discards that stderr, so every start outcome, including a successful one, is
+also written to `<repo>/.loom/logs/live-output-attended/last-start.log` as
+`<UTC time> <the same line>`, replacing the previous start's (#10125). Read
+it when an issue's log panel stays empty:
 
 - the agent was launched by the daemon (`LOOM_WORK_ORIGIN=autonomous`,
   `LOOM_SWEEP_ID`, or a GitHub Actions run), whose own producer covers it;
@@ -593,10 +612,10 @@ shape. Specific to this feature:
 cargo test -p loom-daemon session_output
 
 # 2. The live path: real adapter → real records → real OTLP/HTTP export →
-#    real collector stages → backend. Needs a reachable collector and the
-#    `otlp` feature; the tests are #[ignore]d so CI never needs either.
+#    real collector stages → backend. Needs a reachable collector; the
+#    tests are #[ignore]d so CI never needs one.
 LOOM_E2E_OTLP_ENDPOINT=http://127.0.0.1:14319 \
-  cargo test -p loom-daemon --features otlp session_output::e2e \
+  cargo test -p loom-daemon session_output::e2e \
   -- --ignored --nocapture
 ```
 
@@ -616,7 +635,7 @@ repository's config → SigNoz):
 | Two attempts of one issue separable | issue 9766 `loom.attempt` 1 and 2 — distinct `sweep_id`, `stream_id` and `event_id` |
 | Worktree name unrelated to forge repo | `loom.repo` is the forge slug on every row; no `stream_id` contains a path fragment |
 | Runtime coverage recorded | `claude → live` (2 rows); `codex`, `pi`, `opencode` → `unsupported` (1 row each, severity `Warn`) |
-| Source-to-queryable latency, both clocks | e2e p50 **211 ms** / p95 **239 ms** / max **239 ms** over 9 content rows, using `created_at` as the observation clock |
+| Source-to-queryable latency, both clocks | e2e p50 **211 ms** / p95 **239 ms** / max **239 ms** over 9 content rows, using the backend insert clock as the observation clock (measured before the 2026-10-11 finding that the live logs tables have no such column; re-measure with `inserted_at_unix_milli` once it exists) |
 | Historical timestamp not a latency | A 6 h-old source event was published (and sorts at its source time, `producer_lag_ms = 21600032`) while the run's heartbeat reported `lag_p95_ms = 1`, `lag_samples = 1`, `lag_historical_excluded = 1` — the outlier excluded from the distribution, and the exclusion visible |
 | Credentials cannot pass | 4 live credential shapes plus a prompt canary in the source; the published body contained only `[REDACTED:*]` markers, the prompt line produced no record at all, and a `tool_use.input` holding a token produced a `tool_start` carrying only the tool name |
 | Cannot enable managed-cloud export | `native: false` is asserted in two separate tests; `resolve_exporters` is byte-identical with live output on and off |

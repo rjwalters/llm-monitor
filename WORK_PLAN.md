@@ -5,13 +5,19 @@ Prioritized roadmap derived from current GitHub label state. Regenerated automat
 <!-- guide:plan-body:start -->
 ## Operator Attention: Merge-Risk-Hold Pileup
 
-Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
+Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
 _None._
 
-## Operator Priority
+## Very Important
 
-Issues the operator starred (`loom:operator-priority`); land these first.
+`loom:very-important` (one counts per workspace); every stage takes these first.
+
+_None._
+
+## Important
+
+`loom:important`; taken before unlabelled work.
 
 _None._
 
@@ -25,7 +31,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report
+_None._
 
 ## PRs Awaiting Review
 
@@ -44,6 +50,8 @@ _None._
 Issues carrying `loom:curated`.
 
 - **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)*
+- **#246**: Linux: top-bar tray indicator (AppIndicator) reading ranking.json *(curated)*
+- **#249**: z.ai seats invisible on Loom workers: also discover keys from Loom's shared api-keys pool (~/.loom/api-keys/zai), show sub-1% burn *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -55,15 +63,16 @@ _None._
 
 ## Backlog Balance
 
-| Tier | Count |
+| Bucket | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Operator priority | 0 |
+| Very important | 0 |
+| Important | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 1 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

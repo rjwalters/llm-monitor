@@ -9,15 +9,57 @@ the label, re-evaluates them every tick, and removes the label when the
 recorded predecessor lands, closes, or the ordering no longer applies.
 Read-only inspection: `loom-daemon merge-pr sequence-plan`.
 
+## One landing-order comment per PR (#10634)
+
+The "Landing order recorded" comment is upserted, not appended. It carries a
+hidden key, `<!-- loom:landing-order v1 after=N after_head=… follower_head=… -->`:
+the PR's order (after #N) pinned at both heads. The component's `plan=` id is
+not part of the key, because any push to any PR in a large component changes
+it. On each pass the PR's trusted comments are read once and:
+
+- the same key already on the thread, with no sequencing note after it, is
+  left alone (no write);
+- a changed key edits that comment in place;
+- otherwise (no landing comment yet, or a release/replan note or newer marker
+  follows it) one new comment is posted;
+- an older fleet-authored landing comment whose key a newer one repeats is
+  deleted, a few per pass. This is how two hosts that both posted converge.
+
+Comments written before the key existed are recognized by their heading and
+`source=pass` marker. Only fleet-authored comments are edited or deleted. A
+failed comments read skips the PR for that pass rather than posting.
+
+One host per workspace runs the pass: the role-runner shard
+(`autonomous.roleRunner` `shardIndex`/`shardCount` or the roster) that already
+decides which host owns a workspace. An unsharded host owns every workspace, so
+a single daemon is unaffected, and the duplicate cleanup above covers a fleet
+that is not sharded.
+
+## Only a landable predecessor anchors a hold (#12010)
+
+A PR is only ever held behind a predecessor that is ready to land: `loom:pr`,
+with no `loom:changes-requested`, `loom:ci-failure`, `loom:blocked` or
+`loom:operator` (#10371), not itself sequenced behind such a PR (#10465), and
+**landable now**. Each tick the pass reads every such approved PR's check runs
+on its current head and its mergeability, both as conditional (ETag'd) REST
+reads that cost nothing for an unchanged head. A PR with a completed `failure`
+or `timed_out` check, or that GitHub reports as conflicting with its base, is
+treated as not ready: no new hold is planned behind it, and an existing soft
+hold behind it is released on that tick, with a comment naming the red checks
+or the conflict. Pending CI, a `cancelled` run, and unknown mergeability change
+nothing, so a freshly re-dated head does not churn holds. Human holds (no
+`source=pass`), stacked bases and consolidation reservations are unaffected.
+Once the predecessor is green again it is ordered oldest-first as before.
+
 ## A pinned head that moves
 
 By default a hold whose follower head moved since the marker was written is
 voided and re-planned on the next tick, because the marker no longer describes
 the tree it holds.
 
-**A tree-identical re-date is not a moved head (#10398).** The documented
-remedy for a stale chain head is to re-date it with a tree-identical commit
-and re-run CI (#8248/#8919). If the forge proves the new head's tree equals the
+**A tree-identical re-date is not a moved head (#10398).** A tree-identical
+commit (such as the #8508 re-date push, retired by #12063) moves the head
+without changing the tree. If the forge proves the new head's tree equals the
 pinned head's tree (the same `kind=tree` test that carries a review verdict
 across a re-date), the pass keeps the PR's sequencing state as it is:
 
