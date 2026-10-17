@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **z.ai seats from Loom's shared API-key pool** (#249). Fleet workers get
+  their seats in `~/.loom/api-keys/zai/<label>.env` (`$LOOM_SHARED_API_KEYS_DIR`;
+  empty disables it), not `~/.zai`, so headless hosts showed none. Discovery now
+  reads `~/.zai` then the pool (`$LLM_MONITOR_ZAI_DIRS` replaces the list),
+  skips the pool's state files, honours `.disabled` (an unreadable one withholds
+  the pool, as in loom-daemon), and merges one key found in both places into
+  one account that keeps the `~/.zai` email. An email-less z.ai seat is exported
+  to `ranking.json` keyed `zai:<label>` instead of being dropped.
+
 ### Changed
 
 - **The UI no longer assumes Claude** (#225). The popover is titled "LLM
@@ -23,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the table, Premium % and Extra disappear and the popover narrows to fit.
 
 ### Fixed
+
+- **Small usage is visible** (#249). `zai list` and the popover show one
+  decimal under 10% (`0.1%`, `<0.1%`), so a z.ai seat that has spent 150 of
+  140k weekly credits no longer reads as an idle `0%`.
+- **A reading stored this second is shown** (#249). The store's
+  `timestamp <= now` cutoff used fractional seconds against whole-second stored
+  timestamps, hiding a just-written reading — `zai import` printed `—` for every
+  seat it had just registered.
 
 - **A Codex home re-registered after an upgrade was reported as drift.** Older
   `auth.json` files stored the ChatGPT *user* id (`user-…`) as

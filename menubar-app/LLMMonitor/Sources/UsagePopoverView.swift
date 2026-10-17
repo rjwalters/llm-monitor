@@ -1548,7 +1548,7 @@ struct SummaryRow: View {
     @ViewBuilder
     private func percentText(_ value: Double?) -> some View {
         if let pct = value {
-            Text("\(Int(pct))%")
+            Text(UsagePercentText.string(pct))
                 .foregroundColor(PercentSeverity(percent: pct).color)
         } else {
             Text("—")
@@ -1630,7 +1630,7 @@ struct SetupGuideView: View {
                     .font(.headline)
 
                 Text("Add a Claude, z.ai, or OpenAI Codex account. Tokens in ~/.claude-oauth, "
-                     + "keys in ~/.zai, and Loom Codex profiles are picked up automatically.")
+                     + "keys in ~/.zai or the Loom pool, and Loom Codex profiles are picked up automatically.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -1818,7 +1818,7 @@ struct AddAccountView: View {
             addButton(isEmpty: zaiKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || zaiLabelText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       action: addZai)
-            note("Keys in ~/.zai/coding-plan-<label>.env are imported automatically at launch.")
+            note("Keys in ~/.zai/coding-plan-<label>.env and ~/.loom/api-keys/zai/<label>.env are imported automatically at launch.")
         }
     }
 

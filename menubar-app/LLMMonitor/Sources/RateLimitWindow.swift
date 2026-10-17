@@ -276,3 +276,24 @@ struct RateLimitSnapshot {
         gatingWindow?.resetAt?.timeIntervalSinceNow
     }
 }
+
+// MARK: - Percent text
+
+/// A used-percent as display text. Whole percent from 10% up, one decimal
+/// below it (`0.1%`, `2.5%`, with a trailing `.0` dropped), and `<0.1%` for any
+/// non-zero spend smaller than that — so a z.ai seat that has burned 150 of
+/// its 140k weekly credits never reads as an idle `0%` (#249). Truncates rather
+/// than rounds, so a window never reads `100%` before it is actually spent.
+enum UsagePercentText {
+    static func string(_ percent: Double) -> String {
+        guard percent.isFinite, percent > 0 else { return "0%" }
+        // The epsilon keeps binary noise (0.7 * 10 = 6.999…) from dropping a tenth.
+        let tenths = (percent * 10 + 1e-9).rounded(.down) / 10
+        if tenths < 0.1 { return "<0.1%" }
+        if tenths < 10 {
+            let text = String(format: "%.1f", tenths)
+            return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + "%"
+        }
+        return "\(Int(percent + 1e-9))%"
+    }
+}
