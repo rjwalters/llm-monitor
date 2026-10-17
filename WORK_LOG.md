@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-17
+
+- **PR #242**: chore(claude): track .claude/settings.json
+
 ### 2026-10-16
 
 - **PR #254**: Bump Repo Skills 0.24.1 -> 0.24.3
