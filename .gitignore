@@ -106,3 +106,6 @@ dist/
 
 # Repo Skills machine-local install metadata (absolute source path + timestamp)
 .claude/skills/repo/.install-local.json
+
+# Per-host Loom account pool state (written by the daemon; never shared)
+.loom/accounts.json
