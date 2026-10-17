@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-10-17
 
+- **Issue #259** (closed): Add a LICENSE file
+- **PR #258**: chore: gitignore .loom/accounts.json (per-host Loom account pool state)
 - **PR #242**: chore(claude): track .claude/settings.json
 
 ### 2026-10-16
