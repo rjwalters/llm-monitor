@@ -688,6 +688,32 @@ When replacing `/Applications/LLMMonitor.app`, you must `rm -rf` the old
 bundle before copying — `cp -R` over a running app does not replace the
 binary. See `CLAUDE.md` for the exact sequence.
 
+### Shared Claude Code Settings
+
+`.claude/settings.json` is tracked and registers **hooks only**; it carries no
+`permissions` block. Per-user permission preferences belong in
+`.claude/settings.local.json`, which stays git-ignored.
+
+- `SessionStart` (`startup` and `resume`) runs
+  `.claude/skills/repo/hooks/session-start-handoff.sh`.
+- `PreToolUse` on `Bash` runs `.claude/skills/repo/hooks/guard-destructive.sh`.
+
+Things to know before trusting the workspace:
+
+- **Hooks execute tracked code.** Once you trust the project, Claude Code runs
+  those two scripts from this checkout on your machine. Read them first.
+- **Handoff context.** On startup/resume the session-start hook may place the
+  local handoff note into the agent's context.
+- **The Bash guard is not a sandbox.** It is a pattern-based check that fails
+  open: a command it does not recognise is not blocked.
+- **No permissions are granted or denied here.** With no shared allowlist,
+  what may run without a prompt comes from your own runtime/user
+  configuration. Removing the list neither forbids every command nor grants
+  new access.
+
+Each hook command quotes its whole executable path, so a checkout under a
+directory with spaces in its name still works.
+
 ## Headless Mode / Linux
 
 The same package builds on Linux as a headless daemon — no UI, same poll loop
