@@ -2,6 +2,7 @@
   "name": "loom-workspace",
   "description": "Loom-managed workspace with AI development orchestration",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "worktree:return": "./.loom/scripts/worktree-return.sh",
     "check:ci": "cd menubar-app/LLMMonitor && swift build",
