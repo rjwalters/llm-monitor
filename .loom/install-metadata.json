@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1180",
-  "loom_commit": "2b58988b8fc372abff824eaf75670461d0838c41",
+  "loom_version": "0.19.1181",
+  "loom_commit": "075189da699b29c175ee4aa909e2219687e6e405",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -423,7 +423,9 @@
     ".loom/scripts/tests/test-guide-work-log-issue-pagination.sh",
     ".loom/scripts/tests/test-guide-work-log-pr-pagination.sh",
     ".loom/scripts/tests/test-loom-dispatcher.sh",
-    ".loom/scripts/tests/test-resync-installed-local-fix-guard.sh"
+    ".loom/scripts/tests/test-resync-installed-local-fix-guard.sh",
+    ".loom/docs/work-docs-archive.md",
+    ".loom/scripts/tests/test-champion-ci-workflow-blast.sh"
   ],
   "last_resync": "2026-10-17",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
