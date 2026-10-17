@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1177",
-  "loom_commit": "9f78359079053fae40e7a50b427a827089135c6c",
+  "loom_version": "0.19.1180",
+  "loom_commit": "2b58988b8fc372abff824eaf75670461d0838c41",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -245,7 +245,6 @@
     ".agents/skills/loom-judge-reference/SKILL.md",
     ".claude/commands/loom/judge-reference.md",
     ".loom/docs/trace-identity.md",
-    ".loom/hooks/presence-beat.sh",
     ".loom/roles/judge-reference.md",
     ".loom/scripts/tests/test-build-gate-runner.sh",
     ".loom/scripts/tests/test-provision-hooks.sh",
@@ -413,7 +412,18 @@
     ".loom/docs/issue-filing-lock.md",
     ".loom/docs/long-running-compute.md",
     ".loom/scripts/create-issue.sh",
-    ".loom/scripts/tests/test-champion-followon-out-of-scope.sh"
+    ".loom/scripts/tests/test-champion-followon-out-of-scope.sh",
+    ".loom/scripts/tests/test-judge-spec-reconcile.sh",
+    ".loom/scripts/tests/test-merge-pr-feature-branch-close.sh",
+    ".loom/docs/health-monitoring.md",
+    ".loom/scripts/check-git-identity.sh",
+    ".loom/scripts/tests/test-champion-standing-authorization.sh",
+    ".loom/scripts/tests/test-check-git-identity.sh",
+    ".loom/scripts/tests/test-guide-work-log-issue-out-of-order.sh",
+    ".loom/scripts/tests/test-guide-work-log-issue-pagination.sh",
+    ".loom/scripts/tests/test-guide-work-log-pr-pagination.sh",
+    ".loom/scripts/tests/test-loom-dispatcher.sh",
+    ".loom/scripts/tests/test-resync-installed-local-fix-guard.sh"
   ],
   "last_resync": "2026-10-17",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
