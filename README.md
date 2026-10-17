@@ -853,6 +853,33 @@ are headless-loop flags: bare (without `--headless`) they print an error to
 stderr and exit non-zero rather than launching a duplicate GUI instance, e.g.
 `LLMMonitor --headless --once`.
 
+### Desktop tray (Ubuntu top bar)
+
+On a Linux desktop, a small AppIndicator client shows the same live usage % in
+the top bar, with a dropdown listing every account (Claude, Codex, z.ai): 5h
+and 7d utilization, time to reset, and how fresh the data is. The icon turns
+orange at 90% and red above 95%, and grey when `ranking.json` is stale or
+missing. The tray reads **only** the daemon's non-secret
+`~/.llm-monitor/ranking.json`. It never holds tokens and never polls, so the
+daemon above must be running.
+
+```bash
+sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1
+./scripts/install-linux.sh --from-release --tray   # daemon + tray
+./scripts/install-linux.sh --tray                  # tray only, next to an existing daemon
+```
+
+`--tray` installs `llm-monitor-tray` next to the binary and an XDG autostart
+entry (`~/.config/autostart/llm-monitor-tray.desktop`), then starts it if
+you're in a graphical session. On Ubuntu's GNOME the **Ubuntu AppIndicators**
+extension (on by default) puts it in the top bar; KDE and other
+StatusNotifierItem desktops show it natively. `llm-monitor-tray --print`
+prints the same summary in a terminal, and `--selftest` checks the parsing.
+`LLM_MONITOR_RANKING` overrides the file it reads.
+
+The history charts, Add Account and Roll Token are macOS-only. On Linux, add
+accounts with the CLI (`accounts.env`, `llm-monitor zai import`).
+
 ## Multi-Host Sync
 
 When multiple hosts each run their own `llm-monitor` (e.g. two Macs + a
@@ -1452,6 +1479,7 @@ rm -rf dist node_modules
 
 ```
 llm-monitor/
+├── linux-tray/llm-monitor-tray.py  # Linux top-bar AppIndicator over ranking.json
 ├── menubar-app/LLMMonitor/   # Swift Package: macOS menu-bar app + Linux headless daemon
 │   ├── Package.swift
 │   ├── Assets/                     # App icon (AppIcon.icns + 1024px master PNG + generation recipe)
