@@ -275,7 +275,6 @@ discover_epic_children() {
 
   page_full() { [ "$(printf '%s' "$1" | jq 'length' 2>/dev/null || echo 0)" -ge "$2" ]; }
   local a a_raw
-
   # (a) phase-marker children — the historical source (champion-epic.md Step 3).
   # Every `gh issue list` below is fetched UNFILTERED and filtered locally with
   # jq: the truncation check must see the raw page, because a full page whose
