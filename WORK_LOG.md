@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-21
+
+- **PR #261**: Bump Repo Skills 0.24.3 -> 0.24.7
+
 ### 2026-10-17
 
 - **Issue #259** (closed): Add a LICENSE file
