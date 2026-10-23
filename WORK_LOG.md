@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-23
+
+- **Issue #246** (closed): Linux: top-bar tray indicator (AppIndicator) reading ranking.json
+
 ### 2026-10-21
 
 - **PR #261**: Bump Repo Skills 0.24.3 -> 0.24.7
