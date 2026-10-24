@@ -7,7 +7,7 @@ Prioritized roadmap derived from current GitHub label state. Regenerated automat
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#248**: Linux: top-bar tray indicator over ranking.json (#246)
+_None._
 
 ## Very Important
 
@@ -43,14 +43,13 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#248**: Linux: top-bar tray indicator over ranking.json (#246)
+_None._
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
 - **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)*
-- **#246**: Linux: top-bar tray indicator (AppIndicator) reading ranking.json *(curated)*
 - **#249**: z.ai seats invisible on Loom workers: also discover keys from Loom's shared api-keys pool (~/.loom/api-keys/zai), show sub-1% burn *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -65,14 +64,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 0 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 1 |
-| Curated | 3 |
+| Approved PRs awaiting merge | 0 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
