@@ -4,9 +4,10 @@ import Foundation
 /// and show their quota. One-shot, no `--headless` needed, works on Linux.
 ///
 /// Keys are read from `~/.zai/coding-plan-<label>.env` (the chezmoi-managed
-/// directory; `$LLM_MONITOR_ZAI_DIR` overrides it), one `ZAI_API_KEY=…`
-/// line per file. **A key is never printed or logged** — only labels, emails,
-/// and derived percentages.
+/// directory; `$LLM_MONITOR_ZAI_DIR` overrides it) and from Loom's shared
+/// API-key pool `~/.loom/api-keys/zai/<label>.env` (see
+/// `ZaiKeyFile.directories`), one `ZAI_API_KEY=…` line per file. **A key is
+/// never printed or logged** — only labels, emails, and derived percentages.
 ///
 /// @MainActor for the same reason as `CodexCLI`: the whole CLI runs to
 /// completion on the process's initial thread via `dispatchMain()`.
@@ -38,7 +39,7 @@ enum ZaiCLI {
 
     private static func runImport(_ args: [String]) -> Never {
         var dbPath: String?
-        var directory = ZaiKeyFile.defaultDirectory
+        var directories = ZaiKeyFile.directories()
         var i = 0
         while i < args.count {
             switch CLIArgs.matchCommon(args, i) {
@@ -50,15 +51,16 @@ enum ZaiCLI {
                 exit(0)
             case .notMatched:
                 guard args[i] == "--dir" else { CLIArgs.fail("Unknown option '\(args[i])' (see --help)") }
-                directory = CLIArgs.requireValue(args, i, option: "--dir")
+                directories = [CLIArgs.requireValue(args, i, option: "--dir")]
                 i += 1
             }
             i += 1
         }
 
-        let files = ZaiKeyFile.scan(directory: directory)
+        let files = ZaiKeyFile.scan(directories: directories)
         guard !files.isEmpty else {
-            CLIArgs.fail("No coding-plan-<label>.env files with a ZAI_API_KEY line in \(directory)")
+            CLIArgs.fail("No z.ai key files (coding-plan-<label>.env or <label>.env with a ZAI_API_KEY line) in "
+                         + directories.joined(separator: ", "))
         }
 
         let storePath = dbPath
@@ -74,7 +76,7 @@ enum ZaiCLI {
                     failed += 1
                     FileHandle.standardError.write(Data("  \(file.label): \(error)\n".utf8))
                 } else {
-                    print("  \(file.label)  \(file.email ?? "(no email)")  registered")
+                    print(importLine(file))
                 }
             }
             print("Registered \(files.count - failed)/\(files.count) z.ai account(s).")
@@ -191,17 +193,24 @@ enum ZaiCLI {
             print("No z.ai accounts registered. Add them with: llm-monitor zai import")
             return
         }
-        func pct(_ value: Double?) -> String { value.map { String(format: "%.0f%%", $0) } ?? "—" }
+        // One decimal under 10%, so a seat that has spent 150 of 140k weekly
+        // credits reads 0.1%, not an idle-looking 0% (#249).
+        func pct(_ value: Double?) -> String { value.map(UsagePercentText.string) ?? "—" }
         print("")
-        print(pad("ACCOUNT", 10) + pad("EMAIL", 26) + pad("PLAN", 6) + pad("5H", 6) + pad("WEEK", 6) + "WEEK RESETS")
+        print(pad("ACCOUNT", 16) + pad("EMAIL", 26) + pad("PLAN", 6) + pad("5H", 7) + pad("WEEK", 7) + "WEEK RESETS")
         for account in accounts {
             let usage = store.latestUsage[account.id]
             let windows = usage?.rateLimit
             let reset = windows?.weekly?.resetAt.map { formatReset($0) } ?? "—"
-            print(pad(account.accountName ?? account.id, 10) + pad(account.email ?? "—", 26)
-                  + pad(account.plan ?? "—", 6) + pad(pct(windows?.session?.usedPercent), 6)
-                  + pad(pct(windows?.weekly?.usedPercent), 6) + reset)
+            print(pad(account.accountName ?? account.id, 16) + pad(account.email ?? "—", 26)
+                  + pad(account.plan ?? "—", 6) + pad(pct(windows?.session?.usedPercent), 7)
+                  + pad(pct(windows?.weekly?.usedPercent), 7) + reset)
         }
+    }
+
+    /// One `zai import` progress line: label and email only, never the key.
+    static func importLine(_ file: ZaiKeyFile) -> String {
+        "  \(file.label)  \(file.email ?? "(no email)")  registered"
     }
 
     private static func pad(_ s: String, _ width: Int) -> String {
@@ -234,11 +243,16 @@ enum ZaiCLI {
             Register z.ai (GLM Coding Plan) API keys and show their quota.
 
             Subcommands:
-              import [--dir <path>]     Register every coding-plan-<label>.env in the key
-                                        directory (default ~/.zai, or $LLM_MONITOR_ZAI_DIR).
-                                        Each file holds one ZAI_API_KEY=… line; an
-                                        "(account: <email>)" header comment names the account.
-                                        The app also does this automatically at launch.
+              import [--dir <path>]     Register every z.ai key file found in, in order:
+                                          ~/.zai/coding-plan-<label>.env ($LLM_MONITOR_ZAI_DIR)
+                                          Loom's pool ~/.loom/api-keys/zai/<label>.env
+                                            ($LOOM_SHARED_API_KEYS_DIR; empty disables it)
+                                        $LLM_MONITOR_ZAI_DIRS (colon-separated) or --dir
+                                        replaces that list. Each file holds one
+                                        ZAI_API_KEY=… line; an "(account: <email>)" header
+                                        comment names the account. A label in the pool's
+                                        .disabled is skipped; the same key in two places
+                                        is one account. The app also does this at launch.
               add <label> [--key-file <path>|-] [--email <addr>]
                                         Register one key, read from a file or stdin
                                         (never from the command line).

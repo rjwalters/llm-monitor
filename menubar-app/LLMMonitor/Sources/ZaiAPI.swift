@@ -225,10 +225,33 @@ final class ZaiAPIClient: Sendable {
 
 // MARK: - Key files
 
-/// One z.ai key as registered on disk: `~/.zai/coding-plan-<label>.env`,
-/// holding a single `ZAI_API_KEY=…` line (the same line `loom-daemon api-keys
-/// add zai <label>` consumes) and, by convention, an `(account: <email>)`
-/// header comment.
+/// One z.ai key as registered on disk, holding a single `ZAI_API_KEY=…` line
+/// (the same line `loom-daemon api-keys add zai <label>` consumes) and, by
+/// convention in `~/.zai`, an `(account: <email>)` header comment.
+///
+/// ### Where keys are found, in precedence order (#249)
+///
+/// `$LLM_MONITOR_ZAI_DIRS` (colon-separated) replaces the default list:
+///
+/// 1. `~/.zai` (`$LLM_MONITOR_ZAI_DIR` moves it) — the operator's chezmoi
+///    copy, `coding-plan-<label>.env`. Only operator Macs have it.
+/// 2. Loom's shared API-key pool, `${LOOM_SHARED_API_KEYS_DIR:-~/.loom/api-keys}/zai/<label>.env`
+///    — what every fleet worker's `api-keys-sync` fills from SSM. An
+///    explicitly empty `LOOM_SHARED_API_KEYS_DIR` disables it, as in
+///    loom-daemon.
+///
+/// Every directory is read the same way: `coding-plan-<label>.env` or
+/// `<label>.env`, dotfiles skipped (so the pool's `.disabled`, `.allowlist`,
+/// `.limits.json`, `.inflight/`, … are never seats). A label listed in a
+/// directory's `.disabled` (Loom's name-per-line format) is not a seat, and
+/// neither is its key under any other label; an unreadable `.disabled`
+/// withholds that whole directory, as loom-daemon does, rather than reading as
+/// "nothing is disabled".
+///
+/// The same key under two labels is one account: the first directory wins,
+/// and a later copy only lends its email when the winner has none — so the
+/// `~/.zai` file's `(account: …)` email is kept. **A key is never printed or
+/// logged**; `description` redacts it.
 struct ZaiKeyFile: Equatable {
     let label: String
     let email: String?
@@ -246,12 +269,47 @@ struct ZaiKeyFile: Equatable {
         return "zai:\(label)"
     }
 
-    /// Where key files are read from: `$LLM_MONITOR_ZAI_DIR`, else `~/.zai`.
-    static var defaultDirectory: String {
-        if let override = AppPaths.environment("ZAI_DIR") {
-            return override
+    /// Key directories, in precedence order (see the type doc).
+    static func directories(environment: [String: String] = ProcessInfo.processInfo.environment) -> [String] {
+        func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
+        if let raw = AppPaths.environment("ZAI_DIRS", in: environment) {
+            return raw.split(separator: ":").map { expand(String($0).trimmingCharacters(in: .whitespaces)) }
+                .filter { !$0.isEmpty }
         }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zai").path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var dirs = [AppPaths.environment("ZAI_DIR", in: environment).map(expand)
+                    ?? (home as NSString).appendingPathComponent(".zai")]
+        if let pool = environment["LOOM_SHARED_API_KEYS_DIR"] {
+            let trimmed = pool.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { dirs.append((expand(trimmed) as NSString).appendingPathComponent("zai")) }
+        } else {
+            dirs.append((home as NSString).appendingPathComponent(".loom/api-keys/zai"))
+        }
+        return dirs
+    }
+
+    /// The seat label a file name carries, or nil when it is not a key file:
+    /// `coding-plan-<label>.env` (`~/.zai`) or `<label>.env` (Loom pool).
+    /// Dotfiles and opencode's bare `coding-plan.env` are never seats.
+    static func label(forFileName name: String) -> String? {
+        let suffix = ".env", prefix = "coding-plan-"
+        guard !name.hasPrefix("."), name.hasSuffix(suffix) else { return nil }
+        var stem = String(name.dropLast(suffix.count))
+        guard stem != "coding-plan" else { return nil }
+        if stem.hasPrefix(prefix) { stem = String(stem.dropFirst(prefix.count)) }
+        return stem.isEmpty ? nil : stem
+    }
+
+    /// Labels listed in `directory/.disabled` (one per line, `#` comments),
+    /// empty when there is no such file, or nil when it exists but cannot be
+    /// read — the caller must then withhold the directory (fail closed).
+    static func disabledLabels(directory: String) -> Set<String>? {
+        let path = (directory as NSString).appendingPathComponent(".disabled")
+        guard FileManager.default.fileExists(atPath: path) else { return [] }
+        guard let body = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return Set(body.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") })
     }
 
     /// Parse one file's content. Returns nil when it carries no `ZAI_API_KEY`
@@ -285,21 +343,61 @@ struct ZaiKeyFile: Equatable {
         return ZaiKeyFile(label: label, email: email, apiKey: apiKey)
     }
 
-    /// Every `coding-plan-<label>.env` in `directory` that carries a key,
-    /// sorted by label. A missing directory is simply empty.
-    static func scan(directory: String = defaultDirectory) -> [ZaiKeyFile] {
+    /// Every key file in one directory (see `scan(directories:)`).
+    static func scan(directory: String) -> [ZaiKeyFile] {
+        scan(directories: [directory])
+    }
+
+    /// Every usable seat across `directories`, one per key and per account id,
+    /// sorted by label. Missing directories are simply empty.
+    static func scan(directories: [String] = directories()) -> [ZaiKeyFile] {
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: directory) else { return [] }
-        let prefix = "coding-plan-", suffix = ".env"
-        var seenKeys = Set<String>()
-        return names.sorted().compactMap { name -> ZaiKeyFile? in
-            guard name.hasPrefix(prefix), name.hasSuffix(suffix), name.count > prefix.count + suffix.count else { return nil }
-            let label = String(name.dropFirst(prefix.count).dropLast(suffix.count))
-            let path = (directory as NSString).appendingPathComponent(name)
-            guard let content = try? String(contentsOfFile: path, encoding: .utf8),
-                  let file = parse(content, label: label),
-                  seenKeys.insert(file.apiKey).inserted else { return nil }
-            return file
+        var candidates: [ZaiKeyFile] = []
+        var disabledKeys = Set<String>()
+        for dir in directories {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            let disabled = disabledLabels(directory: dir)
+            for name in names.sorted() {
+                guard let label = label(forFileName: name) else { continue }
+                let path = (dir as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue,
+                      let content = try? String(contentsOfFile: path, encoding: .utf8),
+                      let file = parse(content, label: label) else { continue }
+                guard let disabled = disabled, !disabled.contains(label) else {
+                    disabledKeys.insert(file.apiKey)
+                    continue
+                }
+                candidates.append(file)
+            }
         }
+
+        // One seat per key: first directory wins, a later copy lends its email.
+        var byKey: [String: Int] = [:]
+        var merged: [ZaiKeyFile] = []
+        for file in candidates where !disabledKeys.contains(file.apiKey) {
+            if let index = byKey[file.apiKey] {
+                if merged[index].email == nil, let email = file.email {
+                    merged[index] = ZaiKeyFile(label: merged[index].label, email: email, apiKey: file.apiKey)
+                }
+                continue
+            }
+            byKey[file.apiKey] = merged.count
+            merged.append(file)
+        }
+        // One seat per account id, too: two different keys under one label
+        // would otherwise overwrite each other's credential on every launch.
+        var seenIds = Set<String>()
+        return merged.filter { seenIds.insert($0.accountId).inserted }.sorted { $0.label < $1.label }
+    }
+}
+
+/// Redacted renderings, so string interpolation, `print`, `dump` or a log line
+/// can never leak a key.
+extension ZaiKeyFile: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    var description: String { "ZaiKeyFile(label: \(label), email: \(email ?? "nil"), apiKey: <redacted>)" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["label": label, "email": email as Any, "apiKey": "<redacted>"])
     }
 }
