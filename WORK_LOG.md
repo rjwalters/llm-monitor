@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-25
+
+- **Issue #265** (closed): syncClaudeTokenFiles rewrites accounts.env, fighting external managers (claudeauth)
+
 ### 2026-10-23
 
 - **Issue #246** (closed): Linux: top-bar tray indicator (AppIndicator) reading ranking.json
