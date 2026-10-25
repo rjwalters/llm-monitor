@@ -3030,7 +3030,7 @@ projected reason, so `passVerdictQuery` still parses both):
 `size`, `critical_file`, `stale`, `head_moved`, `not_eligible` or `unknown`
 (an unnamed criterion). `noop` carries `held`, or, for a `skipped` / `requeued`
 step, the gate it names with `reason=` (#12715): `facts_unread`, `janitor_rc3`,
-`verdict_rc11`, `ci_pending`, `mergeable_unknown`, `pin_missing`, `merge_rc<N>`,
+`verdict_rc11`, `ci_pending`, `mergeable_unknown`, `pin_missing`, `guard_refused`, `merge_rc<N>`,
 or `unspecified` when it named none or an unknown one. `ci_pending` is never
 inferred from the word `requeued`. A `skipped` / `requeued` step is never
 ledgered `failed`, even with no readable journal. `failed` carries

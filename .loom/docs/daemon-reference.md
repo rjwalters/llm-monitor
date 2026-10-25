@@ -6365,6 +6365,7 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
 | set | below; the newest release is below it | `FLEET FLOOR UNSATISFIABLE` at ERROR. No roll; dispatch continues |
 | set | below; no release resolved | No roll; the next tick asks again |
 | set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists, unless a registered workspace needs a newer daemon (the next row) |
+| set or unknown, `fleet.autoApply` on | restart-required config changed since boot (#12425), and none of the rows above is rolling | Pause-and-roll now onto the **running** binary (`from_version == to_version`), even with `autoUpdate.enabled=false`; no fetch, no window, settle or debounce. `target_source = config_restart`; the tick reports `decision = config_restart` with `target_source` and `config_restart_paths` (a count, never the paths). See [fleet-config-lifecycle](fleet-config-lifecycle.md) |
 | any store, floor unknown included | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest published release (binary and `.sha256` present) at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
 
 - **A fleet host moves only when the floor moves.** It does not chase the
