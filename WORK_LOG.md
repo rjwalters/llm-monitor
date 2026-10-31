@@ -2,6 +2,11 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-10-31
+
+- **PR #268**: ci: move build-macos runner from macos-14 to macos-15
+- **Issue #267** (closed): CI: move macos-14 runner pins to macos-15 before the 2026-11-02 image retirement
+
 ### 2026-10-25
 
 - **Issue #265** (closed): syncClaudeTokenFiles rewrites accounts.env, fighting external managers (claudeauth)
