@@ -20,14 +20,14 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
 
-      # The macos-14 image's *default* Xcode is 15.x, whose Swift predates
-      # language mode 6 and rejects Package.swift's `-swift-version 6`
-      # (`error: invalid value '6'`). Select the newest Xcode 16.x on the image
-      # to get a Swift-6-capable toolchain before building.
+      # Package.swift passes `-swift-version 6`, which Swift 5.x compilers
+      # (e.g. Xcode 15.x) reject (`error: invalid value '6'`). Don't rely on
+      # the runner image's default Xcode: explicitly select the newest
+      # Xcode 16.x to get a Swift-6-capable toolchain before building.
       - name: Select Swift 6 toolchain (Xcode 16+)
         run: |
           XCODE=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n1)
