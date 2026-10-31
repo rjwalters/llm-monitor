@@ -40,7 +40,8 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 - **Multi-account.** Add accounts one at a time from **Add Account**, which has
   a Claude / z.ai / Codex picker, or bulk-import a `.env` file of
   `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs. Many accounts need no adding at all:
-  tokens in `~/.claude-oauth` or the Loom pool, keys in `~/.zai`, and Loom Codex
+  tokens in `~/.claude-oauth` or the Loom pool, keys in `~/.zai` or the Loom
+  api-keys pool, and Loom Codex
   profiles are picked up automatically.
 - **Multi-provider.** Anthropic and OpenAI/ChatGPT (Codex) accounts sit side by
   side in the same table, each row tagged with a pixel-art provider badge. See
@@ -468,25 +469,40 @@ the key is stored and polled directly. Usage comes from
 spends no quota. It reports a **5-hour** window and a **weekly** window, shown
 in the same columns as Claude's.
 
-Keys are read from `~/.zai/coding-plan-<label>.env` (chezmoi-managed on
-operator Macs; override the directory with `$LLM_MONITOR_ZAI_DIR`). Each
-file holds one `ZAI_API_KEY=…` line, and an `(account: <email>)` header comment
-names the account:
+Keys are read from two places, in order:
+
+1. `~/.zai/coding-plan-<label>.env` — chezmoi-managed on operator Macs;
+   `$LLM_MONITOR_ZAI_DIR` moves it.
+2. Loom's shared API-key pool, `~/.loom/api-keys/zai/<label>.env` — what each
+   Loom worker's `api-keys-sync` fills from SSM, so headless Linux hosts see
+   their seats with no `~/.zai`. `$LOOM_SHARED_API_KEYS_DIR` moves the pool
+   root, and an explicitly empty value disables it (as in loom-daemon).
+
+`$LLM_MONITOR_ZAI_DIRS` (colon-separated) replaces that list. Each file holds
+one `ZAI_API_KEY=…` line; in `~/.zai` an `(account: <email>)` header comment
+names the account. The pool's state files (`.disabled`, `.allowlist`,
+`.limits.json`, `.inflight/`, …) are skipped, and a seat listed in `.disabled`
+is not registered. The same key in both places is one account, keeping the
+`~/.zai` copy's email:
 
 ```bash
-llm-monitor zai import     # register every coding-plan-<label>.env
+llm-monitor zai import     # register every key file in ~/.zai and the Loom pool
 llm-monitor zai list       # last stored 5h / weekly usage per account
 # one key from a file or stdin (never argv):
 llm-monitor zai add agent3 --key-file ~/.zai/coding-plan-agent3.env
 ```
 
-The app also scans that directory **at every launch**, so a rotated key is
+The app also scans those directories **at every launch**, so a rotated key is
 picked up without a re-import. An unchanged key is skipped without a network
 call, and a deleted file never removes its account. `coding-plan.env`
 (opencode's `ZHIPU_API_KEY` copy) is ignored, so it does not register a
 duplicate. Accounts are keyed `zai:<email>` (else `zai:<label>`), so a
 rotation rolls the credential in place. In `ranking.json` they appear with
-`"provider": "zai"`, and a spent window reports `exhausted`/`rate_limited`.
+`"provider": "zai"` (a seat with no known email is keyed by its account id,
+`zai:<label>`), and a spent window reports `exhausted`/`rate_limited` — on
+z.ai the weekly window is usually the one that binds. Usage under 10% is
+shown to one decimal (`0.1%`, or `<0.1%`), so a lightly used seat never reads
+as an idle `0%`.
 
 ### Rolling a Token (revoke + re-mint)
 
@@ -1474,7 +1490,7 @@ llm-monitor/
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
 │       ├── CodexAppServer.swift    # Codex app-server JSON-RPC client (usage with no stored credential)
 │       ├── CodexCLI.swift          # `llm-monitor codex provision|add|list|import` CLI surface
-│       ├── ZaiAPI.swift            # z.ai GLM Coding Plan quota client + ~/.zai key-file scanner
+│       ├── ZaiAPI.swift            # z.ai GLM Coding Plan quota client + key-file scanner (~/.zai, Loom pool)
 │       ├── ZaiCLI.swift            # `llm-monitor zai import|add|list` CLI surface
 │       ├── TranscriptImporter.swift # Incremental Claude Code transcript → token_usage/token_sessions ingest
 │       ├── TokensCLI.swift         # `llm-monitor tokens sync` CLI surface
