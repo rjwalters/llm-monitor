@@ -109,3 +109,6 @@ dist/
 
 # Per-host Loom account pool state (written by the daemon; never shared)
 .loom/accounts.json
+
+# Repo Skills Codex-side machine-local install metadata (never committed)
+.agents/skills/repo/.install-local.json
