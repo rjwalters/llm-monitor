@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1250",
-  "loom_commit": "b95c0def26e0ae706f1f6efa9086325c8f10d529",
+  "loom_version": "0.19.1253",
+  "loom_commit": "dc75531b3445740462cb8d6dea16e931f876f285",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -567,7 +567,9 @@
     ".loom/roles/hermit.json",
     ".loom/roles/loom.json",
     ".loom/scripts/tests/lib/daemon-update-fixtures.sh",
-    ".loom/scripts/tests/test-merge-pr-stacked-child-branch-delete.sh"
+    ".loom/scripts/tests/test-merge-pr-stacked-child-branch-delete.sh",
+    ".loom/docs/ratification-lane.md",
+    ".loom/scripts/tests/test-doctor-champion-hold-conflict.sh"
   ],
   "last_resync": "2026-11-02",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
