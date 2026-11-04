@@ -494,6 +494,14 @@ criterion), the `merge-risk` criterion passes without scoring the four axes — 
 shape as the docs-only fast path, generalized to an operator-declared,
 per-repo class instead of a hardcoded, always-safe one.
 
+**Repo-declared critical paths (#13542)**: a separate, optional `champion.extraCriticalPaths` array
+(e.g. `["infra/bot/**", "policy/*-policy.json"]`) adds repo-specific critical paths to the
+`critical-files` criterion. Entries are anchored bash globs on the full path (`*` crosses `/`),
+matched against `filename` and `previous_filename`. It only adds: built-ins still hold, a non-array
+value or an empty/non-string entry is skipped with a warning, and it holds on any edit. No
+standing-authorization class, carve-out or merge-risk self-release can waive a declared hit; only the
+human release of the critical-file hold does. See `champion-pr-merge.md` → `critical-files`.
+
 **Precedence and interactions** (all preserved exactly):
 
 - **Sticky-hold precheck runs first, always.** A standing authorization
@@ -576,14 +584,14 @@ by hand. Absent `coversCriticalFiles`, nothing changes.
 
 **Resync waiver (#13096)**: the one exception to the kept-set hold is not a
 class and has no config key. A `chore(loom): resync installed Loom to vX` PR
-passes the `merge-risk` kept-set entries when `resync_waiver_eval` proves every
+passes the `merge-risk` kept-set entries when `resync_waiver_eval` (a call to `loom-daemon forge resync-waiver`, the one implementation the daemon's own landing shares, #13487) proves every
 changed kept-set file has the same blob SHA as its `defaults/` counterpart at
 tag `vX` (the title and `.loom/install-metadata.json` must both name `X`). A
 differing byte, a removed or renamed file, a kept-set file with no upstream
 counterpart, a missing tag or a failed read holds as before. So does any changed
 file outside `.loom/` and `.claude/`, or any merge-gate path (`champion*`,
 `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`, comment trust, `config.json`;
-`RESYNC_GATE_PATTERNS`, #12945), except that files under `.loom/scripts/tests/`
+the daemon's `GATE` list, #12945), except that files under `.loom/scripts/tests/`
 are compared byte-for-byte rather than refused as gate paths (#13486). The same rule covers a Repo Skills bump PR (`Bump Repo Skills <from> -> <X.Y.Z>`, #13435)
 against the `rjwalters/repo` tag `vX.Y.Z`, mapped through that installer's copy lines; a bump that
 changes `.claude/settings.json` holds. After a resync PR merges, Step 3b closes open
