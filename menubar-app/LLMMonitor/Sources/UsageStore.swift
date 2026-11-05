@@ -1199,6 +1199,15 @@ class UsageStore: ObservableObject {
         }
     }
 
+    /// The `timestamp <= ?` cutoff `loadFromDatabase` reads readings up to.
+    /// Whole-second ISO 8601, matching how readings are stored, so a reading
+    /// stored in the current second is never excluded by string comparison.
+    nonisolated static func usageCutoffString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
+    }
+
     func loadFromDatabase() {
         do {
             if !FileManager.default.fileExists(atPath: dbPath) {
@@ -1214,9 +1223,11 @@ class UsageStore: ObservableObject {
 
             var loadedAccounts: [Account] = []
 
-            let isoFormatter = ISO8601DateFormatter()
-            isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let nowString = isoFormatter.string(from: Date())
+            // Whole seconds, like the stored `usage_history.timestamp`: with a
+            // fractional now ("…:47.123Z"), a reading written in the same
+            // second ("…:47Z") compares *greater* ('Z' > '.') and was hidden —
+            // so `zai import` printed "—" for the readings it had just stored.
+            let nowString = Self.usageCutoffString(Date())
 
             // Load accounts using raw SQL. `provider` and `codex_home` are
             // selected only when the column exists, so a database that hasn't

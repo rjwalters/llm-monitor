@@ -183,8 +183,9 @@ enum HeadlessRunner {
                               stored — codex itself is asked for usage)
           claude              Map rolled Claude tokens from ~/.claude-oauth and the
                               Loom pool onto their accounts now (sync)
-          zai                 Register z.ai GLM Coding Plan keys from ~/.zai and
-                              show their 5h/weekly quota (import|add|list)
+          zai                 Register z.ai GLM Coding Plan keys from ~/.zai and the
+                              Loom api-keys pool, and show their 5h/weekly quota
+                              (import|add|list)
           selftest            Run portable-core assertions (no network, no
                               credentials; exits non-zero on failure)
         """

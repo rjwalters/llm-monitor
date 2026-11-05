@@ -85,6 +85,10 @@ enum SelfTest {
         testInstanceLock()
         testZaiQuotaResponseMapping()
         testZaiKeyFileParsing()
+        testZaiKeyFileDiscovery()
+        testZaiKeyNeverRendered()
+        testUsagePercentText()
+        testZaiWeeklyExhaustionRanking()
         testDataDirectoryMigration()
         testCodexRolloutSnapshotParsing()
         testCodexProfileSyncSnapshotMode()
@@ -1524,6 +1528,213 @@ enum SelfTest {
         expectEqual(scanned.map(\.label), ["a", "b"],
                     "scan: coding-plan-<label>.env only, sorted, duplicate keys dropped")
         expectEqual(ZaiKeyFile.scan(directory: dir + "-missing").count, 0, "missing key dir is empty")
+    }
+
+    /// #249: Loom workers have no `~/.zai`, only Loom's shared api-keys pool
+    /// (`~/.loom/api-keys/zai/<label>.env`). Discovery reads both, skips the
+    /// pool's state files, honours `.disabled`, and merges one key seen twice.
+    private static func testZaiKeyFileDiscovery() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let defaults = ZaiKeyFile.directories(environment: [:])
+        expectEqual(defaults, [home + "/.zai", home + "/.loom/api-keys/zai"],
+                    "z.ai dirs default to ~/.zai, then the Loom api-keys pool's zai/ dir")
+        expectEqual(ZaiKeyFile.directories(environment: ["LLM_MONITOR_ZAI_DIRS": "/a: /b"]), ["/a", "/b"],
+                    "LLM_MONITOR_ZAI_DIRS replaces the default list")
+        expectEqual(ZaiKeyFile.directories(environment: ["LLM_MONITOR_ZAI_DIR": "/z", "LOOM_SHARED_API_KEYS_DIR": "/pool"]),
+                    ["/z", "/pool/zai"], "LLM_MONITOR_ZAI_DIR moves ~/.zai; LOOM_SHARED_API_KEYS_DIR moves the pool")
+        expectEqual(ZaiKeyFile.directories(environment: ["LOOM_SHARED_API_KEYS_DIR": " "]), [home + "/.zai"],
+                    "an explicitly empty LOOM_SHARED_API_KEYS_DIR drops the pool, as in loom-daemon")
+
+        expectEqual(ZaiKeyFile.label(forFileName: "coding-plan-robb.env"), "robb", "~/.zai file name → label")
+        expectEqual(ZaiKeyFile.label(forFileName: "agent1.env"), "agent1", "pool file stem is the label")
+        for name in ["coding-plan.env", ".disabled", ".allowlist", ".limits.json", ".bad_accounts.json",
+                     ".sync_state.json", ".inflight", ".alpha.env.tmp-1-2", ".hidden.env", "README.md"] {
+            expect(ZaiKeyFile.label(forFileName: name) == nil, "\(name) is never a z.ai seat")
+        }
+
+        withSelfTestTempDir("zai-discovery") { dir in
+            let fm = FileManager.default
+            let zaiDir = dir.appendingPathComponent("zai-home").path
+            let pool = dir.appendingPathComponent("api-keys/zai").path
+            for d in [zaiDir, pool] { try? fm.createDirectory(atPath: d, withIntermediateDirectories: true) }
+            func put(_ d: String, _ name: String, _ body: String) {
+                try? body.write(toFile: (d as NSString).appendingPathComponent(name), atomically: true, encoding: .utf8)
+            }
+            put(zaiDir, "coding-plan-robb.env", "# z.ai key (account: robb@example.com)\nZAI_API_KEY=key-robb\n")
+            put(zaiDir, "coding-plan-gone.env", "ZAI_API_KEY=key-gone\n")
+            put(pool, "robb.env", "ZAI_API_KEY=key-robb\n")
+            put(pool, "agent1.env", "# synced from SSM\nZAI_API_KEY=key-agent1\n")
+            put(pool, "agent2.env", "ZAI_API_KEY=key-agent2\n")
+            put(pool, "off.env", "ZAI_API_KEY=key-off\n")
+            put(pool, "gone.env", "ZAI_API_KEY=key-gone\n")
+            put(pool, "blank.env", "# no key yet\n")
+            put(pool, ".disabled", "# disabled seats\noff\n gone \n")
+            put(pool, ".allowlist", "agent1\n")
+            put(pool, ".limits.json", #"{"agent1":{"max_concurrent":2}}"#)
+            put(pool, ".bad_accounts.json", "{}")
+            put(pool, ".sync_state.json", "{}")
+            put(pool, ".agent1.env.tmp-1-2", "ZAI_API_KEY=key-temp\n")
+            try? fm.createDirectory(atPath: (pool as NSString).appendingPathComponent(".inflight/agent1.env"),
+                                    withIntermediateDirectories: true)
+
+            let poolOnly = ZaiKeyFile.scan(directories: [dir.appendingPathComponent("missing").path, pool])
+            expectEqual(poolOnly.map(\.label), ["agent1", "agent2", "robb"],
+                        "pool-only host: every enabled <label>.env seat, state files and disabled seats skipped")
+            expectEqual(poolOnly.map(\.accountId), ["zai:agent1", "zai:agent2", "zai:robb"],
+                        "a pool seat with no email is keyed zai:<label>")
+
+            let both = ZaiKeyFile.scan(directories: [zaiDir, pool])
+            expectEqual(both.map(\.label), ["agent1", "agent2", "robb"],
+                        "a seat in both stores appears once; a key disabled in the pool is dropped from ~/.zai too")
+            expectEqual(both.first { $0.label == "robb" }?.accountId, "zai:robb@example.com",
+                        "the ~/.zai copy wins, keeping its (account: …) email")
+
+            // A pool copy lends its email when the earlier copy has none.
+            let lent = dir.appendingPathComponent("lent").path
+            try? fm.createDirectory(atPath: lent, withIntermediateDirectories: true)
+            put(lent, "agent2.env", "# (account: agent-2@example.com)\nZAI_API_KEY=key-agent2\n")
+            expectEqual(ZaiKeyFile.scan(directories: [pool, lent]).first { $0.label == "agent2" }?.email,
+                        "agent-2@example.com", "a later duplicate of a key lends its email to an email-less winner")
+
+            // Two different keys under one label are one account: first wins.
+            let rotated = dir.appendingPathComponent("rotated").path
+            try? fm.createDirectory(atPath: rotated, withIntermediateDirectories: true)
+            put(rotated, "agent1.env", "ZAI_API_KEY=key-agent1-new\n")
+            expectEqual(ZaiKeyFile.scan(directories: [rotated, pool]).filter { $0.label == "agent1" }.map(\.apiKey),
+                        ["key-agent1-new"], "one seat per account id; the earlier directory's key wins")
+
+            // An unreadable .disabled withholds the directory (fail closed).
+            let broken = dir.appendingPathComponent("broken").path
+            try? fm.createDirectory(atPath: (broken as NSString).appendingPathComponent(".disabled"),
+                                    withIntermediateDirectories: true)
+            put(broken, "seat.env", "ZAI_API_KEY=key-seat\n")
+            expect(ZaiKeyFile.disabledLabels(directory: broken) == nil, "an unreadable .disabled is reported, not empty")
+            expectEqual(ZaiKeyFile.scan(directory: broken).count, 0,
+                        "an unreadable .disabled never reads as 'nothing is disabled'")
+        }
+    }
+
+    /// #249: a key never reaches output — not through interpolation, `dump`,
+    /// or the `zai import` progress line.
+    private static func testZaiKeyNeverRendered() {
+        let secret = "fixture-secret-key.0123456789"
+        let file = ZaiKeyFile(label: "agent1", email: nil, apiKey: secret)
+        var dumped = ""
+        dump(file, to: &dumped)
+        for (rendering, label) in [("\(file)", "interpolation"), (String(reflecting: file), "debug description"),
+                                   (dumped, "dump"), (ZaiCLI.importLine(file), "zai import line"),
+                                   (String(describing: [file]), "array description")] {
+            expect(!rendering.contains(secret), "a z.ai key never appears in its \(label)")
+        }
+        expect(ZaiCLI.importLine(file).contains("agent1"), "the import line names the seat by label")
+    }
+
+    /// #249: small burn must be visible — 150/140k weekly credits is 0.1%, not 0%.
+    private static func testUsagePercentText() {
+        let cases: [(Double, String)] = [
+            (0, "0%"), (-1, "0%"), (.nan, "0%"), (150.0 / 140_000 * 100, "0.1%"), (0.04, "<0.1%"),
+            (0.7, "0.7%"), (2.5, "2.5%"), (5, "5%"), (9.99, "9.9%"), (10, "10%"), (25.6, "25%"),
+            (99.9, "99%"), (100, "100%"),
+        ]
+        for (value, expected) in cases {
+            expectEqual(UsagePercentText.string(value), expected, "percent text for \(value)")
+        }
+    }
+
+    /// #249: on z.ai the weekly window binds (140k/week vs 28k per 5h), so a
+    /// spent weekly window with an idle 5h window must still export as
+    /// `exhausted` until its `nextResetTime`; and an email-less pool seat is
+    /// still a ranking.json row.
+    private static func testZaiWeeklyExhaustionRanking() {
+        let weeklySpent = """
+            {"code":200,"msg":"Operation successful","success":true,
+             "data":{"level":"max","limits":[
+               {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":0,"remaining":28000,"percentage":0},
+               {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":140000,
+                "remaining":0,"percentage":100,"nextResetTime":1790617927983}]}}
+            """
+        let snapshot: ProviderUsageSnapshot
+        do {
+            snapshot = try ZaiAPIClient.snapshot(from: Data(weeklySpent.utf8), httpStatus: 200, accountKey: "zai:agent1")
+        } catch {
+            expect(false, "weekly-spent z.ai fixture should map: \(error)")
+            return
+        }
+        expectEqual(snapshot.rateLimit.session?.usedPercent, 0, "idle 5h window")
+        expectEqual(snapshot.rateLimit.weekly?.isExhausted, true, "weekly window at its cap is exhausted")
+        expectEqual(snapshot.rawFields["overall_status"], "rejected", "a spent weekly window alone rejects the seat")
+        expectEqual(snapshot.rawFields["weekly_status"], "rejected", "weekly_status carries the exhaustion")
+        expectEqual(RankingExporter.mapStatus(overallStatus: snapshot.rawFields["overall_status"],
+                                              sessionStatus: snapshot.rawFields["session_status"],
+                                              weeklyStatus: snapshot.rawFields["weekly_status"],
+                                              credentialActive: true),
+                    "exhausted", "weekly-spent z.ai seat ranks exhausted, not available or rate_limited")
+        expectEqual(RankingExporter.joinKey(email: nil, accountId: "zai:agent1", provider: .zai), "zai:agent1",
+                    "an email-less z.ai seat is keyed by its account id")
+        expect(RankingExporter.joinKey(email: nil, accountId: "org-x", provider: .anthropic) == nil,
+               "other providers still need an email")
+
+        withSelfTestTempDir("zai-ranking") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
+                let reset = snapshot.rateLimit.weekly?.resetAtISO ?? ""
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('zai:agent1', 'agent1', NULL, 'max', ?, 0, 'zai')
+                """, now)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('zai:agent2', 'agent2', NULL, 'max', ?, 1, 'zai')
+                """, now)
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent, weekly_all_percent,
+                         weekly_sonnet_percent, weekly_reset, raw_data, is_synthetic)
+                    VALUES ('zai:agent1', ?, 100, 0, 100, 0, ?,
+                            '{"overall_status":"rejected","session_status":"allowed","weekly_status":"rejected"}', 0)
+                """, now, reset)
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent, weekly_all_percent,
+                         weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('zai:agent2', ?, 0.107, 0, 0.107, 0,
+                            '{"overall_status":"allowed","session_status":"allowed","weekly_status":"allowed"}', 0)
+                """, now)
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let accounts = root["accounts"] as? [[String: Any]] else {
+                    expect(false, "z.ai ranking export produced no readable accounts array")
+                    return
+                }
+                let byKey = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
+                    (obj["email"] as? String).map { ($0, obj) }
+                })
+                expectEqual(byKey["zai:agent1"]?["provider"] as? String, "zai", "email-less z.ai seat is a ranking row")
+                expectEqual(byKey["zai:agent1"]?["status"] as? String, "exhausted",
+                            "weekly-spent seat exports exhausted")
+                expect((byKey["zai:agent1"]?["resets"] as? [String: Any])?["7d"] != nil,
+                       "exhausted seat carries its weekly reset, so consumers know when it frees up")
+                let util = (byKey["zai:agent2"]?["utilization"] as? [String: Any])?["7d"] as? Double
+                expect((util ?? 0) > 0, "sub-1% weekly burn survives into ranking.json as non-zero")
+
+                // A reading stored this very second is visible to the store
+                // (`zai import` prints its table right after writing).
+                let instant = Date()
+                expectEqual(UsageStore.usageCutoffString(instant), ISO8601DateFormatter().string(from: instant),
+                            "the load cutoff has the stored timestamps' whole-second shape")
+                let store = UsageStore(dbPath: dbPath)
+                store.loadFromDatabase()
+                expectEqual(store.latestUsage["zai:agent2"]?.weeklyAllPercent, 0.107,
+                            "a reading written in the current second is loaded, not hidden by the cutoff")
+            } catch {
+                expect(false, "z.ai ranking test threw: \(error)")
+            }
+        }
     }
 
     private static func testOpenAIUsageResponseMapping() {

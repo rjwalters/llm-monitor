@@ -50,6 +50,12 @@ import Foundation
 /// session window at all. Consumers must treat a missing key as *unknown*, not
 /// as 0.0 (which would read as "full session capacity available").
 ///
+/// ### z.ai seats without an email (added in #249)
+///
+/// A `provider: "zai"` row whose key file names no email is exported with its
+/// account id (`zai:<label>`) in `email`, rather than dropped — see
+/// `RankingExporter.joinKey`. Every other provider still requires an email.
+///
 /// ### `absent` (added in #135)
 ///
 /// `"absent": true` marks an OpenAI identity this host is *expected* to have
@@ -184,11 +190,13 @@ enum RankingExporter {
 
             for row in accountStmt {
                 guard let accountId = row[0] as? String else { continue }
-                // Acceptance criterion: accounts with a NULL email are excluded
-                // (email is the sole join key — a null key is useless to consumers).
-                guard let email = row[1] as? String, !email.isEmpty else { continue }
                 let plan = row[2] as? String
                 let provider = AccountProvider(stored: hasProvider ? row[3] as? String : nil)
+                // Acceptance criterion: accounts with a NULL email are excluded
+                // (email is the sole join key — a null key is useless to consumers),
+                // except a z.ai seat, which is keyed by its account id (#249).
+                guard let email = joinKey(email: row[1] as? String, accountId: accountId,
+                                          provider: provider) else { continue }
                 let isAbsent = isAbsentCodexIdentity(
                     provider: provider,
                     hasStoredToken: ((row[5] as? Int64) ?? 0) > 0,
@@ -311,6 +319,17 @@ enum RankingExporter {
     }
 
     // MARK: - Helpers
+
+    /// The `email` a row is exported under, or nil to skip it. A z.ai seat
+    /// that only Loom's api-keys pool knows (#249) has no email — the key file
+    /// carries none and the quota API returns no identity — so it is keyed by
+    /// its stable account id `zai:<label>` instead of being dropped. That id
+    /// has no `@`, so it can never collide with a real email, and the row's
+    /// `provider: "zai"` already tells a Claude-only consumer to skip it.
+    static func joinKey(email: String?, accountId: String, provider: AccountProvider) -> String? {
+        if let email = email, !email.isEmpty { return email }
+        return provider == .zai ? accountId : nil
+    }
 
     /// Whether the account's OAuth credential is active, and whether its last
     /// poll was rejected as unauthorized. Reads only the non-secret `is_active`
