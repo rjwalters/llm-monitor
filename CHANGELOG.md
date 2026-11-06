@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Codex usage for Loom profiles comes from `loom-daemon accounts check --live`**
+  (#230, #232). A rollout snapshot is only as current as the account's last Codex
+  turn. When `loom-daemon` is available, its live reading (probed inside the
+  account's own session container) is used instead, but only if it is newer than
+  the snapshot and actually measured something. Any failure falls back silently
+  to the snapshot. This app still spawns no `codex`, reads no `auth.json`, and
+  writes nothing into a profile.
+- **A second instance on the same data directory is refused** (#238, #239). The
+  GUI launch and the headless poll loop take a non-blocking lock on
+  `~/.llm-monitor/instance.lock`. A second launch prints a message and exits 0.
+  The kernel frees the lock when the holder dies. `--version`, `--help`,
+  `selftest` and the one-shot CLIs never take it.
+- **The popover says why a stale or never-read row is blank** (#237). Instead of
+  empty cells, the row shows one line such as
+  `Last reading Sep 29, 6:48 PM · session container stopped` or
+  `No reading yet · profile not logged in`. For a Loom Codex profile the reason
+  comes from the live check. It is display-only and does not affect polling or
+  `ranking.json`.
+- **The popover height is resizable** (#236). Drag the grip on the bottom edge;
+  the height is remembered. Dragging to full content height shows all rows, and
+  double-clicking the grip returns to auto-fit.
+
 ### Changed
 
 - **The UI no longer assumes Claude** (#225). The popover is titled "LLM
@@ -21,8 +45,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleared, is gone from the popover. Token and key fields are masked.
 - **Anthropic-only columns hide when unused** (#227). With no Anthropic account
   in the table, Premium % and Extra disappear and the popover narrows to fit.
+- **The quota-calibration alert is a popover footer line, not a menu-bar dot**
+  (#243, #244). The menu bar shows only the percentage. When tokens per point
+  drop well below baseline, the popover footer says so, for example
+  `Quota calibration: recent tokens/point fell to 0.57x baseline (through 10-05)`.
+  Days with near-empty token data (under 1% of the prior median) are ignored by
+  the alert, because points are pool-wide while token data is this host's
+  transcripts. Stored rows, charts and exports are unchanged.
 
 ### Fixed
+
+- **The time-to-limit projection no longer runs past the window's reset**
+  (#221, #223). A fast-burning session window could show "limited in ~2.3 days"
+  when it resets in 40 minutes, and could beat a real weekly estimate. An
+  estimate that lands at or after its own window's reset is now discarded, and
+  no projection is shown for a stale account. An unknown reset keeps the estimate.
+- **No empty window at launch** (#236). On recent macOS the placeholder
+  Settings scene was presented on every launch; it is now suppressed (macOS 15+).
+- **A revoked Claude credential is now visible** (#240, #241). A 401 poll failure
+  is saved to `oauth_credentials.last_error` (never `last_poll_at`, so the
+  staleness backstop still fires), and `ranking.json` exports that account as
+  `"status": "blocked"` instead of `available` with a frozen reading. A later
+  5xx or network error does not overwrite the stored 401. A token roll or a
+  successful poll clears it.
+- **A missing credential is no longer reported as a 401** (#241). "No access
+  token", "No API key" and an exhausted Codex ladder were relabelled as revoked
+  and exported as `blocked`. They now persist their own reason.
+- **`selftest` could recurse without end** (#234, #235). The push check re-ran the
+  running executable even when it was not the CLI, so a standalone harness
+  spawned a chain hundreds deep (19 h, 5.6 GB RSS, heavy swap). The check now
+  re-execs only a binary that understands `selftest`, a depth guard bounds any
+  chain, and push/pull checks run under a subprocess timeout.
 
 - **A Codex home re-registered after an upgrade was reported as drift.** Older
   `auth.json` files stored the ChatGPT *user* id (`user-…`) as
