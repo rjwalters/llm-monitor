@@ -2,6 +2,11 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-06
+
+- **PR #274**: docs(changelog): backfill Unreleased with user-visible changes since 2.1.0
+- **Issue #273** (closed): Backfill CHANGELOG [Unreleased] with the user-visible PRs merged since 2.1.0
+
 ### 2026-11-01
 
 - **PR #271**: Bump Repo Skills 0.24.7 -> 0.25.1
