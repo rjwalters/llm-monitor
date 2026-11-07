@@ -82,7 +82,8 @@ enum ClaudeCLI {
             Map rolled Claude OAuth tokens onto their accounts now. Reads every
             <name>.token in the token directories (default: ~/.claude-oauth, then the
             Loom pool ~/.loom/tokens; override with LLM_MONITOR_CLAUDE_TOKEN_DIRS or
-            --dir). Each changed token is pinged and stored on the account whose org id
+            --dir; LOOM_SHARED_TOKENS_DIR replaces only the pool entry, empty disables
+            it). Each changed token is pinged and stored on the account whose org id
             it reports, keeping history; a row stored under the wrong id is re-keyed.
             accounts.env entries for rolled accounts are updated. The app and the
             headless daemon do this automatically on every poll tick.

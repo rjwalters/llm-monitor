@@ -40,7 +40,8 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 - **Multi-account.** Add accounts one at a time from **Add Account**, which has
   a Claude / z.ai / Codex picker, or bulk-import a `.env` file of
   `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs. Many accounts need no adding at all:
-  tokens in `~/.claude-oauth` or the Loom pool, keys in `~/.zai`, and Loom Codex
+  tokens in `~/.claude-oauth` or the Loom pool
+  ([details](#rolled-claude-tokens-claude-sync)), keys in `~/.zai`, and Loom Codex
   profiles are picked up automatically.
 - **Multi-provider.** Anthropic and OpenAI/ChatGPT (Codex) accounts sit side by
   side in the same table, each row tagged with a pixel-art provider badge. See
@@ -1091,6 +1092,63 @@ sqlite3 ~/.llm-monitor/usage.db \
      FROM token_usage GROUP BY day ORDER BY day DESC LIMIT 7;"
 ```
 
+## Rolled Claude Tokens (`claude sync`)
+
+Claude OAuth tokens that are minted outside this app (the token-roll runbook)
+are delivered as one file per account, and the app **reads** them: it never
+creates or owns them.
+
+**Where it looks.** By default, in order: `~/.claude-oauth` (delivered by
+chezmoi on operator Macs), then the Loom shared pool, `~/.loom/tokens`. When
+both hold the same `<name>.token`, the first directory wins. A file is
+`<name>.token` holding a single `sk-ant-…` token; whitespace anywhere in it is
+stripped, and hidden or malformed files are skipped. The pool's `index.json`
+(`accounts[].name`/`file` → `email`), if present, supplies each name's email.
+
+**Overrides.**
+
+| Variable | Effect |
+|---|---|
+| `LLM_MONITOR_CLAUDE_TOKEN_DIRS` | Colon-separated list that **replaces the whole default list**. `CLAUDE_MONITOR_CLAUDE_TOKEN_DIRS` is accepted as a fallback. |
+| `LOOM_SHARED_TOKENS_DIR` | Replaces **only the pool entry** (`~/.claude-oauth` stays). Set it to an empty value to disable the pool entry. Ignored when `LLM_MONITOR_CLAUDE_TOKEN_DIRS` is set. |
+
+```bash
+# A worker whose pool lives somewhere else
+LOOM_SHARED_TOKENS_DIR=/srv/loom/tokens llm-monitor claude sync
+# Read exactly these two directories
+LLM_MONITOR_CLAUDE_TOKEN_DIRS=~/tokens-a:~/tokens-b llm-monitor claude sync
+```
+
+**When it runs.** The app and the headless daemon sync at launch and on every
+poll tick. A token that is already stored is skipped without a network call,
+so the steady-state cost is reading the directories. A changed token is pinged
+once and filed under the account whose org id it reports: the credential is
+rolled in place and history is kept. If no account has that org id but the
+file's email names an account stored under a different id, that row is
+re-keyed with all of its history; otherwise a new account is created.
+
+**On demand.**
+
+```bash
+llm-monitor claude sync [--dir <path>]... [--db <path>]
+```
+
+`--dir` (repeatable) replaces the directory list for this run; `--db` uses
+another database (and the `accounts.env` files beside it). It prints the
+directories read, the number of token files found, and one `ok`/`FAIL` line per
+changed file with the account email. It never prints a token. It then
+re-exports `ranking.json`. Exit status: `0` all changed tokens synced (or
+nothing to do), `1` at least one token failed or an option was invalid, `2`
+missing or unknown subcommand (`llm-monitor claude` alone, or `claude foo`).
+
+**`accounts.env` is rewritten.** For each account rolled, the matching
+`ACCOUNT_KEY_N` line in `accounts.env` and `accounts.local.env` (beside the
+database) is replaced with the new token. Other lines, and entries for other
+providers, are left alone. The files stay mode `0600` and are written
+atomically. This is needed because loom-daemon's `tokens bootstrap` ranks
+`accounts.env` first and would otherwise copy the revoked tokens it still holds
+back over the freshly rolled pool.
+
 ## Quota Calibration (`calibrate`)
 
 The two series above answer different halves of the same question. Usage polls
@@ -1285,8 +1343,9 @@ rm ~/Library/LaunchAgents/com.llm-monitor.plist
 ### Menu bar shows "LLM --"
 
 No data yet. Click the widget → **+ Add Account**, pick the provider, and add a
-credential. Or put tokens in `~/.claude-oauth` or keys in `~/.zai`; they're picked
-up automatically.
+credential. Or put tokens in `~/.claude-oauth` (see
+[Rolled Claude Tokens](#rolled-claude-tokens-claude-sync)) or keys in `~/.zai`;
+they're picked up automatically.
 
 ### A new account doesn't appear after import
 
