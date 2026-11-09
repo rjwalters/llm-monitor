@@ -2,6 +2,11 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-09
+
+- **PR #279**: docs: document claude sync and LOOM_SHARED_TOKENS_DIR
+- **Issue #278** (closed): Document `llm-monitor claude sync` and the token-directory overrides in README and --help
+
 ### 2026-11-07
 
 - **PR #276**: Bump Repo Skills 0.25.1 -> 0.25.10
