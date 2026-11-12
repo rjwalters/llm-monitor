@@ -697,7 +697,7 @@ binary. See `CLAUDE.md` for the exact sequence.
 
 - `SessionStart` (`startup` and `resume`) runs
   `.claude/skills/repo/hooks/session-start-handoff.sh`.
-- `PreToolUse` on `Bash` runs `.claude/skills/repo/hooks/guard-destructive.sh`.
+- `PreToolUse` on `Bash` runs `.loom/hooks/guard-destructive.sh` (Loom's guard).
 
 Things to know before trusting the workspace:
 
