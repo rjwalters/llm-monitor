@@ -35,10 +35,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/guard-destructive.sh\""
-          },
-          {
-            "type": "command",
             "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""
           },
           {
