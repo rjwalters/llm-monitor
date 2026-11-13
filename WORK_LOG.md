@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-13
+
+- **PR #283**: Bump Repo Skills 0.25.10 -> 0.26.1
+
 ### 2026-11-09
 
 - **PR #279**: docs: document claude sync and LOOM_SHARED_TOKENS_DIR
