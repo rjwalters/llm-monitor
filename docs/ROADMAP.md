@@ -9,6 +9,9 @@ Status as of 2026-11-13, `main` @ `84df471`.
 [`WORK_PLAN.md`](../WORK_PLAN.md) is generated from issue labels and
 [`WORK_LOG.md`](../WORK_LOG.md) records what merged; this file is the direction.
 
+> This file is human-maintained and intentionally not read by Loom roles' roadmap
+> lookup (which only checks `docs/roadmap.md` / `ROADMAP.md`); don't "fix" the path.
+
 ## Where it stands
 
 Released: **v2.1.0** (2026-09-26, `CHANGELOG.md`). `UsageStore.swift` still
