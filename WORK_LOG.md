@@ -2,6 +2,18 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-14
+
+- **PR #295**: docs: link ROADMAP.md from README and mark it human-maintained
+- **Issue #290** (closed): docs/ROADMAP.md is unreferenced and off the path Loom's roadmap lookup reads
+- **PR #294**: fix: refuse install-linux.sh --from-release on non-x86_64 hosts
+- **Issue #289** (closed): install-linux.sh --from-release: refuse a non-x86_64 host before downloading
+- **PR #286**: docs: roadmap as of 2026-11-13
+- **PR #293**: chore: roll CHANGELOG to 2.2.0 and bump version strings
+- **Issue #287** (closed): Prepare the 2.2.0 release: roll CHANGELOG [Unreleased] and bump the version
+- **PR #292**: feat: add --list and --filter to selftest
+- **Issue #288** (closed): selftest: add --list and --filter <substring> to run part of the suite
+
 ### 2026-11-13
 
 - **PR #283**: Bump Repo Skills 0.25.10 -> 0.26.1
