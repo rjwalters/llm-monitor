@@ -43,7 +43,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#286**: docs: roadmap as of 2026-11-13
 
 ## Proposed
 
@@ -51,6 +51,7 @@ Issues carrying `loom:curated`.
 
 - **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)*
 - **#249**: z.ai seats invisible on Loom workers: also discover keys from Loom's shared api-keys pool (~/.loom/api-keys/zai), show sub-1% burn *(curated)*
+- **#288**: selftest: add --list and --filter <substring> to run part of the suite *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -70,8 +71,8 @@ _None._
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 0 |
-| Curated | 2 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
