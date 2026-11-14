@@ -821,7 +821,11 @@ llm-monitor --interval 300   # override per-account poll interval (seconds, min 
 llm-monitor --version        # print the version and exit
 llm-monitor calibrate        # daily tokens/cost per weekly point, JSON on stdout
 llm-monitor selftest         # self-check (no network/credentials); non-zero exit on failure
+llm-monitor selftest --list  # print every test name (the name minus its `test` prefix), run nothing
+llm-monitor selftest --filter calibration  # run only tests whose name contains the substring (case-insensitive)
 ```
+
+`--filter <substring>` runs only the matching tests and reports how many ran; a filter that matches nothing exits non-zero, so a typo cannot pass as a green run. It composes with `--db`. `--list` takes precedence and runs nothing.
 
 `selftest` also takes `--db <path>` (migrate and verify a **copy** of a real
 database — it writes, so never point it at the live `usage.db`) and
