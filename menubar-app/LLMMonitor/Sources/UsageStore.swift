@@ -1890,7 +1890,7 @@ class UsageStore: ObservableObject {
 // MARK: - Update Checker
 
 struct AppVersion {
-    static let current = "2.1.0"
+    static let current = "2.2.0"
     static let repoOwner = "rjwalters"
     static let repoName = "llm-monitor"
 }
