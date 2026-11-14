@@ -50,7 +50,8 @@ Binary source (exactly one required):
   --from-release [TAG]   Download the llm-monitor-linux-x64 asset from a
                           GitHub Release (latest if TAG is omitted) and
                           verify its checksum when the release API publishes
-                          one.
+                          one. The asset is x86_64-only: other architectures
+                          (aarch64/arm64) are refused before any download.
   --from-source           Build inside the swift:6.1 Docker container with
                           --static-swift-stdlib (requires docker, no local
                           Swift toolchain needed).
@@ -149,8 +150,21 @@ verify_digest() {
     log "Checksum verified (sha256:$actual)."
 }
 
+# The release asset is x86_64-only; refuse other hosts before downloading.
+# $1 is the machine string (`uname -m`); the override env var is a test seam.
+require_x64_for_release() {
+    local machine="$1"
+    case "$machine" in
+        x86_64|amd64) ;;
+        *)
+            fail "--from-release ships an x86_64 binary only, but this host is '$machine'. Use --from-source to build natively, or --binary PATH."
+            ;;
+    esac
+}
+
 acquire_from_release() {
     local api_path resolved_tag digest
+    require_x64_for_release "${LLM_MONITOR_INSTALL_MACHINE:-$(uname -m)}"
     if [[ -n "$RELEASE_TAG" ]]; then
         api_path="repos/$REPO/releases/tags/$RELEASE_TAG"
     else

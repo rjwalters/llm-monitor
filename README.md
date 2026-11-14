@@ -731,6 +731,8 @@ systemd user unit, seed accounts — in one idempotent, re-runnable command:
 ```bash
 # Fastest path: download the latest static-stdlib release asset, no Swift
 # toolchain needed. Installs to ~/.local/bin (no sudo) and starts the unit.
+# The release asset is x86_64-only; on aarch64/arm64 the script refuses before
+# downloading, so use --from-source there.
 ./scripts/install-linux.sh --from-release
 
 # No GitHub release available yet: build in the swift:6.1 container instead
