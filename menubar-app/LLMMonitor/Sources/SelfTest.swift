@@ -23,6 +23,186 @@ enum SelfTest {
     private nonisolated(unsafe) static var failures: [String] = []
     private nonisolated(unsafe) static var checks = 0
 
+    /// Every check `main` runs, in the order it runs them. `name` is the test
+    /// function's name without its `test` prefix; `--list` prints it and
+    /// `--filter` matches against it (#288).
+    private static let suiteEntries: [(name: String, run: @MainActor () -> Void)] = [
+        ("NaturalSort", { testNaturalSort() }),
+        ("SortedAccountsForPopoverTieBreak", { testSortedAccountsForPopoverTieBreak() }),
+        ("GatingResetOrdering", { testGatingResetOrdering() }),
+        ("StalenessBackstop", { testStalenessBackstop() }),
+        ("BadgePercentSuppression", { testBadgePercentSuppression() }),
+        ("WindowKindDerivation", { testWindowKindDerivation() }),
+        ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
+        ("MissingSessionWindow", { testMissingSessionWindow() }),
+        ("ProviderParsing", { testProviderParsing() }),
+        ("OpenAIUsageResponseMapping", { testOpenAIUsageResponseMapping() }),
+        ("OpenAIRawFieldRedaction", { testOpenAIRawFieldRedaction() }),
+        ("OpenAITokenExpiryParsing", { testOpenAITokenExpiryParsing() }),
+        ("InstanceLock", { testInstanceLock() }),
+        ("ZaiQuotaResponseMapping", { testZaiQuotaResponseMapping() }),
+        ("ZaiKeyFileParsing", { testZaiKeyFileParsing() }),
+        ("DataDirectoryMigration", { testDataDirectoryMigration() }),
+        ("CodexRolloutSnapshotParsing", { testCodexRolloutSnapshotParsing() }),
+        ("CodexProfileSyncSnapshotMode", { testCodexProfileSyncSnapshotMode() }),
+        ("LoomLiveCheckDecoding", { testLoomLiveCheckDecoding() }),
+        ("LoomDaemonBinaryAndWorkspaceResolution", { testLoomDaemonBinaryAndWorkspaceResolution() }),
+        ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
+        ("LoomLiveReadingPreferredOnlyWhenNewer", { testLoomLiveReadingPreferredOnlyWhenNewer() }),
+        ("ClaudeTokenFileScanning", { testClaudeTokenFileScanning() }),
+        ("ClaudeTokenTargetAndAccountsEnv", { testClaudeTokenTargetAndAccountsEnv() }),
+        ("ClaudeAccountRekey", { testClaudeAccountRekey() }),
+        // The macOS-only ProviderColumnVisibility entry is spliced in here by
+        // `suite` below (an `#if` cannot sit inside an array literal).
+        ("CodexAuthParsing", { testCodexAuthParsing() }),
+        ("CodexAppServerFraming", { testCodexAppServerFraming() }),
+        ("CodexAppServerEnvelopeDecoding", { testCodexAppServerEnvelopeDecoding() }),
+        ("CodexVersionDiagnosticLogging", { testCodexVersionDiagnosticLogging() }),
+        ("CodexAppServerMapping", { testCodexAppServerMapping() }),
+        ("CodexAppServerRedaction", { testCodexAppServerRedaction() }),
+        ("CodexSnapshotOfflinePathWritesNoLog", { testCodexSnapshotOfflinePathWritesNoLog() }),
+        ("CodexBinaryResolution", { testCodexBinaryResolution() }),
+        ("CodexProvisionArgParsing", { testCodexProvisionArgParsing() }),
+        ("CodexProvisionIdentityConflict", { testCodexProvisionIdentityConflict() }),
+        ("CodexHomeIdentityGuard", { testCodexHomeIdentityGuard() }),
+        ("CodexIdentityDriftReporting", { testCodexIdentityDriftReporting() }),
+        ("CodexTier2GuardEmailFallback", { testCodexTier2GuardEmailFallback() }),
+        ("DriftVocabularySharedWithCodexList", { testDriftVocabularySharedWithCodexList() }),
+        ("CodexDriftDetailMessage", { testCodexDriftDetailMessage() }),
+        ("CodexIdentityConflictSetsAndClearsDriftedState", { testCodexIdentityConflictSetsAndClearsDriftedState() }),
+        ("CodexHomeResolution", { testCodexHomeResolution() }),
+        ("CodexHomeRegistrationEnumeration", { testCodexHomeRegistrationEnumeration() }),
+        ("CodexAdoptionRepointsExistingRow", { testCodexAdoptionRepointsExistingRow() }),
+        ("CodexAdoptionRegistersNewAccountWhenNoneExists", { testCodexAdoptionRegistersNewAccountWhenNoneExists() }),
+        ("CodexAdoptionSkipsAlreadyAdoptedHome", { testCodexAdoptionSkipsAlreadyAdoptedHome() }),
+        ("CodexAdoptionIgnoresAnthropicRowsForEmailMatch", { testCodexAdoptionIgnoresAnthropicRowsForEmailMatch() }),
+        ("CodexAdoptionConvertsPlaceholderRowWithoutDuplicating", { testCodexAdoptionConvertsPlaceholderRowWithoutDuplicating() }),
+        ("CodexListDiscoversUnregisteredHomes", { testCodexListDiscoversUnregisteredHomes() }),
+        ("CodexAppServerSpawnAgainstStub", { testCodexAppServerSpawnAgainstStub() }),
+        ("CodexPerAccountHomeReachesChild", { testCodexPerAccountHomeReachesChild() }),
+        ("SchemaMigrationFromPreMigrationDatabase", { testSchemaMigrationFromPreMigrationDatabase() }),
+        ("RankingExportCarriesProvider", { testRankingExportCarriesProvider() }),
+        ("RankingExportMarksAbsentIdentity", { testRankingExportMarksAbsentIdentity() }),
+        ("RankingExportBlocksRevokedCredential", { testRankingExportBlocksRevokedCredential() }),
+        ("NamedLimitsRoundTrip", { testNamedLimitsRoundTrip() }),
+        ("HistoryDecimationKeepsFirstLastAndBigJumps", { testHistoryDecimationKeepsFirstLastAndBigJumps() }),
+        ("FullHistoryDecimationMatchesLoadHistory", { testFullHistoryDecimationMatchesLoadHistory() }),
+        ("FullHistoryDecimationAlwaysKeepsNilWeeklyPercent", { testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent() }),
+        ("HistoryCutoffExcludesOlderRows", { testHistoryCutoffExcludesOlderRows() }),
+        ("TokenHistoryRoundTripAndCutoff", { testTokenHistoryRoundTripAndCutoff() }),
+        ("UnattributedTokenDataFallsBackToHostTotal", { testUnattributedTokenDataFallsBackToHostTotal() }),
+        ("TranscriptSchemaMatchesLegacyShape", { testTranscriptSchemaMatchesLegacyShape() }),
+        ("TranscriptSchemaPreservesLegacyRows", { testTranscriptSchemaPreservesLegacyRows() }),
+        ("TranscriptImportOverFixtureTree", { testTranscriptImportOverFixtureTree() }),
+        ("TranscriptImportIsIncrementalAndIdempotent", { testTranscriptImportIsIncrementalAndIdempotent() }),
+        ("TranscriptImportPersistsNoMessageContent", { testTranscriptImportPersistsNoMessageContent() }),
+        ("TranscriptImportBudgetDefersRemainder", { testTranscriptImportBudgetDefersRemainder() }),
+        ("TranscriptImportMissingRootIsTyped", { testTranscriptImportMissingRootIsTyped() }),
+        ("TranscriptPathRedaction", { testTranscriptPathRedaction() }),
+        ("TranscriptRootResolution", { testTranscriptRootResolution() }),
+        ("CalibrationReproducesReferenceSeries", { testCalibrationReproducesReferenceSeries() }),
+        ("CalibrationResetOrderingTieBreaksOnRowid", { testCalibrationResetOrderingTieBreaksOnRowid() }),
+        ("CalibrationOrdersMixedISOShapesByInstant", { testCalibrationOrdersMixedISOShapesByInstant() }),
+        ("CalibrationRecomputeIsIdempotent", { testCalibrationRecomputeIsIdempotent() }),
+        ("CalibrationLowSignalDayHasNoRatio", { testCalibrationLowSignalDayHasNoRatio() }),
+        ("CalibrationDayWithoutTokensOmitsCostEntirely", { testCalibrationDayWithoutTokensOmitsCostEntirely() }),
+        ("CalibrationAttributesTokensOnlyViaExplicitMapping", { testCalibrationAttributesTokensOnlyViaExplicitMapping() }),
+        ("CalibrationExcludesNonAnthropicAccounts", { testCalibrationExcludesNonAnthropicAccounts() }),
+        ("CalibrationCostWeights", { testCalibrationCostWeights() }),
+        ("CalibrationExportFormats", { testCalibrationExportFormats() }),
+        ("CalibrationDayBoundariesAreUTC", { testCalibrationDayBoundariesAreUTC() }),
+        ("CalibrationWindowBoundIsPrefixSafe", { testCalibrationWindowBoundIsPrefixSafe() }),
+        ("CalibrationSchemaMigrationAndUniqueness", { testCalibrationSchemaMigrationAndUniqueness() }),
+        ("CalibrationStepChangeAlertFiresOnceOnReferenceSeries", { testCalibrationStepChangeAlertFiresOnceOnReferenceSeries() }),
+        ("CalibrationStepChangeAlertIgnoresSubThresholdMove", { testCalibrationStepChangeAlertIgnoresSubThresholdMove() }),
+        ("CalibrationStepChangeAlertNoDataNoAlert", { testCalibrationStepChangeAlertNoDataNoAlert() }),
+        ("CalibrationAlertIgnoresNearEmptyTokenDays", { testCalibrationAlertIgnoresNearEmptyTokenDays() }),
+        ("CalibrationAlertEligibilityBoundaries", { testCalibrationAlertEligibilityBoundaries() }),
+        ("CalibrationAlertLatchRearmsAndIgnoresSkippedDays", { testCalibrationAlertLatchRearmsAndIgnoresSkippedDays() }),
+        ("OpenAIImportResolvesExistingAccountByEmail", { testOpenAIImportResolvesExistingAccountByEmail() }),
+        ("ExportAccountsEnvIncludesAllProviders", { testExportAccountsEnvIncludesAllProviders() }),
+        ("ExportAccountsEnvExcludesTokenlessCodexAccount", { testExportAccountsEnvExcludesTokenlessCodexAccount() }),
+        ("ExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty", { testExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty() }),
+        ("ExportAccountsEnvGenuinelyEmptyStoreReturnsNil", { testExportAccountsEnvGenuinelyEmptyStoreReturnsNil() }),
+        ("ParseAccountPairsBackwardCompatibleWithOldFormat", { testParseAccountPairsBackwardCompatibleWithOldFormat() }),
+        ("ParseAccountPairsRoundTripsOpenAIFields", { testParseAccountPairsRoundTripsOpenAIFields() }),
+        ("ParseAccountPairsAcceptsKeylessCodexIdentity", { testParseAccountPairsAcceptsKeylessCodexIdentity() }),
+        ("CodexHomeLabelDerivation", { testCodexHomeLabelDerivation() }),
+        ("DeclaredCodexIdentityIsAbsent", { testDeclaredCodexIdentityIsAbsent() }),
+        ("StoredTokenPredicateAgreesAcrossSurfaces", { testStoredTokenPredicateAgreesAcrossSurfaces() }),
+        ("ProvisioningAbsentIdentityConvertsInPlace", { testProvisioningAbsentIdentityConvertsInPlace() }),
+        ("AbsentIdentityDoesNotMakeAmbientHomeAmbiguous", { testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous() }),
+        ("OpenAIAccountCountIncludesLegacyRowWithUsageHistory", { testOpenAIAccountCountIncludesLegacyRowWithUsageHistory() }),
+        ("StrandedCodexIdentityIsReported", { testStrandedCodexIdentityIsReported() }),
+        ("ExhaustedTiersMessageNeverClaimsAMissingToken", { testExhaustedTiersMessageNeverClaimsAMissingToken() }),
+        ("DeclaredIdentityRePropagates", { testDeclaredIdentityRePropagates() }),
+        ("HeadlessEnvFileCanDeclareIdentities", { testHeadlessEnvFileCanDeclareIdentities() }),
+        ("AbsentVocabularyIsDistinct", { testAbsentVocabularyIsDistinct() }),
+        ("AccountSyncExcludesOpenAIAccounts", { testAccountSyncExcludesOpenAIAccounts() }),
+        ("AccountSyncExportHasUniqueEmailsAndNoOpenAI", { testAccountSyncExportHasUniqueEmailsAndNoOpenAI() }),
+        ("AccountImportCreatesMissingDatabase", { testAccountImportCreatesMissingDatabase() }),
+        ("AccountSyncRemoteArgsAndCommands", { testAccountSyncRemoteArgsAndCommands() }),
+        ("SelfTestCLIResolutionRefusesNonCLIHost", { testSelfTestCLIResolutionRefusesNonCLIHost() }),
+        ("SelfTestReentryGuardRefusesNestedRun", { testSelfTestReentryGuardRefusesNestedRun() }),
+        ("RunProcessTimeoutKillsWedgedChildAndItsDrains", { testRunProcessTimeoutKillsWedgedChildAndItsDrains() }),
+        ("AccountSyncPushStreamsBundleWithoutWritingAFile", { testAccountSyncPushStreamsBundleWithoutWritingAFile() }),
+        ("AccountSyncPushDryRunSendsNoBundle", { testAccountSyncPushDryRunSendsNoBundle() }),
+        ("AccountSyncPushReportsPerHostFailure", { testAccountSyncPushReportsPerHostFailure() }),
+        ("AccountSyncPushSurvivesSSHThatNeverReadsStdin", { testAccountSyncPushSurvivesSSHThatNeverReadsStdin() }),
+        ("AccountSyncPullImportsPeerBundle", { testAccountSyncPullImportsPeerBundle() }),
+        ("AccountSyncPullRejectsUndecodableBodyWithoutEchoingIt", { testAccountSyncPullRejectsUndecodableBodyWithoutEchoingIt() }),
+        ("PipeDrainDeliversEOFAfterChildWriteThenExit", { testPipeDrainDeliversEOFAfterChildWriteThenExit() }),
+        ("MergeDuplicateAccountsSharingEmail", { testMergeDuplicateAccountsSharingEmail() }),
+        ("AccountDeletionRemovesCredentials", { testAccountDeletionRemovesCredentials() }),
+        ("PurgeOrphanedCredentialsMigration", { testPurgeOrphanedCredentialsMigration() }),
+        ("NullOutOpenAITokensMigration", { testNullOutOpenAITokensMigration() }),
+        ("PurgeOrphanedProbeAndNamedLimitsMigration", { testPurgeOrphanedProbeAndNamedLimitsMigration() }),
+        ("ReadOnlyOpenOfWALDatabaseWithoutSHM", { testReadOnlyOpenOfWALDatabaseWithoutSHM() }),
+        ("SelectionOptions", { testSelectionOptions() }),
+    ]
+
+    /// `suiteEntries` with the macOS-only check spliced in after `ClaudeAccountRekey`.
+    private static let suite: [(name: String, run: @MainActor () -> Void)] = {
+        var entries = suiteEntries
+        #if os(macOS)
+        let at = entries.firstIndex { $0.name == "ClaudeAccountRekey" }.map { $0 + 1 } ?? entries.count
+        entries.insert(("ProviderColumnVisibility", { testProviderColumnVisibility() }), at: at)
+        #endif
+        return entries
+    }()
+
+    // MARK: - Selecting part of the suite (#288)
+
+    struct SelfTestOptions: Equatable {
+        var list = false
+        var filter: String?
+    }
+
+    struct OptionError: Error, Equatable { let message: String }
+
+    /// Pure parse of `--list` and `--filter <substring>`; every other flag is
+    /// left to `main`'s own handling. A `--filter` with no value is an error,
+    /// never silently "run everything".
+    static func parseOptions(_ arguments: [String]) -> Result<SelfTestOptions, OptionError> {
+        var options = SelfTestOptions()
+        options.list = arguments.contains("--list")
+        if let idx = arguments.firstIndex(of: "--filter") {
+            guard idx + 1 < arguments.count, !arguments[idx + 1].hasPrefix("--"),
+                  !arguments[idx + 1].isEmpty else {
+                return .failure(OptionError(message: "--filter needs a substring to match"))
+            }
+            options.filter = arguments[idx + 1]
+        }
+        return .success(options)
+    }
+
+    /// Indices (in suite order) of the names containing `filter`, case-insensitively;
+    /// all indices when `filter` is nil.
+    static func select(names: [String], filter: String?) -> [Int] {
+        guard let filter else { return Array(names.indices) }
+        return names.indices.filter { names[$0].lowercased().contains(filter.lowercased()) }
+    }
+
     static func main(_ arguments: [String] = []) -> Never {
         // Before anything else, including --help: a process that got here from
         // a selftest stub must not run the suite again. See `reentryGuardEnvKey`.
@@ -42,10 +222,17 @@ enum SelfTest {
 
         if arguments.contains("--help") || arguments.contains("-h") {
             print("""
-                Usage: llm-monitor selftest [--db <path>] [--wire <path>] [--codex]
+                Usage: llm-monitor selftest [--list] [--filter <substring>] [--db <path>] [--wire <path>] [--codex]
 
                 Runs assertions over the portable core (rate-limit window model,
                 schema migration). No network access and no credentials needed.
+
+                  --list        Print the name of every test, one per line, and
+                                exit 0 without running anything.
+
+                  --filter <s>  Run only the tests whose name contains <s>
+                                (case-insensitive). Exits 1 if none match.
+                                Composes with --db/--wire/--codex.
 
                   --db <path>   Additionally migrate an existing database *copy*
                                 and verify its accounts still load. Point this at
@@ -70,138 +257,26 @@ enum SelfTest {
             exit(0)
         }
 
-        testNaturalSort()
-        testSortedAccountsForPopoverTieBreak()
-        testGatingResetOrdering()
-        testStalenessBackstop()
-        testBadgePercentSuppression()
-        testWindowKindDerivation()
-        testSnapshotFromPositionalWindows()
-        testMissingSessionWindow()
-        testProviderParsing()
-        testOpenAIUsageResponseMapping()
-        testOpenAIRawFieldRedaction()
-        testOpenAITokenExpiryParsing()
-        testInstanceLock()
-        testZaiQuotaResponseMapping()
-        testZaiKeyFileParsing()
-        testDataDirectoryMigration()
-        testCodexRolloutSnapshotParsing()
-        testCodexProfileSyncSnapshotMode()
-        testLoomLiveCheckDecoding()
-        testLoomDaemonBinaryAndWorkspaceResolution()
-        testLoomLiveCheckSpawnAgainstStub()
-        testLoomLiveReadingPreferredOnlyWhenNewer()
-        testClaudeTokenFileScanning()
-        testClaudeTokenTargetAndAccountsEnv()
-        testClaudeAccountRekey()
-        #if os(macOS)
-        testProviderColumnVisibility()
-        #endif
-        testCodexAuthParsing()
-        testCodexAppServerFraming()
-        testCodexAppServerEnvelopeDecoding()
-        testCodexVersionDiagnosticLogging()
-        testCodexAppServerMapping()
-        testCodexAppServerRedaction()
-        testCodexSnapshotOfflinePathWritesNoLog()
-        testCodexBinaryResolution()
-        testCodexProvisionArgParsing()
-        testCodexProvisionIdentityConflict()
-        testCodexHomeIdentityGuard()
-        testCodexIdentityDriftReporting()
-        testCodexTier2GuardEmailFallback()
-        testDriftVocabularySharedWithCodexList()
-        testCodexDriftDetailMessage()
-        testCodexIdentityConflictSetsAndClearsDriftedState()
-        testCodexHomeResolution()
-        testCodexHomeRegistrationEnumeration()
-        testCodexAdoptionRepointsExistingRow()
-        testCodexAdoptionRegistersNewAccountWhenNoneExists()
-        testCodexAdoptionSkipsAlreadyAdoptedHome()
-        testCodexAdoptionIgnoresAnthropicRowsForEmailMatch()
-        testCodexAdoptionConvertsPlaceholderRowWithoutDuplicating()
-        testCodexListDiscoversUnregisteredHomes()
-        testCodexAppServerSpawnAgainstStub()
-        testCodexPerAccountHomeReachesChild()
-        testSchemaMigrationFromPreMigrationDatabase()
-        testRankingExportCarriesProvider()
-        testRankingExportMarksAbsentIdentity()
-        testRankingExportBlocksRevokedCredential()
-        testNamedLimitsRoundTrip()
-        testHistoryDecimationKeepsFirstLastAndBigJumps()
-        testFullHistoryDecimationMatchesLoadHistory()
-        testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent()
-        testHistoryCutoffExcludesOlderRows()
-        testTokenHistoryRoundTripAndCutoff()
-        testUnattributedTokenDataFallsBackToHostTotal()
-        testTranscriptSchemaMatchesLegacyShape()
-        testTranscriptSchemaPreservesLegacyRows()
-        testTranscriptImportOverFixtureTree()
-        testTranscriptImportIsIncrementalAndIdempotent()
-        testTranscriptImportPersistsNoMessageContent()
-        testTranscriptImportBudgetDefersRemainder()
-        testTranscriptImportMissingRootIsTyped()
-        testTranscriptPathRedaction()
-        testTranscriptRootResolution()
-        testCalibrationReproducesReferenceSeries()
-        testCalibrationResetOrderingTieBreaksOnRowid()
-        testCalibrationOrdersMixedISOShapesByInstant()
-        testCalibrationRecomputeIsIdempotent()
-        testCalibrationLowSignalDayHasNoRatio()
-        testCalibrationDayWithoutTokensOmitsCostEntirely()
-        testCalibrationAttributesTokensOnlyViaExplicitMapping()
-        testCalibrationExcludesNonAnthropicAccounts()
-        testCalibrationCostWeights()
-        testCalibrationExportFormats()
-        testCalibrationDayBoundariesAreUTC()
-        testCalibrationWindowBoundIsPrefixSafe()
-        testCalibrationSchemaMigrationAndUniqueness()
-        testCalibrationStepChangeAlertFiresOnceOnReferenceSeries()
-        testCalibrationStepChangeAlertIgnoresSubThresholdMove()
-        testCalibrationStepChangeAlertNoDataNoAlert()
-        testCalibrationAlertIgnoresNearEmptyTokenDays()
-        testCalibrationAlertEligibilityBoundaries()
-        testCalibrationAlertLatchRearmsAndIgnoresSkippedDays()
-        testOpenAIImportResolvesExistingAccountByEmail()
-        testExportAccountsEnvIncludesAllProviders()
-        testExportAccountsEnvExcludesTokenlessCodexAccount()
-        testExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty()
-        testExportAccountsEnvGenuinelyEmptyStoreReturnsNil()
-        testParseAccountPairsBackwardCompatibleWithOldFormat()
-        testParseAccountPairsRoundTripsOpenAIFields()
-        testParseAccountPairsAcceptsKeylessCodexIdentity()
-        testCodexHomeLabelDerivation()
-        testDeclaredCodexIdentityIsAbsent()
-        testStoredTokenPredicateAgreesAcrossSurfaces()
-        testProvisioningAbsentIdentityConvertsInPlace()
-        testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous()
-        testOpenAIAccountCountIncludesLegacyRowWithUsageHistory()
-        testStrandedCodexIdentityIsReported()
-        testExhaustedTiersMessageNeverClaimsAMissingToken()
-        testDeclaredIdentityRePropagates()
-        testHeadlessEnvFileCanDeclareIdentities()
-        testAbsentVocabularyIsDistinct()
-        testAccountSyncExcludesOpenAIAccounts()
-        testAccountSyncExportHasUniqueEmailsAndNoOpenAI()
-        testAccountImportCreatesMissingDatabase()
-        testAccountSyncRemoteArgsAndCommands()
-        testSelfTestCLIResolutionRefusesNonCLIHost()
-        testSelfTestReentryGuardRefusesNestedRun()
-        testRunProcessTimeoutKillsWedgedChildAndItsDrains()
-        testAccountSyncPushStreamsBundleWithoutWritingAFile()
-        testAccountSyncPushDryRunSendsNoBundle()
-        testAccountSyncPushReportsPerHostFailure()
-        testAccountSyncPushSurvivesSSHThatNeverReadsStdin()
-        testAccountSyncPullImportsPeerBundle()
-        testAccountSyncPullRejectsUndecodableBodyWithoutEchoingIt()
-        testPipeDrainDeliversEOFAfterChildWriteThenExit()
-        testMergeDuplicateAccountsSharingEmail()
-        testAccountDeletionRemovesCredentials()
-        testPurgeOrphanedCredentialsMigration()
-        testNullOutOpenAITokensMigration()
-        testPurgeOrphanedProbeAndNamedLimitsMigration()
-        testReadOnlyOpenOfWALDatabaseWithoutSHM()
+        let options: SelfTestOptions
+        switch parseOptions(arguments) {
+        case .success(let parsed): options = parsed
+        case .failure(let error):
+            FileHandle.standardError.write(Data("selftest: \(error.message)\n".utf8))
+            exit(2)
+        }
+        let names = suite.map(\.name)
+        if options.list {
+            for name in names { print(name) }
+            exit(0)
+        }
+        let selected = select(names: names, filter: options.filter)
+        if let filter = options.filter, selected.isEmpty {
+            FileHandle.standardError.write(Data(
+                "selftest: no test name contains \"\(filter)\" — run `selftest --list` to see them\n".utf8))
+            exit(1)
+        }
+        for index in selected { suite[index].run() }
+
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -217,6 +292,9 @@ enum SelfTest {
 
         if failures.isEmpty {
             print("selftest: \(checks) check(s) passed")
+            if let filter = options.filter {
+                print("selftest: ran \(selected.count) of \(suite.count) test(s) matching \"\(filter)\"")
+            }
             exit(0)
         }
         for failure in failures {
@@ -224,6 +302,26 @@ enum SelfTest {
         }
         FileHandle.standardError.write(Data("selftest: \(failures.count)/\(checks) check(s) failed\n".utf8))
         exit(1)
+    }
+
+    // MARK: - --list / --filter parsing (#288)
+
+    private static func testSelectionOptions() {
+        let names = ["NaturalSort", "CalibrationReset", "calibrationAlerts", "AccountSyncPush"]
+        expect(parseOptions(["--list"]) == .success(SelfTestOptions(list: true, filter: nil)),
+               "--list is recognised")
+        expect(parseOptions([]) == .success(SelfTestOptions()), "no flags: run everything")
+        expect(parseOptions(["--filter", "calib", "--db", "/tmp/x"])
+               == .success(SelfTestOptions(list: false, filter: "calib")),
+               "--filter composes with --db")
+        expect(parseOptions(["--filter"]) == .failure(OptionError(message: "--filter needs a substring to match")),
+               "--filter without a value is an error")
+        expect(parseOptions(["--filter", "--db"]) != .success(SelfTestOptions(list: false, filter: "--db")),
+               "--filter does not swallow the next flag")
+        expect(select(names: names, filter: nil) == [0, 1, 2, 3], "no filter selects all, in order")
+        expect(select(names: names, filter: "CALIBRATION") == [1, 2], "match is case-insensitive substring")
+        expect(select(names: names, filter: "natural") == [0], "filter matching exactly one")
+        expect(select(names: names, filter: "zzz").isEmpty, "no match selects nothing")
     }
 
     // MARK: - Re-entering this suite from a child process (#234)
