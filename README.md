@@ -296,6 +296,11 @@ llm-monitor codex list
 #   → llm-monitor codex add --home <path>
 ```
 
+An account whose latest `wham/usage` reading carried reset credits also prints
+an unused-reset line, e.g. `  → 1 unused limit reset` (with `· limit reached —
+1 applicable now` appended when the account is cut off and a reset is
+spendable). Accounts whose readings carry no reset credits print nothing extra.
+
 `list` reports each home's live state: **logged in**, **needs login** (the home
 exists but `codex login` hasn't been run in it), **home missing** (the directory
 is gone — re-register), **drift** (see below), **absent** (see
@@ -1016,6 +1021,7 @@ atomically, so a reader never sees a partial document.
       "status":      "available",
       "utilization": { "7d": 0.14 },      // note: no "5h" key — see below
       "resets":      { "7d": "…Z" },
+      "reset_credits": { "available_count": 1, "applicable_available_count": 0 },   // optional
       "updated_at":  "2026-07-30T17:58:00Z"
     },
     {
@@ -1054,6 +1060,17 @@ atomically, so a reader never sees a partial document.
   credential here is broken" (`blocked`) apart from "this host was never set up
   for that identity" (`blocked` + `absent`), which is what makes a fleet-wide
   "who is missing which account?" view possible at all. `schema` stays **1**.
+- **`reset_credits` is new and additive (#298).** The unused limit resets a
+  Codex subscription carries, read from the latest `wham/usage` reading's
+  `rate_limit_reset_credits` object. `available_count` is how many unused
+  resets the account holds; `applicable_available_count` is how many could be
+  spent right now (0 while no limit has been reached). The object appears only
+  when the latest reading carried it, and each count is omitted when unknown —
+  absence always means **unknown**, never 0. Anthropic accounts and Codex
+  readings taken through `codex app-server` or rollout snapshots never carry
+  the object, so they simply omit it. The interpretation is unverified (no
+  reset has actually been spent to confirm it), so treat the numbers as "unused
+  resets on the account", nothing stronger. `schema` stays **1**.
 - Accounts with a `NULL` email are still excluded entirely; `email` remains the
   sole join key, and it is not unique across providers — one person's Anthropic
   and OpenAI accounts can share an address, distinguished by `provider`.

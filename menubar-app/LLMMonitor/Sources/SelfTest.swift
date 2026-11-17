@@ -39,6 +39,7 @@ enum SelfTest {
         ("MissingSessionWindow", { testMissingSessionWindow() }),
         ("ProviderParsing", { testProviderParsing() }),
         ("OpenAIUsageResponseMapping", { testOpenAIUsageResponseMapping() }),
+        ("OpenAIResetCredits", { testOpenAIResetCredits() }),
         ("OpenAIRawFieldRedaction", { testOpenAIRawFieldRedaction() }),
         ("OpenAITokenExpiryParsing", { testOpenAITokenExpiryParsing() }),
         ("InstanceLock", { testInstanceLock() }),
@@ -84,6 +85,7 @@ enum SelfTest {
         ("CodexPerAccountHomeReachesChild", { testCodexPerAccountHomeReachesChild() }),
         ("SchemaMigrationFromPreMigrationDatabase", { testSchemaMigrationFromPreMigrationDatabase() }),
         ("RankingExportCarriesProvider", { testRankingExportCarriesProvider() }),
+        ("RankingExportCarriesResetCredits", { testRankingExportCarriesResetCredits() }),
         ("RankingExportMarksAbsentIdentity", { testRankingExportMarksAbsentIdentity() }),
         ("RankingExportBlocksRevokedCredential", { testRankingExportBlocksRevokedCredential() }),
         ("NamedLimitsRoundTrip", { testNamedLimitsRoundTrip() }),
@@ -1839,6 +1841,112 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("OpenAI usage mapping threw: \(error)")
+        }
+    }
+
+    /// #298: the `wham/usage` decoder reads `rate_limit_reset_credits` when
+    /// the reply carries it, and a reply without the object — or with `null` —
+    /// decodes exactly as before. Also pins the one stored-reading parse rule
+    /// every display surface shares, and the `codex list` line it feeds.
+    private static func testOpenAIResetCredits() {
+        do {
+            // With the object: both counts decode, and flatten archives them
+            // verbatim (the keys carry no PII) — which is what every display
+            // surface reads back out of `usage_history.raw_data`.
+            let withCredits = openAIUsageFixture.replacingOccurrences(
+                of: "\"code_review_rate_limit\": null,",
+                with: """
+                "code_review_rate_limit": null,
+                  "rate_limit_reset_credits": {"available_count": 1, "applicable_available_count": 0},
+                """
+            )
+            let decoded = try OpenAIUsageResponse.decode(Data(withCredits.utf8))
+            expectEqual(decoded.resetCredits?.availableCount, 1, "available_count decodes")
+            expectEqual(decoded.resetCredits?.applicableAvailableCount, 0,
+                        "applicable_available_count decodes")
+            let archived = try OpenAIAPIClient.snapshot(from: Data(withCredits.utf8), httpStatus: 200).rawFields
+            expectEqual(archived["rate_limit_reset_credits.available_count"], "1",
+                        "flatten archives available_count under the verbatim path")
+            expectEqual(archived["rate_limit_reset_credits.applicable_available_count"], "0",
+                        "flatten archives applicable_available_count under the verbatim path")
+
+            // Without the object: decodes as before, credits unknown.
+            let plain = try OpenAIUsageResponse.decode(Data(openAIUsageFixture.utf8))
+            expect(plain.resetCredits == nil, "a reply without the object decodes as before")
+
+            // With null: unknown too.
+            let nullCredits = openAIUsageFixture.replacingOccurrences(
+                of: "\"code_review_rate_limit\": null,",
+                with: """
+                "code_review_rate_limit": null,
+                  "rate_limit_reset_credits": null,
+                """
+            )
+            let nulled = try OpenAIUsageResponse.decode(Data(nullCredits.utf8))
+            expect(nulled.resetCredits == nil, "a null rate_limit_reset_credits decodes to nil")
+
+            // Only one of the two fields: the absent sibling stays unknown.
+            let oneField = openAIUsageFixture.replacingOccurrences(
+                of: "\"code_review_rate_limit\": null,",
+                with: """
+                "code_review_rate_limit": null,
+                  "rate_limit_reset_credits": {"available_count": 2},
+                """
+            )
+            let partial = try OpenAIUsageResponse.decode(Data(oneField.utf8))
+            expectEqual(partial.resetCredits?.availableCount, 2, "a partial object still decodes")
+            expect(partial.resetCredits?.applicableAvailableCount == nil,
+                   "the absent sibling is unknown, never 0")
+
+            // The stored-reading parse rule: the archive is a [String: String]
+            // JSON map, so the counts come back as strings; limitReached rides
+            // the compact status keys written beside them.
+            let blob = """
+            {"overall_status":"allowed","rate_limit_reset_credits.available_count":"1","rate_limit_reset_credits.applicable_available_count":"0","weekly_status":"rejected"}
+            """
+            let reading = OpenAIUsageResponse.parseStoredReading(blob)
+            expectEqual(reading.credits?.availableCount, 1, "stored parse reads string values")
+            expectEqual(reading.credits?.applicableAvailableCount, 0,
+                        "a known 0 parses as 0, not unknown")
+            expect(reading.limitReached, "a rejected weekly_status reads as limit reached")
+
+            expect(OpenAIUsageResponse.parseStoredReading(nil).credits == nil,
+                   "no blob parses as unknown")
+            expect(OpenAIUsageResponse.parseStoredReading("{\"overall_status\":\"allowed\"}").credits == nil,
+                   "a blob without the keys parses as unknown")
+            expect(!OpenAIUsageResponse.parseStoredReading("{\"weekly_status\":\"allowed\"}").limitReached,
+                   "an allowed reading is not limit reached")
+
+            // codex list's line: shown when counts are known, nothing extra
+            // otherwise, singular/plural honest, and the applicable marker
+            // only when the limit is actually reached.
+            func stored(_ available: Int?, _ applicable: Int?, _ reached: Bool)
+                -> OpenAIUsageResponse.StoredResetCredits {
+                OpenAIUsageResponse.StoredResetCredits(
+                    credits: (available != nil || applicable != nil)
+                        ? OpenAIUsageResponse.ResetCredits(
+                            availableCount: available, applicableAvailableCount: applicable)
+                        : nil,
+                    limitReached: reached
+                )
+            }
+            expectEqual(CodexCLI.resetCreditsSummary(stored(1, 0, false)),
+                        "  → 1 unused limit reset", "codex list line, singular")
+            expectEqual(CodexCLI.resetCreditsSummary(stored(3, 0, false)),
+                        "  → 3 unused limit resets", "codex list line, plural")
+            expectEqual(CodexCLI.resetCreditsSummary(stored(1, 1, true)),
+                        "  → 1 unused limit reset · limit reached — 1 applicable now",
+                        "the spendable-reset marker names the reached limit")
+            expectEqual(CodexCLI.resetCreditsSummary(stored(0, 0, true)),
+                        "  → 0 unused limit resets",
+                        "a known 0 count is still shown — only no reading prints nothing extra")
+            expect(CodexCLI.resetCreditsSummary(nil) == nil,
+                   "no reading prints nothing extra")
+            expect(CodexCLI.resetCreditsSummary(stored(nil, nil, true)) == nil,
+                   "a reading without counts prints nothing extra")
+        } catch {
+            checks += 1
+            failures.append("OpenAI reset-credits test threw: \(error)")
         }
     }
 
@@ -8880,6 +8988,78 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("ranking export test threw: \(error)")
+            }
+        }
+    }
+
+    /// #298: `ranking.json` carries both reset-credit counts **additively**
+    /// when the latest reading has them — a known 0 exported as 0, not
+    /// omitted — and omits the key entirely when the reading carries none.
+    /// `schema` stays 1.
+    private static func testRankingExportCarriesResetCredits() {
+        withSelfTestTempDir("ranking-reset-credits") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
+
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
+
+                // The raw_data blobs are shaped exactly as
+                // `OAuthPoller.writeUsageToDB` archives them: a
+                // `[String: String]` JSON map with the verbatim flatten paths.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-credits', 'c@example.com', 'c@example.com', 'pro', ?, 0, 'openai')
+                """, now)
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('user-credits', ?, 14, NULL, 14, 0,
+                            '{"overall_status":"allowed","rate_limit_reset_credits.available_count":"1","rate_limit_reset_credits.applicable_available_count":"0","weekly_status":"allowed"}', 0)
+                """, now)
+                // A same-provider reading with no reset-credit keys at all.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-nocredits', 'n@example.com', 'n@example.com', 'pro', ?, 1, 'openai')
+                """, now)
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('user-nocredits', ?, 14, NULL, 14, 0,
+                            '{"overall_status":"allowed","weekly_status":"allowed"}', 0)
+                """, now)
+
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let accounts = root["accounts"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("ranking export produced no readable accounts array")
+                    return
+                }
+
+                expectEqual(root["schema"] as? Int, RankingExporter.schemaVersion,
+                            "reset_credits is additive — the schema version does not change")
+                let byEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
+                    guard let email = obj["email"] as? String else { return nil }
+                    return (email, obj)
+                })
+
+                let withCredits = byEmail["c@example.com"]?["reset_credits"] as? [String: Any]
+                expectEqual(withCredits?["available_count"] as? Int, 1,
+                            "available_count exported when known")
+                expectEqual(withCredits?["applicable_available_count"] as? Int, 0,
+                            "a known 0 is exported as 0, never omitted")
+                expect(byEmail["n@example.com"]?["reset_credits"] == nil,
+                       "the key is omitted entirely when the reading carries none")
+            } catch {
+                checks += 1
+                failures.append("ranking reset-credits test threw: \(error)")
             }
         }
     }

@@ -415,6 +415,11 @@ enum CodexCLI {
                         home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
                     }
                     print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
+                    if let resetLine = resetCreditsSummary(
+                        store.latestResetCredits(accountId: account.accountId)
+                    ) {
+                        print(resetLine)
+                    }
                     if account.isSnapshotOnly, let profileHome = account.codexHome {
                         print("  → \(snapshotSummary(home: profileHome))")
                     }
@@ -471,6 +476,29 @@ enum CodexCLI {
             exit(0)
         }
         dispatchMain()
+    }
+
+    /// One line describing an account's unused limit resets (#298), parsed
+    /// from its latest stored reading (`wham/usage`'s
+    /// `rate_limit_reset_credits`, archived in `usage_history.raw_data`).
+    /// nil when the reading carried no counts — an account with no
+    /// reset-credit reading prints nothing extra. The count is labeled
+    /// "unused" because that is all the wire states; what spending one does
+    /// is unverified, so the line claims nothing beyond the count. A reached
+    /// limit with an applicable reset is called out, since that is the one
+    /// case where a reset is spendable right now.
+    static func resetCreditsSummary(_ reading: OpenAIUsageResponse.StoredResetCredits?) -> String? {
+        guard let credits = reading?.credits else { return nil }
+        var parts: [String] = []
+        if let available = credits.availableCount {
+            parts.append("\(available) unused limit reset\(available == 1 ? "" : "s")")
+        }
+        if reading?.limitReached == true,
+           let applicable = credits.applicableAvailableCount, applicable > 0 {
+            parts.append("limit reached — \(applicable) applicable now")
+        }
+        guard !parts.isEmpty else { return nil }
+        return "  → " + parts.joined(separator: " · ")
     }
 
     /// One line describing a Loom profile's latest rate-limit snapshot, read
