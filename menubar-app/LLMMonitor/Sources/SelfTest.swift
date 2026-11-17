@@ -109,6 +109,7 @@ enum SelfTest {
         ("TranscriptRootResolution", { testTranscriptRootResolution() }),
         ("CalibrationReproducesReferenceSeries", { testCalibrationReproducesReferenceSeries() }),
         ("CalibrationResetOrderingTieBreaksOnRowid", { testCalibrationResetOrderingTieBreaksOnRowid() }),
+        ("LatestUsageTieBreaksToRealRowAfterReset", { testLatestUsageTieBreaksToRealRowAfterReset() }),
         ("CalibrationOrdersMixedISOShapesByInstant", { testCalibrationOrdersMixedISOShapesByInstant() }),
         ("CalibrationRecomputeIsIdempotent", { testCalibrationRecomputeIsIdempotent() }),
         ("CalibrationLowSignalDayHasNoRatio", { testCalibrationLowSignalDayHasNoRatio() }),
@@ -5309,6 +5310,125 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("calibration tie-break test threw: \(error)")
+            }
+        }
+    }
+
+    /// The "newest row" point reads must resolve a whole-second tie to the
+    /// real row, never the synthetic zero row a reset writes beside it (#310).
+    ///
+    /// `writeUsageToDB` derives the zero row's timestamp and the real row's
+    /// timestamp from **one** clock read, so a reset always produces a tie on
+    /// the reset second — and the real row is inserted last, so a
+    /// `rowid DESC` tiebreak picks it. Before #310 the live-poll path took a
+    /// second `Date()` read that could land a second *later* than the real
+    /// row's, and no read carried a tiebreak at all: when the zero row won,
+    /// every `latestUsage` consumer (popover, menubar, tally, `accounts list`)
+    /// read 0% weekly and NULL resets until the next poll.
+    ///
+    /// This drives the real write path (not hand-inserted rows) through both
+    /// shapes: a fixed `observedAt` (the Codex-snapshot tie) and `nil` (the
+    /// live-poll path whose two clock reads used to be able to straddle a
+    /// second boundary). The calibration series is unaffected by design: it
+    /// keeps synthetic rows and orders on `(parsed instant, rowid)` itself
+    /// (pinned by `testCalibrationResetOrderingTieBreaksOnRowid` above).
+    private static func testLatestUsageTieBreaksToRealRowAfterReset() {
+        withSelfTestTempDir("latest-usage-reset-tie") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+                try db.run(
+                    "INSERT INTO accounts (id, account_name, email, plan, provider) VALUES ('acct-tie', 'acct-tie', 'tie@example.com', 'pro', 'anthropic')")
+
+                // Seed: a high weekly reading, no drop, no synthetic rows.
+                let t1 = UsageRecord.parseISO("2026-03-01T10:00:00Z") ?? Date()
+                poller.writeUsageToDB(
+                    accountId: "acct-tie", sessionPercent: 40, weeklyPercent: 80,
+                    sessionReset: "2026-03-01T15:00:00Z", weeklyReset: "2026-03-05T10:00:00Z",
+                    rawFields: ["anthropic-ratelimit-unified-7d": "80"],
+                    probeModel: "haiku", httpStatus: 200, observedAt: t1)
+
+                // The reset (80 → 12, drop > 5) with a fixed `observedAt`: the
+                // synthetic zero row and the real row share second 11:00:00.
+                let t2 = UsageRecord.parseISO("2026-03-01T11:00:00Z") ?? Date()
+                poller.writeUsageToDB(
+                    accountId: "acct-tie", sessionPercent: 5, weeklyPercent: 12,
+                    sessionReset: "2026-03-01T16:00:00Z", weeklyReset: "2026-03-08T11:00:00Z",
+                    rawFields: ["rate_limit_reset_credits.available_count": "2"],
+                    probeModel: "haiku", httpStatus: 200, observedAt: t2)
+
+                // The tie this test exists for: exactly two rows on the reset
+                // second, one synthetic and one real — anything else and the
+                // assertions below would not be exercising the tiebreak.
+                var tieRows: [(Int64, Double?)] = []
+                for row in try db.prepare(
+                    "SELECT is_synthetic, weekly_all_percent FROM usage_history WHERE account_id = 'acct-tie' AND timestamp = '2026-03-01T11:00:00Z' ORDER BY rowid"
+                ) {
+                    tieRows.append(((row[0] as? Int64) ?? 0, row[1] as? Double))
+                }
+                expectEqual(tieRows.count, 2, "a reset writes exactly the synthetic zero and the real row on the reset second")
+                expect(tieRows[0].0 == 1 && tieRows[0].1 == 0.0 && tieRows[1].0 == 0 && tieRows[1].1 == 12.0,
+                       "the zero row is inserted first and the real row last, so the rowid tiebreak can only pick the real one")
+
+                // Consumer surface: both of `loadFromDatabase`'s point reads
+                // (the `latestPercent` read and the latest-record read) must
+                // return the real row, not the zero row.
+                let store = UsageStore(dbPath: dbPath)
+                store.loadFromDatabase()
+                expectEqual(store.accounts.first?.latestPercent, 12.0,
+                            "the menubar percent read resolves the tie to the real row (the zero row would read 0)")
+                let record = store.latestUsage["acct-tie"]
+                expectEqual(record?.weeklyAllPercent, 12.0,
+                            "the latest-record read carries the real weekly figure")
+                expect(record?.weeklyReset == "2026-03-08T11:00:00Z" && record?.sessionReset == "2026-03-01T16:00:00Z",
+                       "resets come from the real row (the zero row's are NULL)")
+                expectEqual(record?.resetCredits?.availableCount, 2,
+                            "raw_data comes from the real row — the zero row's is NULL, so a synthetic win would read unknown")
+
+                // Live-poll path (`observedAt == nil`): the bracket and the
+                // real row now come from one clock read, so a second reset ties
+                // by construction instead of racing a second `Date()`.
+                poller.writeUsageToDB(
+                    accountId: "acct-tie", sessionPercent: 2, weeklyPercent: 6,
+                    sessionReset: "2026-03-01T17:00:00Z", weeklyReset: "2026-03-15T11:00:00Z",
+                    rawFields: [:], probeModel: "haiku", httpStatus: 200)
+                var newest: (synthetic: Int64, weekly: Double?, raw: String?) = (0, nil, nil)
+                for row in try db.prepare(
+                    "SELECT is_synthetic, weekly_all_percent, raw_data FROM usage_history WHERE account_id = 'acct-tie' ORDER BY timestamp DESC, rowid DESC LIMIT 1"
+                ) {
+                    newest = ((row[0] as? Int64) ?? 0, row[1] as? Double, row[2] as? String)
+                }
+                expect(newest.synthetic == 0 && newest.weekly == 6.0 && newest.raw != nil,
+                       "the live-poll reset's newest row is the real one (non-synthetic, weekly 6, raw_data present)")
+                var liveTie = 0
+                for row in try db.prepare(
+                    "SELECT COUNT(*) FROM usage_history WHERE account_id = 'acct-tie' AND is_synthetic = 1 AND timestamp = (SELECT timestamp FROM usage_history WHERE account_id = 'acct-tie' AND is_synthetic = 0 ORDER BY timestamp DESC, rowid DESC LIMIT 1)"
+                ) {
+                    liveTie = Int((row[0] as? Int64) ?? 0)
+                }
+                expect(liveTie == 1,
+                       "the live-poll zero row shares the real row's second — one clock read, a tie the tiebreak resolves")
+
+                // Reset detection's own previous-row read must see the real
+                // row (weekly 6), not the zero row (weekly 0): 6 → 0.5 is a
+                // drop > 5 and emits two synthetic rows, while 0 → 0.5 is not
+                // and would emit none.
+                let syntheticsBefore = try db.scalar(
+                    "SELECT COUNT(*) FROM usage_history WHERE account_id = 'acct-tie' AND is_synthetic = 1") as? Int64 ?? 0
+                expectEqual(syntheticsBefore, 4, "two resets emitted two synthetic rows each")
+                poller.writeUsageToDB(
+                    accountId: "acct-tie", sessionPercent: 1, weeklyPercent: 0.5,
+                    sessionReset: "2026-03-01T17:30:00Z", weeklyReset: "2026-03-15T11:30:00Z",
+                    rawFields: [:], probeModel: "haiku", httpStatus: 200)
+                let syntheticsAfter = try db.scalar(
+                    "SELECT COUNT(*) FROM usage_history WHERE account_id = 'acct-tie' AND is_synthetic = 1") as? Int64 ?? 0
+                expectEqual(syntheticsAfter, syntheticsBefore + 2,
+                             "the previous-row read resolved to the real row (6 → 0.5 fires); the zero row (0 → 0.5) would have emitted none")
+            } catch {
+                checks += 1
+                failures.append("latest-usage reset tie test threw: \(error)")
             }
         }
     }
