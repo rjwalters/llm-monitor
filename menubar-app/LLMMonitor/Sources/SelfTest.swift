@@ -821,9 +821,6 @@ enum SelfTest {
                     "a fully-idle tally's line is just the usable count — no exhausted or reset segment")
     }
 
-    /// The persisted tab's fallback (#297): a stored provider that no longer
-    /// has any account demotes to `All`; a stored provider that does — and
-    /// `All` itself — survive the round trip unchanged.
     /// #303: the reset advisor's one rule, at every threshold the policy
     /// names — the weekly gate, the recovery horizon, the pool fraction, the
     /// expiry horizon, the quiet 48 h notice, the 5-hour exclusion, and the
@@ -969,6 +966,9 @@ enum SelfTest {
             now: now), nil, "a quiet account prints no advice line")
     }
 
+    /// The persisted tab's fallback (#297): a stored provider that no longer
+    /// has any account demotes to `All`; a stored provider that does — and
+    /// `All` itself — survive the round trip unchanged.
     private static func testPoolSummaryTabFallback() {
         let accounts = [
             poolAccount("an-1", .anthropic),
