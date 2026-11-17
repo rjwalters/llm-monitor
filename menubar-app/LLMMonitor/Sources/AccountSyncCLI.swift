@@ -1,9 +1,15 @@
 import Foundation
 
-/// `llm-monitor accounts export|import|push|pull` — the CLI surface for
-/// `AccountSync` (issue #16) and its ssh fan-out (#188). Reachable directly on
+/// `llm-monitor accounts export|import|push|pull|list` — the CLI surface for
+/// `AccountSync` (issue #16) and its ssh fan-out (#188), plus the read-only
+/// per-provider pool summary (#297). Reachable directly on
 /// both macOS and Linux without requiring `--headless` or any GUI code, so it
 /// works on headless Loom hosts.
+///
+/// `@MainActor` for the same reason as `ZaiCLI`/`CodexCLI`: `list` reads
+/// through `UsageStore`, and the whole CLI runs to completion synchronously
+/// on the process's initial thread.
+@MainActor
 enum AccountSyncCLI {
     /// `args` is everything after the `accounts` subcommand itself.
     static func main(_ args: [String]) -> Never {
@@ -21,6 +27,8 @@ enum AccountSyncCLI {
             runRemote(Array(args.dropFirst()), verb: .push)
         case "pull":
             runRemote(Array(args.dropFirst()), verb: .pull)
+        case "list":
+            runList(Array(args.dropFirst()))
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -189,6 +197,131 @@ enum AccountSyncCLI {
         }
     }
 
+    // MARK: - list (#297)
+
+    /// Read-only per-provider pool summary: one table per provider, each with
+    /// the same usable/exhausted/next-reset tally the macOS popover's provider
+    /// tabs show (`ProviderPoolSummary`). Status comes from
+    /// `RankingExporter.statusReading` — exactly what `ranking.json` exports —
+    /// so "usable" means the same thing on both surfaces.
+    private static func runList(_ args: [String]) -> Never {
+        var providerFilter: AccountProvider?
+        var dbPath = AccountSync.defaultDBPath
+
+        var i = 0
+        while i < args.count {
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
+                i += 1
+            case .help:
+                printUsage()
+                exit(0)
+            case .notMatched:
+                switch args[i] {
+                case "--provider":
+                    providerFilter = parseProviderFilter(CLIArgs.requireValue(args, i, option: "--provider"))
+                    i += 1
+                default:
+                    CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
+                }
+            }
+            i += 1
+        }
+
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            print("No accounts registered yet (no database at \(dbPath)).")
+            exit(0)
+        }
+
+        let store = UsageStore(dbPath: dbPath)
+        store.loadFromDatabase()
+
+        let db: Connection
+        do {
+            db = try openDatabase(dbPath, readonly: true)
+        } catch {
+            CLIArgs.fail("Could not open '\(dbPath)': \(error.localizedDescription)")
+        }
+
+        let inputs = store.accounts.map { account -> PoolAccountInput in
+            let status = RankingExporter.statusReading(db: db, accountId: account.id).status
+            return PoolAccountInput(account: account, usage: store.latestUsage[account.id], status: status)
+        }
+
+        var providers = AccountProvider.allCases.filter { provider in
+            inputs.contains { $0.account.provider == provider }
+        }
+        if let filter = providerFilter {
+            providers = providers.filter { $0 == filter }
+        }
+        guard !providers.isEmpty else {
+            if let filter = providerFilter {
+                print("No accounts for provider \(filter.displayName).")
+            } else {
+                print("No accounts registered.")
+            }
+            exit(0)
+        }
+
+        for provider in providers {
+            let rows = inputs.filter { $0.account.provider == provider }
+            let tally = ProviderPoolSummary.tally(rows)
+            print("")
+            print("\(provider.displayName) — \(ProviderPoolSummary.summaryLine(tally)) (\(tally.total) configured)")
+            print("  " + pad("ACCOUNT", 26) + pad("STATUS", 13) + pad("HEADROOM", 9) + "NEXT RESET")
+            for input in rows {
+                print("  " + listRow(input))
+            }
+        }
+        print("")
+        exit(0)
+    }
+
+    /// `--provider` accepts the operator vocabulary — `claude`/`codex`/`zai`,
+    /// the names the sibling `claude`/`codex`/`zai` CLIs already answer to —
+    /// plus the stored raw values (`anthropic`/`openai`).
+    private static func parseProviderFilter(_ value: String) -> AccountProvider {
+        switch value.lowercased() {
+        case "claude", "anthropic": return .anthropic
+        case "codex", "openai": return .openai
+        case "zai": return .zai
+        default:
+            CLIArgs.fail("Unknown provider '\(value)' (expected claude, codex, or zai)")
+        }
+    }
+
+    /// One table row. Absent identities, never-polled accounts, and stale
+    /// readings are named for what they are rather than passing silently as
+    /// their last exported status.
+    private static func listRow(_ input: PoolAccountInput) -> String {
+        if input.account.isAbsent {
+            return pad(input.account.displayName, 26) + pad(CodexCLI.absentLabel, 13) + pad("—", 9) + "—"
+        }
+        guard let usage = input.usage else {
+            return pad(input.account.displayName, 26) + pad("no reading", 13) + pad("—", 9) + "—"
+        }
+        let stale = AccountFreshness.isStale(lastUpdated: usage.timestamp, pollInterval: 600)
+        let status = stale ? "stale" : (input.status ?? "unknown")
+        let headroom = usage.rateLimit.headroomScore.map { String(format: "%.0f%%", $0) } ?? "—"
+        let reset = usage.rateLimit.gatingWindow?.resetAt.map { formatReset($0) } ?? "—"
+        return pad(input.account.displayName, 26) + pad(status, 13) + pad(headroom, 9) + reset
+    }
+
+    private static func pad(_ s: String, _ width: Int) -> String {
+        s.count >= width ? s + " " : s + String(repeating: " ", count: width - s.count)
+    }
+
+    private static func formatReset(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE MMM d HH:mm"
+        let interval = date.timeIntervalSinceNow
+        // A past reset (a stale row's frozen date) is shown as passed rather
+        // than as an imminent "now"/interval, which would read as good news.
+        let rel = interval <= 0 ? "passed" : formatInterval(interval)
+        return "\(formatter.string(from: date)) (\(rel))"
+    }
+
     private static func printUsage() {
         print("""
             llm-monitor accounts — converge account records + OAuth
@@ -201,6 +334,7 @@ enum AccountSyncCLI {
                                           [--remote-bin <path>] [--ssh-option <opt>] [--db <path>]
               llm-monitor accounts export [--output <path>] [--compact] [--db <path>]
               llm-monitor accounts import <path|-> [--dry-run] [--db <path>]
+              llm-monitor accounts list [--provider claude|codex|zai] [--db <path>]
 
             push is the primary path: it exports this host's bundle in memory
             and streams it over ssh straight into `accounts import -` on each
@@ -243,6 +377,12 @@ enum AccountSyncCLI {
             ~/.llm-monitor/usage.db (and its schema) when the host has
             none yet, so a fresh worker can be converged before it has ever
             polled.
+
+            list prints a read-only per-provider pool summary — usable,
+            exhausted, and earliest next reset per provider, one table per
+            provider, from the last stored readings. --provider narrows to
+            one provider (claude|codex|zai; anthropic/openai accepted too).
+            Nothing is polled and nothing is written.
 
             --db <path> overrides ~/.llm-monitor/usage.db (mainly for
             testing/scripting against an alternate database).

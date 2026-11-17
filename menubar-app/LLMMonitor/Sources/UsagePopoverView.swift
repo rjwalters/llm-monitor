@@ -1,23 +1,8 @@
 #if os(macOS)
 import SwiftUI
 
-/// Format a time interval using a single unit with decreasing precision:
-/// "34 min" (up to 90 min), "1.5 hrs" (half-hour granularity), "3 days" (rounded up).
-func formatInterval(_ seconds: TimeInterval) -> String {
-    if seconds <= 0 { return "now" }
-    let minutes = seconds / 60
-    if minutes < 90 { return "\(Int(minutes)) min" }
-    let hours = seconds / 3600
-    if hours < 24 {
-        let rounded = (hours * 2).rounded() / 2  // nearest 0.5
-        if rounded == rounded.rounded() {
-            return "\(Int(rounded)) hrs"
-        }
-        return String(format: "%.1f hrs", rounded)
-    }
-    let days = Int(ceil(seconds / 86400))
-    return "\(days) \(days == 1 ? "day" : "days")"
-}
+// `formatInterval(_:)` moved to `ProviderPoolSummary.swift` (portable core) so
+// the provider-tab summary line and the `accounts list` CLI share it (#297).
 
 // MARK: - Hover cursor
 
@@ -188,7 +173,7 @@ enum SummarySort: String {
     }
 }
 
-enum SortDirection {
+enum SortDirection: String {
     case asc, desc
     func toggled() -> SortDirection { self == .asc ? .desc : .asc }
 }
@@ -496,10 +481,29 @@ struct UsagePopoverView: View {
     @State private var titleHoverTimer: Timer?
     @State private var showRemoveConfirmation = false
     @State private var accountToRemove: Account?
-    @State private var sortBy: SummarySort = .headroom
-    @State private var sortDir: SortDirection = .desc
+    @State private var sortBy: SummarySort = UsagePopoverView.restoredSortColumn
+    @State private var sortDir: SortDirection = UsagePopoverView.restoredSortDirection
+    @State private var selectedTab: ProviderTab = ProviderTab(
+        stored: UserDefaults.standard.string(forKey: UsagePopoverView.providerTabKey))
     @State private var clipboardHasAccounts = false
     @State private var transferStatus: String?
+
+    // MARK: Persisted table state (#297)
+
+    /// The selected provider tab and the sort column/direction survive
+    /// relaunches through `UserDefaults`, restoring the last thing the user
+    /// looked at instead of the defaults every time.
+    private static let sortColumnKey = "summarySortColumn"
+    private static let sortDirectionKey = "summarySortDirection"
+    private static let providerTabKey = "summaryProviderTab"
+
+    private static var restoredSortColumn: SummarySort {
+        SummarySort(rawValue: UserDefaults.standard.string(forKey: sortColumnKey) ?? "") ?? .headroom
+    }
+
+    private static var restoredSortDirection: SortDirection {
+        SortDirection(rawValue: UserDefaults.standard.string(forKey: sortDirectionKey) ?? "") ?? .desc
+    }
 
     /// Polls the pasteboard so the Copy/Paste toggle reflects clipboard contents.
     private let clipboardTimer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
@@ -524,6 +528,12 @@ struct UsagePopoverView: View {
         (store.error != nil || store.accounts.isEmpty) ? 0 : store.accounts.count
     }
 
+    /// `effectiveRowCount` deliberately counts **all** accounts, not the
+    /// selected tab's: the popover's height never jumps when a tab is
+    /// switched (#297). A 60-row `All` view and a 20-row provider tab both
+    /// live inside the same window height and scroll within it, exactly as
+    /// they already do under `PopoverHeightManager`'s `maxHeight` clamp.
+
     /// Providers represented among the currently-configured accounts. Drives
     /// whether the premium/extra column headers show a provider-specific
     /// title or fall back to a neutral one — see `columnHeading`.
@@ -536,6 +546,80 @@ struct UsagePopoverView: View {
     private var sortedRows: [(account: Account, usage: UsageRecord?)] {
         let pairs = store.accounts.map { ($0, store.latestUsage[$0.id]) }
         return pairs.sorted { compareRows($0, $1) }
+    }
+
+    /// The sorted rows the selected provider tab asks for (#297). The filter
+    /// runs after the sort — order-preserving, and the comparator never looks
+    /// at other rows — so no sort logic changes when a tab is active.
+    private var tabRows: [(account: Account, usage: UsageRecord?)] {
+        switch selectedTab {
+        case .all:
+            return sortedRows
+        case .provider(let provider):
+            return sortedRows.filter { $0.account.provider == provider }
+        }
+    }
+
+    /// Credential-usable map: which account IDs currently have no credential
+    /// that can authenticate a poll. `.valid`/`.refreshing` are the only
+    /// states whose account may report live figures; every other state
+    /// (revoked, expired, errored, drifted, missing) maps to mapStatus's
+    /// `blocked`, exactly as `RankingExporter` blocks a dead credential.
+    private var credentialBlockedIds: Set<String> {
+        Set(oauthPoller.credentialStatuses.compactMap { status in
+            switch status.status {
+            case .valid, .refreshing: return nil
+            case .expired, .revoked, .error, .drifted, .missing: return status.accountId
+            }
+        })
+    }
+
+    /// The pool tallies behind the tab labels and the selected tab's summary
+    /// line (#297). Recomputed per render, like the sort, so counts track
+    /// usage updates live.
+    private var poolTallies: (all: ProviderPoolSummary.Tally, byProvider: [AccountProvider: ProviderPoolSummary.Tally]) {
+        let inputs = store.accounts.map { account -> PoolAccountInput in
+            let usage = store.latestUsage[account.id]
+            return PoolAccountInput(
+                account: account,
+                usage: usage,
+                status: ProviderPoolSummary.windowStatus(
+                    for: usage,
+                    credentialBlocked: credentialBlockedIds.contains(account.id)
+                )
+            )
+        }
+        return (
+            ProviderPoolSummary.tally(inputs, pollInterval: oauthPoller.pollInterval),
+            ProviderPoolSummary.tallyByProvider(inputs, pollInterval: oauthPoller.pollInterval)
+        )
+    }
+
+    /// `All` plus one tab per configured provider, each labelled
+    /// `Name usable/total`.
+    private func providerTabs(_ tallies: (all: ProviderPoolSummary.Tally, byProvider: [AccountProvider: ProviderPoolSummary.Tally]))
+        -> [ProviderTabEntry] {
+        var tabs: [ProviderTabEntry] = [
+            ProviderTabEntry(id: .all, label: "All \(tallies.all.usable)/\(tallies.all.total)")
+        ]
+        for provider in AccountProvider.allCases {
+            guard let tally = tallies.byProvider[provider] else { continue }
+            tabs.append(ProviderTabEntry(id: .provider(provider),
+                                         label: "\(provider.displayName) \(tally.usable)/\(tally.total)"))
+        }
+        return tabs
+    }
+
+    /// The selected tab's shared summary line — usable count, exhausted
+    /// count, earliest next reset among the rest.
+    private func selectedSummaryLine(_ tallies: (all: ProviderPoolSummary.Tally, byProvider: [AccountProvider: ProviderPoolSummary.Tally]))
+        -> String {
+        switch selectedTab {
+        case .all:
+            return ProviderPoolSummary.summaryLine(tallies.all)
+        case .provider(let provider):
+            return ProviderPoolSummary.summaryLine(tallies.byProvider[provider] ?? ProviderPoolSummary.Tally())
+        }
     }
 
     /// Lookup table for token status by account ID — built once per render
@@ -719,12 +803,18 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil, onAddAccount: onAddAccount)
             } else {
+                ProviderTabStrip(
+                    tabs: providerTabs(poolTallies),
+                    selection: $selectedTab,
+                    summary: selectedSummaryLine(poolTallies)
+                )
+                Divider()
                 SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: visibleProviders)
                 Divider()
 
                 ScrollView {
                     VStack(spacing: 0) {
-                        ForEach(sortedRows, id: \.account.id) { item in
+                        ForEach(tabRows, id: \.account.id) { item in
                             SummaryRow(
                                 account: item.account,
                                 usage: item.usage,
@@ -817,6 +907,9 @@ struct UsagePopoverView: View {
             heightManager.setCalibrationNotice(calibrationNotice != nil)
             heightManager.update(rowCount: effectiveRowCount)
             clipboardHasAccounts = Self.clipboardContainsAccounts()
+            // A persisted tab for a provider that no longer has any account
+            // falls back to `All` before the first render settles.
+            selectedTab = selectedTab.validated(among: store.accounts)
         }
         .onReceive(clipboardTimer) { _ in
             clipboardHasAccounts = Self.clipboardContainsAccounts()
@@ -830,6 +923,20 @@ struct UsagePopoverView: View {
         .onChange(of: visibleProviders) { _, providers in
             heightManager.setVisibleProviders(providers)
             heightManager.update(rowCount: effectiveRowCount)
+            // Removing the last account of the selected tab's provider
+            // demotes the selection to `All` (which then persists).
+            if case .provider(let provider) = selectedTab, !providers.contains(provider) {
+                selectedTab = .all
+            }
+        }
+        .onChange(of: selectedTab) { _, tab in
+            UserDefaults.standard.set(tab.storedValue, forKey: Self.providerTabKey)
+        }
+        .onChange(of: sortBy) { _, column in
+            UserDefaults.standard.set(column.rawValue, forKey: Self.sortColumnKey)
+        }
+        .onChange(of: sortDir) { _, direction in
+            UserDefaults.standard.set(direction.rawValue, forKey: Self.sortDirectionKey)
         }
         .alert("Remove Account?", isPresented: $showRemoveConfirmation) {
             Button("Cancel", role: .cancel) { }
@@ -1083,6 +1190,66 @@ struct SortableHeader: View {
             sortBy = column
             sortDir = column.defaultDirection
         }
+    }
+}
+
+// MARK: - Provider tabs (#297)
+
+/// One selectable tab: which slice it selects and its `Name usable/total`
+/// label. A struct rather than a tuple because `ForEach` ids are key paths,
+/// and a key path cannot refer to a tuple element.
+struct ProviderTabEntry: Identifiable {
+    let id: ProviderTab
+    let label: String
+}
+
+/// The provider tab strip: `All` plus one tab per configured provider, each
+/// labelled `Name usable/total`, with the selected tab's shared summary line
+/// trailing on the right. Selecting a tab filters the existing sorted rows —
+/// no new column set, no new sort (`SummaryColumns.shows` still governs the
+/// columns, over all configured accounts, so the table geometry never
+/// changes when a tab is active). `PopoverHeightManager` reserves
+/// `providerTabsHeight` for this one row.
+struct ProviderTabStrip: View {
+    let tabs: [ProviderTabEntry]
+    @Binding var selection: ProviderTab
+    let summary: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(tabs) { entry in
+                Button {
+                    selection = entry.id
+                } label: {
+                    Text(entry.label)
+                        .font(.caption)
+                        .fontWeight(selection == entry.id ? .semibold : .regular)
+                        .foregroundColor(selection == entry.id ? .primary : .secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(selection == entry.id
+                                      ? Color(nsColor: .quaternaryLabelColor)
+                                      : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursorOnHover()
+                .accessibilityLabel(entry.id == .all
+                                    ? "All providers, \(entry.label)"
+                                    : entry.label)
+            }
+            Spacer()
+            Text(summary)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(summary)
+        }
+        .padding(.horizontal, SummaryColumns.horizontalPadding)
+        .padding(.vertical, 4)
     }
 }
 
