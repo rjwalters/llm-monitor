@@ -34,6 +34,7 @@ enum SelfTest {
         ("BadgePercentSuppression", { testBadgePercentSuppression() }),
         ("PoolSummaryTally", { testPoolSummaryTally() }),
         ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
+        ("ResetAdvisor", { testResetAdvisor() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
         ("MissingSessionWindow", { testMissingSessionWindow() }),
@@ -86,6 +87,7 @@ enum SelfTest {
         ("SchemaMigrationFromPreMigrationDatabase", { testSchemaMigrationFromPreMigrationDatabase() }),
         ("RankingExportCarriesProvider", { testRankingExportCarriesProvider() }),
         ("RankingExportCarriesResetCredits", { testRankingExportCarriesResetCredits() }),
+        ("RankingExportCarriesResetAdvice", { testRankingExportCarriesResetAdvice() }),
         ("RankingExportMarksAbsentIdentity", { testRankingExportMarksAbsentIdentity() }),
         ("RankingExportBlocksRevokedCredential", { testRankingExportBlocksRevokedCredential() }),
         ("NamedLimitsRoundTrip", { testNamedLimitsRoundTrip() }),
@@ -822,6 +824,151 @@ enum SelfTest {
     /// The persisted tab's fallback (#297): a stored provider that no longer
     /// has any account demotes to `All`; a stored provider that does — and
     /// `All` itself — survive the round trip unchanged.
+    /// #303: the reset advisor's one rule, at every threshold the policy
+    /// names — the weekly gate, the recovery horizon, the pool fraction, the
+    /// expiry horizon, the quiet 48 h notice, the 5-hour exclusion, and the
+    /// unknown-stays-unknown contract.
+    private static func testResetAdvisor() {
+        let now = Date()
+
+        // Shorthand: rule-1-shaped inputs — reset usable, weekly spent,
+        // natural reset far out, pool short — varying one factor at a time.
+        func adv(
+            weekly: Double? = 98,
+            session: Double? = nil,
+            usable: Bool? = true,
+            count: Int? = 1,
+            endsIn: TimeInterval? = nil,
+            resetIn: TimeInterval? = 30 * 3600,
+            poolFraction: Double? = 0.5
+        ) -> ResetAdvisor.Advice {
+            ResetAdvisor.advise(
+                usage: ResetAdvisor.Usage(
+                    weeklyUsedPercent: weekly,
+                    weeklyResetsAt: resetIn.map { now.addingTimeInterval($0) },
+                    sessionUsedPercent: session
+                ),
+                resets: ResetAdvisor.Resets(
+                    usableNow: usable,
+                    count: count,
+                    endsAt: endsIn.map { now.addingTimeInterval($0) }
+                ),
+                pool: ResetAdvisor.Pool(usableFraction: poolFraction),
+                now: now
+            )
+        }
+
+        // Rule 1, weekly-gate boundaries: at least 97%.
+        expectEqual(adv(weekly: 96.9).state, .none,
+                    "96.9% weekly is below the gate — no flag")
+        expect(adv(weekly: 97).state == .useNow,
+               "exactly 97% weekly passes the gate")
+
+        // Rule 1, recovery-horizon boundaries: strictly more than 24 h.
+        expectEqual(adv(resetIn: 24 * 3600).state, .none,
+                    "the natural reset exactly 24 h out is not 'more than 24 h away'")
+        expect(adv(resetIn: 24 * 3600 + 1).state == .useNow,
+               "the natural reset just past 24 h flags")
+        expectEqual(adv(resetIn: 3600).state, .none,
+                    "the window recovering within the hour needs no reset")
+
+        // Rule 1, pool boundaries: strictly fewer than 75% usable.
+        expectEqual(adv(poolFraction: 0.75).state, .none,
+                    "a pool at exactly 75% usable is not short")
+        expect(adv(poolFraction: 0.7499).state == .useNow,
+               "a pool just under 75% usable is short")
+        expectEqual(adv(poolFraction: nil).state, .none,
+                    "an unmeasured pool never reads as short")
+
+        // Rule 2 — expiring within 14 days, pool health irrelevant.
+        expect(adv(endsIn: 13 * 86400, poolFraction: 1.0).state == .expiring,
+               "an expiring reset flags with a healthy pool")
+        expect(adv(endsIn: 14 * 86400, poolFraction: 1.0).state == .expiring,
+               "exactly 14 days counts as 'within 14 days'")
+        expectEqual(adv(endsIn: 14 * 86400 + 1, poolFraction: 1.0).state, .none,
+                    "more than 14 days left does not flag on a healthy pool")
+        expectEqual(adv(endsIn: -3600).state, .none,
+                    "an already-lapsed reset advises nothing")
+        expect(adv(endsIn: 2 * 86400, poolFraction: 0.5).state == .expiring,
+               "expiring wins over pool-short when both hold")
+
+        // The quiet 48 h notice — regardless of usage, and regardless of
+        // whether a reset is spendable this moment.
+        expect(adv(weekly: 10, usable: false, count: 2, endsIn: 47 * 3600).state == .expiresSoon,
+               "a held, not-now-usable reset expiring in 47 h gets the quiet notice at 10% usage")
+        expect(adv(weekly: 0, endsIn: 47 * 3600).state == .expiresSoon,
+               "the notice fires at 0% usage too")
+        expectEqual(adv(weekly: 10, usable: false, count: 2, endsIn: 49 * 3600).state, .none,
+                    "a reset with more than 48 h left stays quiet")
+        expect(adv(endsIn: 47 * 3600).state == .expiring,
+               "within the flag thresholds the expiring rule speaks, not the quiet notice")
+
+        // The 5-hour exclusion, spelled end to end: the session window pinned
+        // at 100% with the weekly figure below the gate — none.
+        expectEqual(adv(weekly: 96.9, session: 100).state, .none,
+                    "5h at 100% with weekly below the gate never flags")
+
+        // Unknown stays unknown.
+        expectEqual(adv(usable: nil, count: nil).state, .none,
+                    "no reset data at all advises none — surfaced as 'resets: unknown', never 0")
+        expectEqual(adv(usable: nil).state, .none,
+                    "a count without a usability figure cannot fire the usable-now rules")
+        expect(adv(usable: nil, endsIn: 47 * 3600).state == .expiresSoon,
+               "a held count still earns the quiet notice without a usability figure")
+        expectEqual(adv(usable: false).state, .none,
+                    "a known not-usable reset never fires the usable-now rules")
+        expectEqual(adv(weekly: nil).state, .none,
+                    "an unknown weekly figure cannot pass the gate")
+        expectEqual(adv(resetIn: nil).state, .none,
+                    "an unknown natural reset cannot satisfy the recovery horizon")
+
+        // The Codex mapping (#298): applicable > 0 is usable; absence stays nil.
+        let codex = ResetAdvisor.resets(from: OpenAIUsageResponse.ResetCredits(
+            availableCount: 2, applicableAvailableCount: 1))
+        expectEqual(codex.usableNow, true, "applicable_available_count 1 maps to usable now")
+        expectEqual(codex.count, 2, "available_count passes through")
+        expectEqual(codex.endsAt, nil as Date?, "Codex reports no expiry — nil, never guessed")
+        let quiet = ResetAdvisor.resets(from: OpenAIUsageResponse.ResetCredits(
+            availableCount: 1, applicableAvailableCount: 0))
+        expectEqual(quiet.usableNow, false, "applicable_available_count 0 maps to not usable now")
+        expect(!ResetAdvisor.resets(from: nil).isKnown,
+               "a reading without the object maps to unknown — never usable, never 0")
+
+        // The record-based wiring the popover and menubar share: one stored
+        // reading plus its provider tally reproduces rule 1 (1 of 2 usable).
+        var record = poolUsage("oa", session: nil, weekly: 98,
+                               weeklyResetIn: 30 * 3600, now: now)
+        record?.resetCredits = OpenAIUsageResponse.ResetCredits(
+            availableCount: 1, applicableAvailableCount: 1)
+        var tally = ProviderPoolSummary.Tally()
+        tally.usable = 1
+        tally.total = 2
+        expect(ResetAdvisor.advise(record: record!, poolTally: tally, now: now).state == .useNow,
+               "the record wiring reproduces rule 1 from a stored reading and a tally")
+        expectEqual(ResetAdvisor.Pool(tally: tally).usableFraction ?? -1, 0.5,
+                    "the pool input is the tally's usable fraction")
+
+        // The display line: unknown wording, reason wording, silence.
+        expectEqual(ResetAdvisor.displayLine(
+            usage: ResetAdvisor.Usage(weeklyUsedPercent: 10, weeklyResetsAt: nil, sessionUsedPercent: nil),
+            resets: ResetAdvisor.Resets(usableNow: nil, count: nil, endsAt: nil),
+            pool: ResetAdvisor.Pool(usableFraction: 1.0),
+            now: now), "resets: unknown", "an unknown reading states 'resets: unknown', never 0")
+        expect(ResetAdvisor.displayLine(
+            usage: ResetAdvisor.Usage(weeklyUsedPercent: 98, weeklyResetsAt: now.addingTimeInterval(30 * 3600), sessionUsedPercent: nil),
+            resets: ResetAdvisor.resets(from: OpenAIUsageResponse.ResetCredits(
+                availableCount: 1, applicableAvailableCount: 1)),
+            pool: ResetAdvisor.Pool(usableFraction: 0.5),
+            now: now)?.contains("spend a stored reset") == true,
+            "the flagged line states the reason")
+        expectEqual(ResetAdvisor.displayLine(
+            usage: ResetAdvisor.Usage(weeklyUsedPercent: 10, weeklyResetsAt: nil, sessionUsedPercent: nil),
+            resets: ResetAdvisor.resets(from: OpenAIUsageResponse.ResetCredits(
+                availableCount: 1, applicableAvailableCount: 0)),
+            pool: ResetAdvisor.Pool(usableFraction: 1.0),
+            now: now), nil, "a quiet account prints no advice line")
+    }
+
     private static func testPoolSummaryTabFallback() {
         let accounts = [
             poolAccount("an-1", .anthropic),
@@ -9060,6 +9207,114 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("ranking reset-credits test threw: \(error)")
+            }
+        }
+    }
+
+    /// #303: `ranking.json` carries `reset_advice` for an account the shared
+    /// rule flags — read-only, reason included — and omits the key entirely
+    /// for accounts with nothing to advise (`none`) or no reset data at all
+    /// (unknown, never zero). `schema` stays 1.
+    private static func testRankingExportCarriesResetAdvice() {
+        withSelfTestTempDir("ranking-reset-advice") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
+
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let now = Date()
+
+                // Two OpenAI accounts, fresh readings: 'flagged' sits at 98%
+                // of its weekly window with a usable reset and a natural reset
+                // 30 h out; 'drained' is weekly-rejected. Two more accounts
+                // below join the pool, so it reads 1 of 4 usable = 25% —
+                // short of the 75% threshold, so rule 1 fires for 'flagged'.
+                let iso: (Date) -> String = { ISO8601DateFormatter().string(from: $0) }
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-flag', 'f@example.com', 'f@example.com', 'pro', ?, 0, 'openai')
+                """, iso(now))
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, weekly_reset, raw_data, is_synthetic)
+                    VALUES ('user-flag', ?, 98, NULL, 98, 0, ?,
+                            '{"overall_status":"allowed","weekly_status":"allowed","rate_limit_reset_credits.available_count":"1","rate_limit_reset_credits.applicable_available_count":"1"}', 0)
+                """, iso(now), iso(now.addingTimeInterval(30 * 3600)))
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-drain', 'd@example.com', 'd@example.com', 'pro', ?, 1, 'openai')
+                """, iso(now))
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('user-drain', ?, 100, NULL, 100, 0,
+                            '{"overall_status":"allowed","weekly_status":"rejected"}', 0)
+                """, iso(now))
+                // A third account with credits but no flag, and a fourth with
+                // no reset-credit keys at all (unknown). Both weekly-rejected,
+                // so the pool reads 1 of 4 usable = 25% — short — without
+                // making either of them flaggable (no usable reset, no data).
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-quiet', 'q@example.com', 'q@example.com', 'pro', ?, 2, 'openai')
+                """, iso(now))
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('user-quiet', ?, 100, NULL, 100, 0,
+                            '{"overall_status":"allowed","weekly_status":"rejected","rate_limit_reset_credits.available_count":"2","rate_limit_reset_credits.applicable_available_count":"0"}', 0)
+                """, iso(now))
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-nodata', 'n@example.com', 'n@example.com', 'pro', ?, 3, 'openai')
+                """, iso(now))
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('user-nodata', ?, 100, NULL, 100, 0,
+                            '{"overall_status":"allowed","weekly_status":"rejected"}', 0)
+                """, iso(now))
+
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let accounts = root["accounts"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("ranking export produced no readable accounts array")
+                    return
+                }
+
+                expectEqual(root["schema"] as? Int, RankingExporter.schemaVersion,
+                            "reset_advice is additive — the schema version does not change")
+                let byEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
+                    guard let email = obj["email"] as? String else { return nil }
+                    return (email, obj)
+                })
+
+                let flagged = byEmail["f@example.com"]?["reset_advice"] as? [String: Any]
+                expectEqual(flagged?["state"] as? String, "use_now",
+                            "rule 1 fires: weekly spent, far from recovery, pool short")
+                let reason = flagged?["reason"] as? String
+                expect(reason?.isEmpty == false,
+                       "the exported advice states the reason: \(reason ?? "nil")")
+                expect(flagged?["expires_at"] == nil,
+                       "Codex reports no reset expiry — expires_at omitted, never guessed")
+
+                expect(byEmail["d@example.com"]?["reset_advice"] == nil,
+                       "an unflagged account (no usable reset) omits reset_advice")
+                expect(byEmail["q@example.com"]?["reset_advice"] == nil,
+                       "an account with credits but quiet windows omits reset_advice")
+                expect(byEmail["n@example.com"]?["reset_advice"] == nil,
+                       "a reading without reset data omits reset_advice — unknown, never zero")
+            } catch {
+                checks += 1
+                failures.append("ranking reset-advice test threw: \(error)")
             }
         }
     }
