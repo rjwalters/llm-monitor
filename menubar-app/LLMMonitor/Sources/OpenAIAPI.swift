@@ -288,7 +288,13 @@ struct OpenAIUsageResponse: Decodable {
         guard out.count < maxFlattenedFields else { return }
         switch value {
         case .object(let dict):
-            for (key, child) in dict {
+            // Sorted key order, not dictionary order: once the archive cap
+            // below binds, *which* paths survive must not depend on Swift's
+            // per-process dictionary seed — an unordered walk archives a
+            // different field set every poll, so a stored path a reader looks
+            // for (the #299 reset-credit counts) appears and vanishes with no
+            // change on the wire. Arrays already keep index order.
+            for (key, child) in dict.sorted(by: { $0.key < $1.key }) {
                 let path = prefix.isEmpty ? key : "\(prefix).\(key)"
                 if redactedKeys.contains(key.lowercased()) {
                     out[path] = "[redacted]"

@@ -43,6 +43,7 @@ enum SelfTest {
         ("OpenAIUsageResponseMapping", { testOpenAIUsageResponseMapping() }),
         ("OpenAIResetCredits", { testOpenAIResetCredits() }),
         ("OpenAIRawFieldRedaction", { testOpenAIRawFieldRedaction() }),
+        ("OpenAIFlattenTruncationIsDeterministic", { testOpenAIFlattenTruncationIsDeterministic() }),
         ("OpenAITokenExpiryParsing", { testOpenAITokenExpiryParsing() }),
         ("InstanceLock", { testInstanceLock() }),
         ("ZaiQuotaResponseMapping", { testZaiQuotaResponseMapping() }),
@@ -2221,6 +2222,87 @@ enum SelfTest {
             checks += 1
             failures.append("OpenAI redaction test threw: \(error)")
         }
+    }
+
+    /// #301: `flattenValue` walks objects in sorted key order, so when the
+    /// `maxFlattenedFields` archive cap binds, the same paths survive every
+    /// poll — not whichever fields Swift's per-process dictionary seed put
+    /// first. Pins the boundary over a synthetic wham-shaped body: over cap
+    /// (truncation cuts inside a sub-limit entry), exactly at cap (a
+    /// redacted key takes the final slot), and repeat-call identity.
+    private static func testOpenAIFlattenTruncationIsDeterministic() {
+        // Wire keys are emitted in descending order on purpose: the archive
+        // must still come out in sorted walk order, proving the sort is
+        // applied to the decoded object rather than inherited from the text.
+        func syntheticWhamBody(subLimitCount: Int) -> String {
+            let entries = (0..<subLimitCount).map { i -> String in
+                let fields = (1...9).reversed().map { k in "\"k\(k)\": \(i * 10 + k)" }
+                return "{" + fields.joined(separator: ", ") + "}"
+            }
+            return """
+            {
+              "z_tail": "last",
+              "email": "fixture@example.com",
+              "plan_type": "pro",
+              "additional_rate_limits": [\(entries.joined(separator: ", "))],
+              "account_id": "acct-flatten"
+            }
+            """
+        }
+
+        // The one order a sorted, depth-first traversal produces for the
+        // body above: top-level keys alphabetically, array entries by index
+        // (numeric order, never lexical), each entry's fields alphabetically.
+        func expectedWalk(subLimitCount: Int) -> [String] {
+            var paths = ["account_id"]
+            for i in 0..<subLimitCount {
+                for k in 1...9 {
+                    paths.append("additional_rate_limits.\(i).k\(k)")
+                }
+            }
+            paths.append(contentsOf: ["email", "plan_type", "z_tail"])
+            return paths
+        }
+
+        let cap = OpenAIUsageResponse.maxFlattenedFields
+
+        // Over cap: 30 entries × 9 fields + 4 top-level = 274 paths. The cap
+        // must bind one field into entry 22 — the rest of that entry and
+        // everything sorting after it dropped — and the survivors must be
+        // exactly the sorted-walk prefix.
+        let over = OpenAIUsageResponse.flatten(Data(syntheticWhamBody(subLimitCount: 30).utf8))
+        expectEqual(over.count, cap, "the archive cap binds exactly, never over")
+        expectEqual(over.keys.sorted(),
+                    Array(expectedWalk(subLimitCount: 30).prefix(cap)).sorted(),
+                    "surviving paths are exactly the sorted depth-first prefix")
+        expect(over["additional_rate_limits.22.k1"] != nil,
+               "truncation cuts one field into an entry, deterministically")
+        expect(over["additional_rate_limits.22.k2"] == nil,
+               "the sibling fields past the cut are dropped")
+        expectEqual(over["account_id"], "[redacted]",
+                    "redaction still records a key that survives the cut")
+        let serialized = over.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+        expect(!serialized.contains("acct-flatten"),
+               "a surviving redaction must not leak the value")
+
+        // Exactly at cap: 22 entries × 9 + account_id + email = 200. The
+        // redacted `email` takes the final slot; everything sorting after it
+        // is dropped. (Sorting is by key, so `email` lands here even though
+        // the wire put it first.)
+        let exact = OpenAIUsageResponse.flatten(Data(syntheticWhamBody(subLimitCount: 22).utf8))
+        expectEqual(exact.count, cap, "an at-cap body fills the archive exactly")
+        expectEqual(exact["email"], "[redacted]",
+                    "a redacted key landing on the cap boundary is recorded, not dropped")
+        expectEqual(exact.keys.sorted(),
+                    Array(expectedWalk(subLimitCount: 22).prefix(cap)).sorted(),
+                    "the at-cap surviving set is the sorted-walk prefix minus the tail")
+        expect(exact["plan_type"] == nil && exact["z_tail"] == nil,
+               "paths sorting after the boundary are dropped")
+
+        // Repeat-call identity: truncation is a function of the body, not of
+        // the run — two calls archive the same fields.
+        let again = OpenAIUsageResponse.flatten(Data(syntheticWhamBody(subLimitCount: 30).utf8))
+        expect(again == over, "repeated flatten of one body returns an identical archive")
     }
 
     /// Base64url-encodes a JSON fixture for building a synthetic JWT (no
