@@ -31,7 +31,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#297**: Separate accounts into one tab per provider (pools of ~20 accounts each)
+- **#298**: Show Codex reset credits: wham/usage already returns rate_limit_reset_credits
 
 ## PRs Awaiting Review
 
@@ -51,6 +52,8 @@ Issues carrying `loom:curated`.
 
 - **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)*
 - **#249**: z.ai seats invisible on Loom workers: also discover keys from Loom's shared api-keys pool (~/.loom/api-keys/zai), show sub-1% burn *(curated)*
+- **#297**: Separate accounts into one tab per provider (pools of ~20 accounts each) *(curated)*
+- **#298**: Show Codex reset credits: wham/usage already returns rate_limit_reset_credits *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -68,10 +71,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 2 |
+| Curated | 4 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
