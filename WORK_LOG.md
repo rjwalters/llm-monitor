@@ -4,6 +4,14 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-17
 
+- **PR #312**: fix: walk flattenValue object keys in sorted order so archive truncation is deterministic
+- **Issue #301** (closed): flatten's 200-field cap truncates wham/usage archives nondeterministically (unordered dictionary walk)
+- **PR #311**: fix: tie-break usage_history newest-row reads to the real row after a reset
+- **Issue #310** (closed): latestUsage's point-read can return the synthetic reset row (no rowid tiebreak, no is_synthetic filter)
+- **PR #309**: refactor: share the pool-input assembly and record-based reset advice
+- **Issue #305** (closed): ResetAdvisor wiring re-derives inputs the codebase already spells once
+- **PR #307**: docs: document ProviderPoolSummary/ResetAdvisor entries and update menubar/exporter notes in CLAUDE.md
+- **Issue #306** (closed): CLAUDE.md: add ResetAdvisor.swift / ProviderPoolSummary.swift entries, and main.swift's menubar description is now stale
 - **PR #304**: feat: flag accounts that should spend a stored limit reset (read-only)
 - **Issue #303** (closed): Flag when an account should spend a stored limit reset (read-only; operator spends by hand)
 - **PR #302**: feat: per-provider pool summary tabs in the popover and an accounts list CLI
