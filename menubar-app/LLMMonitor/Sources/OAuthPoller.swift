@@ -3250,7 +3250,10 @@ class OAuthPoller: ObservableObject {
     /// (OpenAI's `additional_rate_limits[]`), stamped with the same timestamp
     /// as the `usage_history` row. Empty for Anthropic pings today, so those
     /// accounts continue to produce zero `named_limits` rows.
-    private func writeUsageToDB(
+    /// Not private: exercised directly by SelfTest, which drives a weekly
+    /// reset through this exact write path (#310) rather than reimplementing
+    /// the bracketing rows it emits.
+    func writeUsageToDB(
         accountId: String,
         sessionPercent: Double?,
         weeklyPercent: Double?,
@@ -3270,7 +3273,13 @@ class OAuthPoller: ObservableObject {
             // it is being read (a Codex rollout snapshot): the row, and
             // `last_updated`, carry that instant so the staleness backstop sees
             // the reading's real age. Re-reading the same snapshot is a no-op.
-            let now = ISO8601DateFormatter().string(from: observedAt ?? Date())
+            // One clock read for the whole write (#310): the reset-bracketing
+            // timestamps below derive from the same `Date`, so the synthetic
+            // zero row can never be *newer* than the real row — at worst they
+            // tie on a whole second, and the real row (inserted last) wins the
+            // `rowid DESC` tiebreak every "newest row" read now carries.
+            let nowDate = observedAt ?? Date()
+            let now = ISO8601DateFormatter().string(from: nowDate)
             if observedAt != nil {
                 let seen = try db.scalar(
                     "SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND timestamp = ? AND is_synthetic = 0",
@@ -3286,14 +3295,15 @@ class OAuthPoller: ObservableObject {
             // reports a weekly window.
             if let weeklyPercent = weeklyPercent {
                 let prevStmt = try db.prepare(
-                    "SELECT primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, timestamp FROM usage_history WHERE account_id = ? ORDER BY timestamp DESC LIMIT 1"
+                    "SELECT primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, timestamp FROM usage_history WHERE account_id = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1"
                 )
                 for prev in prevStmt.bind(accountId) {
                     let prevWeekly = (prev[2] as? Double) ?? 0
                     if prevWeekly - weeklyPercent > 5 {
                         // Bracket the real row, which carries `observedAt`
-                        // when the reading predates this write.
-                        let midpointDate = observedAt ?? Date()
+                        // when the reading predates this write. Derived from
+                        // `nowDate`, never a second clock read (#310).
+                        let midpointDate = nowDate
                         let midpointISO = ISO8601DateFormatter().string(from: midpointDate.addingTimeInterval(-1))
 
                         try db.run(

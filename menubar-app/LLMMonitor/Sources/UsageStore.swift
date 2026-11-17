@@ -1272,7 +1272,7 @@ class UsageStore: ObservableObject {
                 // Get latest percent from usage_history
                 var percent: Double? = nil
                 let usageStmt = try db.prepare(
-                    "SELECT primary_percent FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
+                    "SELECT primary_percent FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC, rowid DESC LIMIT 1"
                 )
                 for usageRow in usageStmt.bind(accountId, nowString) {
                     percent = usageRow[0] as? Double
@@ -1293,7 +1293,7 @@ class UsageStore: ObservableObject {
 
                 // Load latest usage for this account
                 let latestStmt = try db.prepare(
-                    "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
+                    "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC, rowid DESC LIMIT 1"
                 )
                 for usageRow in latestStmt.bind(accountId, nowString) {
                     var record = UsageRecord(
