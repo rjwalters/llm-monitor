@@ -130,6 +130,85 @@ struct OpenAIUsageResponse: Decodable {
     let planType: String?
     let rateLimit: RateLimit?
     let additionalRateLimits: [AdditionalRateLimit]?
+    /// `rate_limit_reset_credits` — the unused limit resets the subscription
+    /// carries. Optional: a reply without the object (or with `null`) decodes
+    /// to nil exactly as before (#298).
+    let resetCredits: ResetCredits?
+
+    /// Explicit because the property is deliberately named for the reader
+    /// (`resetCredits`), while the snake-case strategy maps the wire key to
+    /// `rateLimitResetCredits` — without this the key would decode to nil on
+    /// every reply that carries the object.
+    private enum CodingKeys: String, CodingKey {
+        case accountId, email, planType, rateLimit, additionalRateLimits
+        case resetCredits = "rateLimitResetCredits"
+    }
+
+    /// The unused-limit-reset counts `wham/usage` reports per account
+    /// (#298). Read on one `promax` account at 0% of its weekly window; the
+    /// interpretation — `available_count` = unused resets, the applicable
+    /// count = spendable right now — is the reporter's reading, not confirmed
+    /// by spending one, so every surface labels the number "unused" rather
+    /// than promising what spending it does. Both fields optional: a partial
+    /// object still decodes, and an absent sibling stays unknown, never 0.
+    struct ResetCredits: Decodable, Equatable {
+        let availableCount: Int?
+        let applicableAvailableCount: Int?
+    }
+
+    /// The reset-credit half of a **stored** reading, parsed back out of a
+    /// `usage_history.raw_data` blob. `flatten` archives the object verbatim
+    /// (the keys carry no PII, so they pass redaction untouched) as a
+    /// `[String: String]` map joined with ".", so this — not a new schema
+    /// column — is how every display surface (`codex list`, the popover row,
+    /// `ranking.json`) reads the counts back. One parse rule, spelled here and
+    /// nowhere else, so the key spellings cannot drift apart.
+    struct StoredResetCredits: Equatable {
+        /// nil when the blob carries no reset-credit keys at all: pre-feature
+        /// rows, `app-server`/rollout/loom-live Codex readings (none of those
+        /// shapes carry the object), non-OpenAI rows.
+        let credits: ResetCredits?
+        /// The reading's compact status was `rejected` — for Codex that is
+        /// `rate_limit.limit_reached`, the condition under which an applicable
+        /// reset is actually spendable.
+        let limitReached: Bool
+    }
+
+    /// The raw-data paths `flatten` archives the two counts under. Values are
+    /// strings (the archive is a `[String: String]` JSON map), but numeric
+    /// shapes are tolerated so a future writer change cannot silently nil a
+    /// known count.
+    private static let storedAvailableCountKey = "rate_limit_reset_credits.available_count"
+    private static let storedApplicableCountKey = "rate_limit_reset_credits.applicable_available_count"
+
+    /// Parse a stored `usage_history.raw_data` blob. Never fails: a missing,
+    /// non-JSON, or credit-less blob yields `credits: nil` ("unknown"), never
+    /// fabricated zeros; `limitReached` rides the same blob's compact status
+    /// keys, which `snapshot(from:httpStatus:)` writes beside them.
+    static func parseStoredReading(_ raw: String?) -> StoredResetCredits {
+        guard let raw = raw,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return StoredResetCredits(credits: nil, limitReached: false)
+        }
+        func count(_ key: String) -> Int? {
+            if let i = obj[key] as? Int { return i }
+            if let d = obj[key] as? Double, d == d.rounded() { return Int(d) }
+            if let s = obj[key] as? String { return Int(s) }
+            return nil
+        }
+        let credits = ResetCredits(
+            availableCount: count(storedAvailableCountKey),
+            applicableAvailableCount: count(storedApplicableCountKey)
+        )
+        let known = credits.availableCount != nil || credits.applicableAvailableCount != nil
+        let weekly = obj["weekly_status"] as? String
+        let overall = obj["overall_status"] as? String
+        return StoredResetCredits(
+            credits: known ? credits : nil,
+            limitReached: weekly == "rejected" || overall == "rejected"
+        )
+    }
 
     // MARK: Mapping to the shared model
 

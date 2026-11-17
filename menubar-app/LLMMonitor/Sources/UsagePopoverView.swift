@@ -1413,7 +1413,11 @@ struct SummaryRow: View {
                     .lineLimit(1)
                     .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-                percentText(displayUsage?.rateLimit.weekly?.usedPercent)
+                // Reset credits ride the weekly cell: for Codex the resets
+                // apply to the weekly window, and every other provider's
+                // readings carry no counts, so the suffix never appears there.
+                percentText(displayUsage?.rateLimit.weekly?.usedPercent,
+                            resetCount: displayUsage?.resetCredits?.availableCount)
                     .frame(width: SummaryColumns.percent, alignment: .trailing)
 
                 if SummaryColumns.shows(.premium, among: visibleProviders) {
@@ -1545,11 +1549,27 @@ struct SummaryRow: View {
         return Color(nsColor: .systemRed)
     }
 
+    /// The weekly cell additionally renders the account's unused Codex
+    /// limit-reset count as a small suffix (#298) — but only when above 0:
+    /// unknown and 0 render the bare percentage, so the fixed-width column
+    /// (and the row) never widens for them.
     @ViewBuilder
-    private func percentText(_ value: Double?) -> some View {
+    private func percentText(_ value: Double?, resetCount: Int? = nil) -> some View {
         if let pct = value {
-            Text("\(Int(pct))%")
-                .foregroundColor(PercentSeverity(percent: pct).color)
+            if let count = resetCount, count > 0 {
+                HStack(spacing: 2) {
+                    Text("\(Int(pct))%")
+                        .foregroundColor(PercentSeverity(percent: pct).color)
+                    Text("\(count)↻")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .lineLimit(1)
+                .help("\(count) unused rate-limit reset\(count == 1 ? "" : "s") available")
+            } else {
+                Text("\(Int(pct))%")
+                    .foregroundColor(PercentSeverity(percent: pct).color)
+            }
         } else {
             Text("—")
                 .foregroundColor(.secondary)

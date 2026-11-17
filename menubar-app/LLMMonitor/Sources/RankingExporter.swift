@@ -70,6 +70,23 @@ import Foundation
 /// - A consumer that reads it can distinguish "credential is broken here"
 ///   (`blocked`, no `absent`) from "never set up here" (`blocked` + `absent`),
 ///   which is the whole point.
+///
+/// ### `reset_credits` (added in #298)
+///
+/// ```json
+/// "reset_credits": { "available_count": 1, "applicable_available_count": 0 }
+/// ```
+///
+/// The unused limit resets a Codex subscription carries, read from the latest
+/// `wham/usage` reading's archived `rate_limit_reset_credits` object. The
+/// object is **omitted entirely** unless the latest reading carried it, and
+/// each count is omitted when unknown — absence always means "unknown", never
+/// 0. `available_count` is how many unused resets the account holds;
+/// `applicable_available_count` is how many could be spent right now (0 while
+/// no limit has been reached). The interpretation is unverified (no reset has
+/// been spent to confirm it), so consumers should treat the numbers as "unused
+/// resets on the account", nothing stronger. Additive within schema 1 like
+/// every other optional key here.
 enum RankingExporter {
     static let schemaVersion = 1
 
@@ -297,6 +314,22 @@ enum RankingExporter {
         if let s = normalizedISO(sessionReset) { resets["5h"] = s }
         if let w = normalizedISO(weeklyReset) { resets["7d"] = w }
         if !resets.isEmpty { obj["resets"] = resets }
+
+        // reset_credits (#298): the unused Codex limit resets the latest
+        // reading carried (`wham/usage`'s `rate_limit_reset_credits`, archived
+        // verbatim in `raw_data`). Additive within schema 1 on the same
+        // reasoning as `absent`: the object is omitted entirely when the
+        // reading carries none, and each count omitted when unknown — absence
+        // is "unknown", never 0. Non-OpenAI and `app-server`/rollout readings
+        // never carry the object, so they simply omit it.
+        if let credits = OpenAIUsageResponse.parseStoredReading(rawData).credits {
+            var resetCredits: [String: Any] = [:]
+            if let available = credits.availableCount { resetCredits["available_count"] = available }
+            if let applicable = credits.applicableAvailableCount {
+                resetCredits["applicable_available_count"] = applicable
+            }
+            if !resetCredits.isEmpty { obj["reset_credits"] = resetCredits }
+        }
 
         // models: optional / best-effort. Omitted entirely when unavailable.
         if let models = fableModels(db: db, accountId: accountId) {

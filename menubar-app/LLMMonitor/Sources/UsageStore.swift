@@ -99,6 +99,11 @@ struct UsageRecord: Identifiable {
     var overageDisabledReason: String? = nil
     /// Whether the account is currently drawing on extra usage.
     var overageInUse: Bool? = nil
+    /// Unused Codex limit resets (`wham/usage`'s `rate_limit_reset_credits`),
+    /// parsed out of this row's `raw_data` archive (#298). nil = unknown —
+    /// never 0 — because most readings (Anthropic, `app-server`, rollout
+    /// snapshots) carry no such object.
+    var resetCredits: OpenAIUsageResponse.ResetCredits? = nil
 
     /// This stored reading expressed in the shared, provider-agnostic window
     /// model. The `usage_history` columns are already kind-keyed (a session
@@ -1288,7 +1293,7 @@ class UsageStore: ObservableObject {
 
                 // Load latest usage for this account
                 let latestStmt = try db.prepare(
-                    "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
+                    "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
                 )
                 for usageRow in latestStmt.bind(accountId, nowString) {
                     var record = UsageRecord(
@@ -1302,6 +1307,9 @@ class UsageStore: ObservableObject {
                         sessionReset: usageRow[6] as? String,
                         weeklyReset: usageRow[7] as? String
                     )
+                    // Unused Codex limit resets ride the row's `raw_data`
+                    // archive (#298); nil for every reading that carries none.
+                    record.resetCredits = OpenAIUsageResponse.parseStoredReading(usageRow[8] as? String).credits
 
                     // Premium/Fable allocation + overage come from the latest
                     // Fable probe snapshot's raw headers.
@@ -1518,6 +1526,31 @@ class UsageStore: ObservableObject {
             print("Error loading named limit history: \(error)")
             return [:]
         }
+    }
+
+    /// The newest real (non-synthetic) reading's reset-credit state for one
+    /// account (#298) — `codex list`'s source. nil when the account has no
+    /// reading at all (or the database is unreadable), which is exactly the
+    /// "print nothing extra" case; a reading that carries no reset-credit
+    /// object parses back as `credits == nil` inside the returned value.
+    /// Synthetic reset-marker rows carry no blob and are excluded, matching
+    /// `RankingExporter`'s latest-reading rule.
+    //
+    // Reads only the immutable `dbPath` plus `OpenAIUsageResponse.parseStoredReading`
+    // (a static pure function) — touches no @Published main-actor state, so it
+    // stays callable from the (synchronous, non-UI) selftest suite.
+    nonisolated func latestResetCredits(accountId: String) -> OpenAIUsageResponse.StoredResetCredits? {
+        guard FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath, readonly: true),
+              let stmt = try? db.prepare("""
+                  SELECT raw_data FROM usage_history
+                  WHERE account_id = ? AND is_synthetic = 0
+                  ORDER BY timestamp DESC LIMIT 1
+              """) else { return nil }
+        for row in stmt.bind(accountId) {
+            return OpenAIUsageResponse.parseStoredReading(row[0] as? String)
+        }
+        return nil
     }
 
     /// Load hourly token usage for an account from Claude Code data
