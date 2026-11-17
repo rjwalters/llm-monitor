@@ -34,6 +34,7 @@ enum SelfTest {
         ("BadgePercentSuppression", { testBadgePercentSuppression() }),
         ("PoolSummaryTally", { testPoolSummaryTally() }),
         ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
+        ("PoolInputAssembly", { testPoolInputAssembly() }),
         ("ResetAdvisor", { testResetAdvisor() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
@@ -983,6 +984,85 @@ enum SelfTest {
         expectEqual(ProviderTab(stored: "openai").validated(among: accounts), .provider(.openai),
                     "a persisted tab whose provider still has accounts survives")
         expectEqual(ProviderTab.all.validated(among: accounts), ProviderTab.all, "All never demotes")
+    }
+
+    /// The shared pool-input assembly (#305): the credential-blocked set and
+    /// the `[PoolAccountInput]` mapping the popover's tallies and the menubar's
+    /// reset marker both feed `ProviderPoolSummary` — spelled once in the
+    /// portable core so the two surfaces cannot drift about whether a provider
+    /// pool is short. Also pins the record-based advisor entries as the
+    /// longhand forms verbatim, so the CLI column, popover tooltip and menubar
+    /// marker render the same words from the same single row.
+    private static func testPoolInputAssembly() {
+        let now = Date()
+
+        func credential(_ accountId: String?, _ state: TokenStatus) -> CredentialStatus {
+            CredentialStatus(id: 0, label: "fixture", accountId: accountId,
+                             status: state, lastPoll: nil, lastError: nil)
+        }
+        expectEqual(
+            ProviderPoolSummary.blockedAccountIds([
+                credential("a-live", .valid),
+                credential("a-refreshing", .refreshing),
+                credential("a-expired", .expired),
+                credential("a-revoked", .revoked),
+                credential("a-error", .error),
+                credential("a-drifted", .drifted),
+                credential("a-missing", .missing),
+                credential(nil, .revoked),
+            ]),
+            Set(["a-expired", "a-revoked", "a-error", "a-drifted", "a-missing"]),
+            "only .valid/.refreshing stay unblocked; a credential-less row blocks no account")
+
+        let inputs = ProviderPoolSummary.poolInputs(
+            accounts: [
+                poolAccount("an-1", .anthropic),
+                poolAccount("oa-1", .openai),
+                poolAccount("za-1", .zai),
+            ],
+            latestUsage: [
+                "an-1": poolUsage("an-1", session: 10, weekly: 20, now: now)!,
+                "oa-1": poolUsage("oa-1", session: 80, weekly: 90, now: now)!,
+            ],
+            blockedIds: ["oa-1"]
+        )
+        expectEqual(inputs.count, 3, "one input per account, never-polled included")
+        expectEqual(inputs[0].usage?.accountId, "an-1", "the account's own latest reading is attached")
+        expectEqual(inputs[0].status, "available", "an unblocked quiet reading reads available")
+        expectEqual(inputs[1].status, "blocked", "a blocked credential reads blocked")
+        expect(inputs[2].usage == nil, "a never-polled account carries no reading")
+        expectEqual(inputs[2].status as String?, nil, "no reading stays unknown, never available")
+
+        var record = poolUsage("an-1", session: 5, weekly: 98, weeklyResetIn: 30 * 3600, now: now)!
+        record.resetCredits = OpenAIUsageResponse.ResetCredits(availableCount: 1, applicableAvailableCount: 1)
+        let tally = ProviderPoolSummary.Tally(usable: 1, exhausted: 1, total: 2, nextReset: nil)
+        let longhandUsage = ResetAdvisor.Usage(
+            weeklyUsedPercent: record.weeklyAllPercent,
+            weeklyResetsAt: UsageRecord.parseISO(record.weeklyReset),
+            sessionUsedPercent: record.sessionPercent
+        )
+        expectEqual(
+            ResetAdvisor.advise(record: record, poolTally: tally, now: now),
+            ResetAdvisor.advise(usage: longhandUsage,
+                                resets: ResetAdvisor.resets(from: record.resetCredits),
+                                pool: ResetAdvisor.Pool(tally: tally),
+                                now: now),
+            "advise(record:) is the longhand advise(usage:resets:pool:) call verbatim")
+        expectEqual(
+            ResetAdvisor.displayLine(record: record, poolTally: tally, now: now),
+            ResetAdvisor.displayLine(usage: longhandUsage,
+                                     resets: ResetAdvisor.resets(from: record.resetCredits),
+                                     pool: ResetAdvisor.Pool(tally: tally),
+                                     now: now),
+            "displayLine(record:) is the longhand displayLine(usage:resets:pool:) call verbatim")
+        expectEqual(
+            ResetAdvisor.displayLine(
+                record: poolUsage("an-1", session: 5, weekly: 98, weeklyResetIn: 30 * 3600, now: now)!,
+                poolTally: nil,
+                now: now
+            ),
+            "resets: unknown",
+            "a reading with no reset-credit archive says unknown, never 0")
     }
 
     // MARK: - Window model

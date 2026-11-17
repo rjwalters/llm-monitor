@@ -244,11 +244,17 @@ enum AccountSyncCLI {
             CLIArgs.fail("Could not open '\(dbPath)': \(error.localizedDescription)")
         }
 
-        var readings: [String: RankingExporter.AccountStatusReading] = [:]
+        // Status (and only status) comes from `RankingExporter.statusReading`
+        // — exactly what `ranking.json` exports — so "usable" means the same
+        // thing on both surfaces. The usage figures and reset credits both
+        // come from `store.latestUsage`'s own row (#305), so one advice call
+        // never mixes two `usage_history` rows.
         let inputs = store.accounts.map { account -> PoolAccountInput in
-            let reading = RankingExporter.statusReading(db: db, accountId: account.id)
-            readings[account.id] = reading
-            return PoolAccountInput(account: account, usage: store.latestUsage[account.id], status: reading.status)
+            PoolAccountInput(
+                account: account,
+                usage: store.latestUsage[account.id],
+                status: RankingExporter.statusReading(db: db, accountId: account.id).status
+            )
         }
 
         var providers = AccountProvider.allCases.filter { provider in
@@ -273,8 +279,7 @@ enum AccountSyncCLI {
             print("\(provider.displayName) — \(ProviderPoolSummary.summaryLine(tally)) (\(tally.total) configured)")
             print("  " + pad("ACCOUNT", 26) + pad("STATUS", 13) + pad("HEADROOM", 9) + pad("NEXT RESET", 27) + "RESET ADVICE")
             for input in rows {
-                print("  " + listRow(input, pool: ResetAdvisor.Pool(tally: tally),
-                                     resets: readings[input.account.id]?.resetCredits))
+                print("  " + listRow(input, poolTally: tally))
             }
         }
         print("")
@@ -299,8 +304,7 @@ enum AccountSyncCLI {
     /// their last exported status.
     private static func listRow(
         _ input: PoolAccountInput,
-        pool: ResetAdvisor.Pool,
-        resets: OpenAIUsageResponse.ResetCredits?
+        poolTally: ProviderPoolSummary.Tally
     ) -> String {
         if input.account.isAbsent {
             return pad(input.account.displayName, 26) + pad(CodexCLI.absentLabel, 13) + pad("—", 9)
@@ -315,19 +319,13 @@ enum AccountSyncCLI {
         let headroom = usage.rateLimit.headroomScore.map { String(format: "%.0f%%", $0) } ?? "—"
         let reset = usage.rateLimit.gatingWindow?.resetAt.map { formatReset($0) } ?? "—"
         // #303: the shared advisor's verdict for this account, against its
-        // provider's pool tally. An unknown reading (e.g. an `app-server` or
-        // rollout Codex reading, or a provider whose feed has not landed)
-        // says "resets: unknown" — never 0, never silence that reads as 0.
-        let advice = ResetAdvisor.displayLine(
-            usage: ResetAdvisor.Usage(
-                weeklyUsedPercent: usage.weeklyAllPercent,
-                weeklyResetsAt: UsageRecord.parseISO(usage.weeklyReset),
-                sessionUsedPercent: usage.sessionPercent
-            ),
-            resets: ResetAdvisor.resets(from: resets),
-            pool: pool,
-            now: Date()
-        ) ?? "—"
+        // provider's pool tally — the record-based entry point the popover
+        // tooltip and menubar marker also use (#305), so reset credits come
+        // from this same row (`usage.resetCredits`). An unknown reading (e.g.
+        // an `app-server` or rollout Codex reading, or a provider whose feed
+        // has not landed) says "resets: unknown" — never 0, never silence
+        // that reads as 0.
+        let advice = ResetAdvisor.displayLine(record: usage, poolTally: poolTally, now: Date()) ?? "—"
         return pad(input.account.displayName, 26) + pad(status, 13) + pad(headroom, 9)
             + pad(reset, 27) + advice
     }

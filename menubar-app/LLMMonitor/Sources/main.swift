@@ -514,25 +514,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The provider pool tally the advisor's "pool short" input reads — the
     /// same computation the popover's provider tabs do (`ProviderPoolSummary`
-    /// over stored readings and credential states), never a recount.
+    /// over stored readings and credential states, via the one shared input
+    /// assembly), never a recount.
     private func providerResetPool(_ provider: AccountProvider) -> ProviderPoolSummary.Tally? {
-        let blocked = Set(oauthPoller.credentialStatuses.compactMap { status -> String? in
-            switch status.status {
-            case .valid, .refreshing: return nil
-            case .expired, .revoked, .error, .drifted, .missing: return status.accountId
-            }
-        })
-        let inputs = usageStore.accounts.map { account -> PoolAccountInput in
-            let usage = usageStore.latestUsage[account.id]
-            return PoolAccountInput(
-                account: account,
-                usage: usage,
-                status: ProviderPoolSummary.windowStatus(
-                    for: usage,
-                    credentialBlocked: blocked.contains(account.id)
-                )
-            )
-        }
+        let inputs = ProviderPoolSummary.poolInputs(
+            accounts: usageStore.accounts,
+            latestUsage: usageStore.latestUsage,
+            blockedIds: ProviderPoolSummary.blockedAccountIds(oauthPoller.credentialStatuses)
+        )
         return ProviderPoolSummary.tallyByProvider(inputs, pollInterval: oauthPoller.pollInterval)[provider]
     }
 

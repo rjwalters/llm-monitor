@@ -560,35 +560,18 @@ struct UsagePopoverView: View {
         }
     }
 
-    /// Credential-usable map: which account IDs currently have no credential
-    /// that can authenticate a poll. `.valid`/`.refreshing` are the only
-    /// states whose account may report live figures; every other state
-    /// (revoked, expired, errored, drifted, missing) maps to mapStatus's
-    /// `blocked`, exactly as `RankingExporter` blocks a dead credential.
-    private var credentialBlockedIds: Set<String> {
-        Set(oauthPoller.credentialStatuses.compactMap { status in
-            switch status.status {
-            case .valid, .refreshing: return nil
-            case .expired, .revoked, .error, .drifted, .missing: return status.accountId
-            }
-        })
-    }
-
     /// The pool tallies behind the tab labels and the selected tab's summary
     /// line (#297). Recomputed per render, like the sort, so counts track
-    /// usage updates live.
+    /// usage updates live. The input assembly is the one shared helper
+    /// (`ProviderPoolSummary.poolInputs`) the menubar's reset marker also
+    /// reads (#305), so the two surfaces cannot drift about whether a
+    /// provider pool is short.
     private var poolTallies: (all: ProviderPoolSummary.Tally, byProvider: [AccountProvider: ProviderPoolSummary.Tally]) {
-        let inputs = store.accounts.map { account -> PoolAccountInput in
-            let usage = store.latestUsage[account.id]
-            return PoolAccountInput(
-                account: account,
-                usage: usage,
-                status: ProviderPoolSummary.windowStatus(
-                    for: usage,
-                    credentialBlocked: credentialBlockedIds.contains(account.id)
-                )
-            )
-        }
+        let inputs = ProviderPoolSummary.poolInputs(
+            accounts: store.accounts,
+            latestUsage: store.latestUsage,
+            blockedIds: ProviderPoolSummary.blockedAccountIds(oauthPoller.credentialStatuses)
+        )
         return (
             ProviderPoolSummary.tally(inputs, pollInterval: oauthPoller.pollInterval),
             ProviderPoolSummary.tallyByProvider(inputs, pollInterval: oauthPoller.pollInterval)
