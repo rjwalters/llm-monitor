@@ -217,15 +217,32 @@ enum ResetAdvisor {
     /// Advisor inputs from one stored reading plus its provider's tally — the
     /// wiring every surface repeats otherwise (#303).
     static func advise(record: UsageRecord, poolTally: ProviderPoolSummary.Tally?, now: Date) -> Advice {
-        advise(
+        let inputs = recordInputs(record, poolTally: poolTally)
+        return advise(usage: inputs.usage, resets: inputs.resets, pool: inputs.pool, now: now)
+    }
+
+    /// The record-based `displayLine` — the same shared wording, over the same
+    /// single row's figures, that the popover tooltip, the menubar marker and
+    /// `accounts list`'s advice column all render (#305). Reset credits come
+    /// from the record itself (`record.resetCredits`), so one `advise` call
+    /// never mixes figures from two `usage_history` rows.
+    static func displayLine(record: UsageRecord, poolTally: ProviderPoolSummary.Tally?, now: Date) -> String? {
+        let inputs = recordInputs(record, poolTally: poolTally)
+        return displayLine(usage: inputs.usage, resets: inputs.resets, pool: inputs.pool, now: now)
+    }
+
+    private static func recordInputs(
+        _ record: UsageRecord,
+        poolTally: ProviderPoolSummary.Tally?
+    ) -> (usage: Usage, resets: Resets, pool: Pool) {
+        (
             usage: Usage(
                 weeklyUsedPercent: record.weeklyAllPercent,
                 weeklyResetsAt: UsageRecord.parseISO(record.weeklyReset),
                 sessionUsedPercent: record.sessionPercent
             ),
             resets: resets(from: record.resetCredits),
-            pool: Pool(tally: poolTally),
-            now: now
+            pool: Pool(tally: poolTally)
         )
     }
 

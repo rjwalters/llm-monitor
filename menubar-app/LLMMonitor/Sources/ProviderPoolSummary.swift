@@ -126,6 +126,47 @@ enum ProviderPoolSummary {
         )
     }
 
+    /// Which accounts currently have no credential that can authenticate a
+    /// poll — the credential-blocked set the popover's tally and the menubar's
+    /// reset marker both read (#305). `.valid`/`.refreshing` are the only
+    /// states whose account may report live figures; every other state
+    /// (revoked, expired, errored, drifted, missing) maps to mapStatus's
+    /// `blocked`, exactly as `RankingExporter` blocks a dead credential.
+    /// Spelled once so the two surfaces can never disagree about which
+    /// accounts count toward a provider pool.
+    static func blockedAccountIds(_ statuses: [CredentialStatus]) -> Set<String> {
+        Set(statuses.compactMap { status in
+            switch status.status {
+            case .valid, .refreshing: return nil
+            case .expired, .revoked, .error, .drifted, .missing: return status.accountId
+            }
+        })
+    }
+
+    /// The `[PoolAccountInput]` assembly the in-app surfaces — the popover's
+    /// provider tabs (#297) and the menubar's reset marker (#303) — feed the
+    /// tally with (#305): stored accounts, their latest stored readings, and
+    /// the credential-blocked set above, each status derived by
+    /// `windowStatus`. One assembly, because the marker's "pool short" input
+    /// and the tab tallies must be the same computation, never two copies
+    /// that could drift. (`accounts list` still builds its inputs from
+    /// `RankingExporter.statusReading` — see `PoolAccountInput` — so the CLI
+    /// keeps reporting exactly what `ranking.json` exports.)
+    static func poolInputs(
+        accounts: [Account],
+        latestUsage: [String: UsageRecord],
+        blockedIds: Set<String>
+    ) -> [PoolAccountInput] {
+        accounts.map { account in
+            let usage = latestUsage[account.id]
+            return PoolAccountInput(
+                account: account,
+                usage: usage,
+                status: windowStatus(for: usage, credentialBlocked: blockedIds.contains(account.id))
+            )
+        }
+    }
+
     /// Tally one pool slice. `pollInterval` feeds the staleness threshold
     /// exactly as the popover's freshness dot derives it (#148); the CLI uses
     /// the same 600 s default the poll loop ships with.
