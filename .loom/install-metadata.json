@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1305",
-  "loom_commit": "9589b4a0c59e0dff1b4e3f2b7b8e9a17f3c72e12",
+  "loom_version": "0.19.1306",
+  "loom_commit": "e7af83ea29897351d216cdfd4036ecf628cb96cc",
   "install_date": "2026-07-29",
   "installed_files": [
     ".claude/biome.jsonc",
@@ -591,7 +591,9 @@
     ".loom/scripts/tests/test-spawn-generic-launch.sh",
     ".loom/scripts/tests/test-spawn-session-env.sh",
     ".loom/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh",
-    ".loom/docs/advanced-hooks.md"
+    ".loom/docs/advanced-hooks.md",
+    ".loom/scripts/sweep-lease-fence.sh",
+    ".loom/scripts/sweep-lease-publish.sh"
   ],
   "last_resync": "2026-11-17",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
