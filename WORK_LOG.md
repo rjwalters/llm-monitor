@@ -2,6 +2,15 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-17
+
+- **PR #304**: feat: flag accounts that should spend a stored limit reset (read-only)
+- **Issue #303** (closed): Flag when an account should spend a stored limit reset (read-only; operator spends by hand)
+- **PR #302**: feat: per-provider pool summary tabs in the popover and an accounts list CLI
+- **Issue #297** (closed): Separate accounts into one tab per provider (pools of ~20 accounts each)
+- **PR #299**: feat: surface Codex unused limit-reset credits from wham/usage readings
+- **Issue #298** (closed): Show Codex reset credits: wham/usage already returns rate_limit_reset_credits
+
 ### 2026-11-14
 
 - **PR #295**: docs: link ROADMAP.md from README and mark it human-maintained
