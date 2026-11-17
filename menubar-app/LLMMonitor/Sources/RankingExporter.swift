@@ -87,6 +87,27 @@ import Foundation
 /// been spent to confirm it), so consumers should treat the numbers as "unused
 /// resets on the account", nothing stronger. Additive within schema 1 like
 /// every other optional key here.
+///
+/// ### `reset_advice` (added in #303)
+///
+/// ```json
+/// "reset_advice": { "state": "use_now", "reason": "weekly 98% used, window recovers in 30 hrs, pool 50% usable — spend a stored reset", "expires_at": "2026-12-01T00:00:00Z" }
+/// ```
+///
+/// Whether this account should spend a stored limit reset, computed by
+/// `ResetAdvisor.advise` — the one shared rule over the account's latest
+/// reading (`utilization["7d"]`, its reset, the archived `reset_credits`)
+/// plus its provider's pool tally (`ProviderPoolSummary`, the same usable
+/// count `accounts list` prints). **Read-only by design**: the operator
+/// spends resets by hand; nothing in this app calls anything that spends one.
+///
+/// The key is **omitted entirely** when the advice is `none` or the reading
+/// carries no reset-credit data at all (unknown — e.g. an `app-server` or
+/// rollout reading, a non-OpenAI account until its feed lands) — absence is
+/// "nothing to advise" or "unknown", never 0. `expires_at` is present only
+/// when the reading reports the reset's own expiry (Codex reports none, so
+/// until the Claude feed (#285) lands it never appears). Additive within
+/// schema 1 like every other optional key here.
 enum RankingExporter {
     static let schemaVersion = 1
 
@@ -199,12 +220,9 @@ enum RankingExporter {
                 FROM accounts ORDER BY sort_order ASC, last_updated DESC
             """)
 
+            var accountRows: [(id: String, email: String?, plan: String?, provider: AccountProvider, isAbsent: Bool)] = []
             for row in accountStmt {
                 guard let accountId = row[0] as? String else { continue }
-                // Acceptance criterion: accounts with a NULL email are excluded
-                // (email is the sole join key — a null key is useless to consumers).
-                guard let email = row[1] as? String, !email.isEmpty else { continue }
-                let plan = row[2] as? String
                 let provider = AccountProvider(stored: hasProvider ? row[3] as? String : nil)
                 let isAbsent = isAbsentCodexIdentity(
                     provider: provider,
@@ -212,9 +230,43 @@ enum RankingExporter {
                     hasCodexHome: ((row[4] as? Int64) ?? 0) != 0,
                     hasLocalReading: ((row[6] as? Int64) ?? 0) != 0
                 )
+                accountRows.append((accountId, row[1] as? String, row[2] as? String, provider, isAbsent))
+            }
 
-                if let obj = buildAccount(db: db, accountId: accountId, email: email,
-                                          plan: plan, provider: provider, isAbsent: isAbsent) {
+            // #303: the provider pool tallies behind `reset_advice`'s
+            // "pool short" input — the same `ProviderPoolSummary` rule the
+            // popover's provider tabs and `accounts list` print, over every
+            // configured account, never a recount. Each account's status is
+            // the exported status itself.
+            var poolInputs: [PoolAccountInput] = []
+            for row in accountRows {
+                let reading = statusReading(db: db, accountId: row.id)
+                poolInputs.append(PoolAccountInput(
+                    account: Account(
+                        id: row.id,
+                        provider: row.provider,
+                        accountName: nil,
+                        email: row.email,
+                        plan: row.plan,
+                        lastUpdated: UsageRecord.parseISO(reading.updatedAt),
+                        latestPercent: nil,
+                        isAbsent: row.isAbsent
+                    ),
+                    usage: reading.usageRecord(accountId: row.id),
+                    status: reading.status
+                ))
+            }
+            let poolTallies = ProviderPoolSummary.tallyByProvider(poolInputs)
+
+            for row in accountRows {
+                // Acceptance criterion: accounts with a NULL email are excluded
+                // (email is the sole join key — a null key is useless to consumers).
+                guard let email = row.email, !email.isEmpty else { continue }
+
+                if let obj = buildAccount(db: db, accountId: row.id, email: email,
+                                          plan: row.plan, provider: row.provider,
+                                          isAbsent: row.isAbsent,
+                                          pool: ResetAdvisor.Pool(tally: poolTallies[row.provider])) {
                     accountObjects.append(obj)
                 }
             }
@@ -249,7 +301,8 @@ enum RankingExporter {
         email: String,
         plan: String?,
         provider: AccountProvider,
-        isAbsent: Bool = false
+        isAbsent: Bool = false,
+        pool: ResetAdvisor.Pool
     ) -> [String: Any]? {
         // `provider` is emitted unconditionally (never omitted) so a consumer
         // can rely on its presence rather than defaulting per-account; rows that
@@ -302,6 +355,22 @@ enum RankingExporter {
             if !resetCredits.isEmpty { obj["reset_credits"] = resetCredits }
         }
 
+        // reset_advice (#303): whether this account should spend a stored
+        // limit reset, from the latest reading and its provider's pool tally.
+        // Read-only by design — the operator spends resets by hand, and
+        // nothing in this app calls anything that spends one. Omitted
+        // entirely for `none`/unknown (see the header's `reset_advice`
+        // section); `expires_at` only when the reading reports an expiry.
+        let advice = resetAdvice(from: reading, pool: pool)
+        if advice.state != .none {
+            var adviceObj: [String: Any] = ["state": advice.state.jsonKey]
+            if let reason = advice.reason { adviceObj["reason"] = reason }
+            if let expiresAt = advice.expiresAt {
+                adviceObj["expires_at"] = iso8601(expiresAt)
+            }
+            obj["reset_advice"] = adviceObj
+        }
+
         // models: optional / best-effort. Omitted entirely when unavailable.
         if let models = fableModels(db: db, accountId: accountId) {
             obj["models"] = models
@@ -312,6 +381,25 @@ enum RankingExporter {
         }
 
         return obj
+    }
+
+    /// The reset advice for one exported account (#303): the shared rule over
+    /// the account's latest reading and its provider's pool tally. Unknown
+    /// reset data advises `none` — the key is omitted upstream, never zeroed.
+    private static func resetAdvice(
+        from reading: AccountStatusReading,
+        pool: ResetAdvisor.Pool
+    ) -> ResetAdvisor.Advice {
+        ResetAdvisor.advise(
+            usage: ResetAdvisor.Usage(
+                weeklyUsedPercent: reading.weeklyPercent,
+                weeklyResetsAt: UsageRecord.parseISO(reading.weeklyReset),
+                sessionUsedPercent: reading.sessionPercent
+            ),
+            resets: ResetAdvisor.resets(from: reading.resetCredits),
+            pool: pool,
+            now: Date()
+        )
     }
 
     // MARK: - Shared status reading (#297)
@@ -331,6 +419,26 @@ enum RankingExporter {
         /// `nil` is "unknown", never 0. Non-OpenAI and `app-server`/rollout
         /// readings never carry credits.
         let resetCredits: OpenAIUsageResponse.ResetCredits?
+
+        /// The reading as a minimal `UsageRecord`, for pool-eligibility
+        /// inputs (#303): the timestamp feeds the staleness backstop and the
+        /// window model the next-reset candidate; figures the export query
+        /// does not read stay nil. nil when the timestamp is unparseable —
+        /// no reading, for eligibility purposes.
+        func usageRecord(accountId: String) -> UsageRecord? {
+            guard let timestamp = UsageRecord.parseISO(updatedAt) else { return nil }
+            return UsageRecord(
+                id: 0,
+                accountId: accountId,
+                timestamp: timestamp,
+                primaryPercent: nil,
+                sessionPercent: sessionPercent,
+                weeklyAllPercent: weeklyPercent,
+                weeklySONnetPercent: nil,
+                sessionReset: sessionReset,
+                weeklyReset: weeklyReset
+            )
+        }
     }
 
     /// The account's status and latest real (non-synthetic) usage reading, as

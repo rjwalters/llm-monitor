@@ -449,6 +449,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         var percent: Int = 0
         var isWeeklyLimit = false
+        // #303: the advisor's verdict for the menubar account, when its
+        // figures are current (the same freshness/drift suppression the
+        // percentage below applies — a frozen reading must not flag either).
+        var flaggedReset: ResetAdvisor.Advice?
 
         // Menubar follows the user's pinned account, or falls back to most-available.
         let targetAccount = usageStore.accounts.first(where: { $0.id == usageStore.effectivePrimaryAccountId })
@@ -470,6 +474,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let weeklyAllPercent = usage.weeklyAllPercent ?? 0
                     percent = Int(max(sessionPercent, weeklyAllPercent))
                     isWeeklyLimit = weeklyAllPercent >= sessionPercent
+
+                    let advice = ResetAdvisor.advise(
+                        record: usage,
+                        poolTally: providerResetPool(account.provider),
+                        now: Date()
+                    )
+                    if advice.state != .none { flaggedReset = advice }
                 } else {
                     percent = Int(account.latestPercent ?? 0)
                     isWeeklyLimit = true
@@ -478,11 +489,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Create Stats-style image with "LLM" label and percentage
-        button.image = createStatsStyleImage(percent: percent, isWeeklyLimit: isWeeklyLimit)
+        let resetFlagged = flaggedReset?.state == .useNow || flaggedReset?.state == .expiring
+        button.image = createStatsStyleImage(percent: percent, isWeeklyLimit: isWeeklyLimit, resetFlagged: resetFlagged)
         button.title = ""
+        if let advice = flaggedReset {
+            button.toolTip = resetToolTip(advice)
+        } else {
+            button.toolTip = nil
+        }
     }
 
-    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool) -> NSImage {
+    // MARK: - Reset advisor (#303)
+
+    /// The advisor's verdict reason plus the reset's expiry, for the menubar
+    /// button's tooltip — the menubar itself only draws a marker.
+    private func resetToolTip(_ advice: ResetAdvisor.Advice) -> String {
+        var text = advice.reason ?? "A stored limit reset should be spent"
+        if let expiresAt = advice.expiresAt {
+            text += " · expires \(formatInterval(expiresAt.timeIntervalSince(Date())))"
+        }
+        text += " — trigger resets by hand; this app never spends one."
+        return text
+    }
+
+    /// The provider pool tally the advisor's "pool short" input reads — the
+    /// same computation the popover's provider tabs do (`ProviderPoolSummary`
+    /// over stored readings and credential states), never a recount.
+    private func providerResetPool(_ provider: AccountProvider) -> ProviderPoolSummary.Tally? {
+        let blocked = Set(oauthPoller.credentialStatuses.compactMap { status -> String? in
+            switch status.status {
+            case .valid, .refreshing: return nil
+            case .expired, .revoked, .error, .drifted, .missing: return status.accountId
+            }
+        })
+        let inputs = usageStore.accounts.map { account -> PoolAccountInput in
+            let usage = usageStore.latestUsage[account.id]
+            return PoolAccountInput(
+                account: account,
+                usage: usage,
+                status: ProviderPoolSummary.windowStatus(
+                    for: usage,
+                    credentialBlocked: blocked.contains(account.id)
+                )
+            )
+        }
+        return ProviderPoolSummary.tallyByProvider(inputs, pollInterval: oauthPoller.pollInterval)[provider]
+    }
+
+    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool, resetFlagged: Bool = false) -> NSImage {
         let labelFont = NSFont.systemFont(ofSize: 7, weight: .light)
         let valueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
 
@@ -527,7 +581,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 2pt padding on each side for breathing room
         let contentWidth = ceil(blockWidth) + 4
 
-        let width = contentWidth
+        // #303: a flagged account carries a small orange marker after the
+        // value — "a stored limit reset should be spent" — the one menubar
+        // surface visible without opening the popover. The popover row and
+        // `accounts list` state the reason; the menubar just marks.
+        let markerSpace: CGFloat = resetFlagged ? 10 : 0
+        let width = contentWidth + markerSpace
 
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
             let xOffset = (contentWidth - blockWidth) / 2
@@ -539,6 +598,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let valueRect = CGRect(x: xOffset, y: 3, width: blockWidth, height: 13)
             let valueStr = NSAttributedString(string: percentText, attributes: valueAttrs)
             valueStr.draw(with: valueRect)
+
+            if resetFlagged {
+                NSColor.systemOrange.setFill()
+                NSBezierPath(ovalIn: CGRect(x: contentWidth - 2, y: 8, width: 6, height: 6)).fill()
+            }
 
             return true
         }

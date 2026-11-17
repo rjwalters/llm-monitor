@@ -821,6 +821,7 @@ struct UsagePopoverView: View {
                                 store: store,
                                 oauthPoller: oauthPoller,
                                 visibleProviders: visibleProviders,
+                                poolTally: poolTallies.byProvider[item.account.provider],
                                 onRemove: {
                                     accountToRemove = item.account
                                     showRemoveConfirmation = true
@@ -1270,6 +1271,10 @@ struct SummaryRow: View {
     /// Providers visible in the table — decides whether this row draws the
     /// provider-specific cells at all (`SummaryColumns.shows`, #227).
     var visibleProviders: Set<AccountProvider> = Set(AccountProvider.allCases)
+    /// The account's provider pool tally (#297), feeding the reset advisor's
+    /// "pool short" input (#303). Recomputed per render by the owner, so the
+    /// badge tracks pool changes live.
+    var poolTally: ProviderPoolSummary.Tally? = nil
     var onRemove: (() -> Void)? = nil
     @Environment(\.colorScheme) var colorScheme
     @State private var isEditingName = false
@@ -1478,6 +1483,50 @@ struct SummaryRow: View {
         store.primaryAccountId == account.id
     }
 
+    /// #303: the reset advisor's verdict for this row, computed only when the
+    /// row has current figures — a stale or drifted reading's advice is frozen
+    /// with its numbers and must not present as current (`displayUsage`'s
+    /// rule). nil when there is nothing current to advise on.
+    private var resetAdvice: ResetAdvisor.Advice? {
+        guard let usage = displayUsage else { return nil }
+        return ResetAdvisor.advise(record: usage, poolTally: poolTally, now: Date())
+    }
+
+    /// True when the row's current reading reports nothing about resets at
+    /// all — the "resets: unknown" case. Every provider's accounts hold
+    /// stored limit resets (the issue's premise), so an unreadable or
+    /// unimplemented feed — a Claude token rejected on scope (#285), an
+    /// `app-server`/rollout Codex reading — is a statement about this
+    /// reading, shown as unknown and never rendered as 0.
+    private var resetsUnknown: Bool {
+        guard displayUsage != nil else { return false }
+        return !ResetAdvisor.resets(from: displayUsage?.resetCredits).isKnown
+    }
+
+    /// Short badge text for a flagged row. The full reason — and the reset's
+    /// expiry when the reading reports one — lives in the tooltip.
+    private func resetBadgeText(_ advice: ResetAdvisor.Advice) -> String {
+        switch advice.state {
+        case .none: return ""
+        case .useNow, .expiring: return "use reset"
+        case .expiresSoon:
+            if let expiresAt = advice.expiresAt {
+                return "reset expires \(formatInterval(expiresAt.timeIntervalSinceNow))"
+            }
+            return "reset expires soon"
+        }
+    }
+
+    /// The tooltip that states the reason and the reset's expiry (#303).
+    private func resetAdviceHelp(_ advice: ResetAdvisor.Advice) -> String {
+        var text = advice.reason ?? "A stored limit reset should be spent"
+        if let expiresAt = advice.expiresAt {
+            text += " · expires \(Self.idleSinceFormatter.string(from: expiresAt))"
+        }
+        text += " — trigger resets by hand; this app never spends one."
+        return text
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             // Menu-bar source radio
@@ -1541,7 +1590,36 @@ struct SummaryRow: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .foregroundColor(isAbsent ? .secondary : .primary)
-                        if isAbsent { AbsentBadge() }
+                        if isAbsent {
+                            AbsentBadge()
+                        }
+                        // #303: the reset advisor's verdict. Orange "use reset"
+                        // when a stored reset should be spent (the operator
+                        // triggers it by hand), a quieter grey notice when a
+                        // held reset expires soon, and "resets: unknown" when
+                        // the reading carries no reset data — never a zero.
+                        if let advice = resetAdvice, advice.state != .none {
+                            Text(resetBadgeText(advice))
+                                .font(.caption2)
+                                .foregroundColor(advice.state == .expiresSoon
+                                                    ? Color.secondary
+                                                    : Color.orange)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule().fill(
+                                        advice.state == .expiresSoon
+                                            ? Color.secondary.opacity(0.15)
+                                            : Color.orange.opacity(0.18)
+                                    )
+                                )
+                                .help(resetAdviceHelp(advice))
+                        } else if resetsUnknown {
+                            Text("resets: unknown")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .help("This reading carries no reset-credit data — unknown, not zero (e.g. an app-server or rollout reading).")
+                        }
                     }
                     .opacity(isAbsent ? 0.6 : 1.0)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -244,9 +244,11 @@ enum AccountSyncCLI {
             CLIArgs.fail("Could not open '\(dbPath)': \(error.localizedDescription)")
         }
 
+        var readings: [String: RankingExporter.AccountStatusReading] = [:]
         let inputs = store.accounts.map { account -> PoolAccountInput in
-            let status = RankingExporter.statusReading(db: db, accountId: account.id).status
-            return PoolAccountInput(account: account, usage: store.latestUsage[account.id], status: status)
+            let reading = RankingExporter.statusReading(db: db, accountId: account.id)
+            readings[account.id] = reading
+            return PoolAccountInput(account: account, usage: store.latestUsage[account.id], status: reading.status)
         }
 
         var providers = AccountProvider.allCases.filter { provider in
@@ -269,9 +271,10 @@ enum AccountSyncCLI {
             let tally = ProviderPoolSummary.tally(rows)
             print("")
             print("\(provider.displayName) — \(ProviderPoolSummary.summaryLine(tally)) (\(tally.total) configured)")
-            print("  " + pad("ACCOUNT", 26) + pad("STATUS", 13) + pad("HEADROOM", 9) + "NEXT RESET")
+            print("  " + pad("ACCOUNT", 26) + pad("STATUS", 13) + pad("HEADROOM", 9) + pad("NEXT RESET", 27) + "RESET ADVICE")
             for input in rows {
-                print("  " + listRow(input))
+                print("  " + listRow(input, pool: ResetAdvisor.Pool(tally: tally),
+                                     resets: readings[input.account.id]?.resetCredits))
             }
         }
         print("")
@@ -294,18 +297,39 @@ enum AccountSyncCLI {
     /// One table row. Absent identities, never-polled accounts, and stale
     /// readings are named for what they are rather than passing silently as
     /// their last exported status.
-    private static func listRow(_ input: PoolAccountInput) -> String {
+    private static func listRow(
+        _ input: PoolAccountInput,
+        pool: ResetAdvisor.Pool,
+        resets: OpenAIUsageResponse.ResetCredits?
+    ) -> String {
         if input.account.isAbsent {
-            return pad(input.account.displayName, 26) + pad(CodexCLI.absentLabel, 13) + pad("—", 9) + "—"
+            return pad(input.account.displayName, 26) + pad(CodexCLI.absentLabel, 13) + pad("—", 9)
+                + pad("—", 27) + "—"
         }
         guard let usage = input.usage else {
-            return pad(input.account.displayName, 26) + pad("no reading", 13) + pad("—", 9) + "—"
+            return pad(input.account.displayName, 26) + pad("no reading", 13) + pad("—", 9)
+                + pad("—", 27) + "—"
         }
         let stale = AccountFreshness.isStale(lastUpdated: usage.timestamp, pollInterval: 600)
         let status = stale ? "stale" : (input.status ?? "unknown")
         let headroom = usage.rateLimit.headroomScore.map { String(format: "%.0f%%", $0) } ?? "—"
         let reset = usage.rateLimit.gatingWindow?.resetAt.map { formatReset($0) } ?? "—"
-        return pad(input.account.displayName, 26) + pad(status, 13) + pad(headroom, 9) + reset
+        // #303: the shared advisor's verdict for this account, against its
+        // provider's pool tally. An unknown reading (e.g. an `app-server` or
+        // rollout Codex reading, or a provider whose feed has not landed)
+        // says "resets: unknown" — never 0, never silence that reads as 0.
+        let advice = ResetAdvisor.displayLine(
+            usage: ResetAdvisor.Usage(
+                weeklyUsedPercent: usage.weeklyAllPercent,
+                weeklyResetsAt: UsageRecord.parseISO(usage.weeklyReset),
+                sessionUsedPercent: usage.sessionPercent
+            ),
+            resets: ResetAdvisor.resets(from: resets),
+            pool: pool,
+            now: Date()
+        ) ?? "—"
+        return pad(input.account.displayName, 26) + pad(status, 13) + pad(headroom, 9)
+            + pad(reset, 27) + advice
     }
 
     private static func pad(_ s: String, _ width: Int) -> String {
@@ -380,7 +404,12 @@ enum AccountSyncCLI {
 
             list prints a read-only per-provider pool summary — usable,
             exhausted, and earliest next reset per provider, one table per
-            provider, from the last stored readings. --provider narrows to
+            provider, from the last stored readings. Each row also carries a
+            RESET ADVICE column (#303): when the account should spend a stored
+            limit reset (the operator triggers resets by hand; the app never
+            spends one), a quiet notice when a held reset expires soon, or
+            "resets: unknown" when the reading carries no reset data.
+            --provider narrows to
             one provider (claude|codex|zai; anthropic/openai accepted too).
             Nothing is polled and nothing is written.
 
