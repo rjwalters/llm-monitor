@@ -32,6 +32,8 @@ enum SelfTest {
         ("GatingResetOrdering", { testGatingResetOrdering() }),
         ("StalenessBackstop", { testStalenessBackstop() }),
         ("BadgePercentSuppression", { testBadgePercentSuppression() }),
+        ("PoolSummaryTally", { testPoolSummaryTally() }),
+        ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
         ("MissingSessionWindow", { testMissingSessionWindow() }),
@@ -680,6 +682,158 @@ enum SelfTest {
                "stale and drifted together still suppress — neither cause requires the other")
         expect(!AccountFreshness.shouldSuppressPercent(isStale: false, tokenStatus: .expired),
                "every other token status (expired, revoked, error, missing, refreshing) is not, by itself, a suppression cause")
+    }
+
+    // MARK: - Provider pool summary (#297)
+
+    /// Fixture helpers shared by the pool-summary checks: a throwaway account
+    /// and its latest reading, with optional window percentages, resets
+    /// expressed as seconds from `now`, and a reading age (to force
+    /// staleness).
+    private static func poolAccount(_ id: String, _ provider: AccountProvider, absent: Bool = false) -> Account {
+        Account(id: id, provider: provider, accountName: id, email: nil,
+                plan: nil, lastUpdated: nil, latestPercent: nil,
+                codexHome: nil, isAbsent: absent)
+    }
+
+    private static func poolUsage(
+        _ accountId: String, session: Double?, weekly: Double?,
+        sessionResetIn: TimeInterval? = nil, weeklyResetIn: TimeInterval? = nil,
+        age: TimeInterval = 0, now: Date
+    ) -> UsageRecord? {
+        func iso(_ seconds: TimeInterval) -> String {
+            ISO8601DateFormatter().string(from: now.addingTimeInterval(seconds))
+        }
+        return UsageRecord(
+            id: 1, accountId: accountId, timestamp: now.addingTimeInterval(-age),
+            primaryPercent: session ?? weekly,
+            sessionPercent: session, weeklyAllPercent: weekly, weeklySONnetPercent: nil,
+            sessionReset: sessionResetIn.map(iso), weeklyReset: weeklyResetIn.map(iso)
+        )
+    }
+
+    /// The usable/exhausted/next-reset tally over mixed providers, with
+    /// absent, stale, never-polled, and empty-provider inputs — the exact
+    /// figures the popover's provider tabs and `accounts list` both show.
+    private static func testPoolSummaryTally() {
+        let now = Date()
+
+        // The popover-side status rule: exhaustion derived from the window
+        // percentages, fed through the export path's own mapStatus table.
+        expectEqual(ProviderPoolSummary.windowStatus(
+            for: poolUsage("a", session: 10, weekly: 100, now: now), credentialBlocked: false),
+            "exhausted", "a weekly window at its cap reads exhausted")
+        expectEqual(ProviderPoolSummary.windowStatus(
+            for: poolUsage("a", session: 100, weekly: 30, now: now), credentialBlocked: false),
+            "rate_limited", "a session window at its cap reads rate_limited")
+        expectEqual(ProviderPoolSummary.windowStatus(
+            for: poolUsage("a", session: 10, weekly: 20, now: now), credentialBlocked: false),
+            "available", "ordinary figures read available")
+        expectEqual(ProviderPoolSummary.windowStatus(
+            for: poolUsage("a", session: 10, weekly: 20, now: now), credentialBlocked: true),
+            "blocked", "a blocked credential reads blocked even with quiet windows")
+        expectEqual(ProviderPoolSummary.windowStatus(
+            for: nil, credentialBlocked: false) as String?,
+            nil, "no reading is unknown, never available")
+
+        // Mixed-provider pool: usable, exhausted, rate-limited, absent,
+        // stale, and never-polled rows across all three providers.
+        let inputs: [PoolAccountInput] = [
+            PoolAccountInput(account: poolAccount("an-1", .anthropic),
+                             usage: poolUsage("an-1", session: 10, weekly: 20, now: now),
+                             status: "available"),
+            PoolAccountInput(account: poolAccount("an-2", .anthropic),
+                             usage: poolUsage("an-2", session: 30, weekly: 40, now: now),
+                             status: "available"),
+            // Weekly spent, session back in 2h: the week gates, so the reset
+            // the summary advertises is the weekly one, 3 days out.
+            PoolAccountInput(account: poolAccount("an-3", .anthropic),
+                             usage: poolUsage("an-3", session: 100, weekly: 100,
+                                              sessionResetIn: 7200, weeklyResetIn: 3 * 86400, now: now),
+                             status: "exhausted"),
+            // Session capped only: back in 30 min.
+            PoolAccountInput(account: poolAccount("an-4", .anthropic),
+                             usage: poolUsage("an-4", session: 100, weekly: 30,
+                                              sessionResetIn: 1800, now: now),
+                             status: "rate_limited"),
+            // OpenAI: weekly-only reading (a legitimate shape), usable.
+            PoolAccountInput(account: poolAccount("oa-1", .openai),
+                             usage: poolUsage("oa-1", session: nil, weekly: 25,
+                                              weeklyResetIn: 5 * 86400, now: now),
+                             status: "available"),
+            // Declared-but-never-provisioned identity: total only.
+            PoolAccountInput(account: poolAccount("oa-2", .openai, absent: true),
+                             usage: nil, status: nil),
+            // z.ai: a usable key, a stale reading (2h old at a 10-min poll
+            // interval), and an account that has never reported anything.
+            PoolAccountInput(account: poolAccount("za-1", .zai),
+                             usage: poolUsage("za-1", session: 5, weekly: 15, age: 2 * 3600, now: now),
+                             status: "available"),
+            PoolAccountInput(account: poolAccount("za-2", .zai), usage: nil, status: nil),
+            PoolAccountInput(account: poolAccount("za-3", .zai),
+                             usage: poolUsage("za-3", session: 8, weekly: 18, now: now),
+                             status: "available"),
+            // A stale account whose last reading said exhausted must not be
+            // presented as currently exhausted — a frozen figure presents as
+            // current in neither bucket (#148). Its reset (1h out) stays
+            // above an-4's 30-min one so the next-reset assertion below
+            // doesn't hinge on whether stale rows count here.
+            PoolAccountInput(account: poolAccount("an-5", .anthropic),
+                             usage: poolUsage("an-5", session: nil, weekly: 100,
+                                              weeklyResetIn: 3600, age: 2 * 3600, now: now),
+                             status: "exhausted"),
+        ]
+
+        let tally = ProviderPoolSummary.tally(inputs, pollInterval: 600, now: now)
+        expectEqual(tally.total, 10, "every configured account is counted")
+        expectEqual(tally.usable, 4, "usable = present reading, not absent, not stale, available")
+        expectEqual(tally.exhausted, 1, "exhausted applies the same eligibility as usable — a stale exhausted reading does not count")
+        expect(tally.nextReset != nil,
+               "a pool with non-usable accounts has a next reset")
+        expect(abs(tally.nextReset!.timeIntervalSince(now) - 1800) < 5,
+               "the next reset is the earliest gating reset among non-usable accounts (an-4's session, 30 min)")
+
+        let byProvider = ProviderPoolSummary.tallyByProvider(inputs, pollInterval: 600, now: now)
+        expectEqual(byProvider[.anthropic]?.usable, 2, "Anthropic: an-1 and an-2 usable")
+        expectEqual(byProvider[.anthropic]?.exhausted, 1, "Anthropic: an-3 exhausted")
+        expectEqual(byProvider[.anthropic]?.total, 5, "Anthropic: all five configured")
+        expectEqual(byProvider[.openai]?.usable, 1, "OpenAI: oa-1 usable, its absent sibling never counts")
+        expectEqual(byProvider[.openai]?.total, 2, "OpenAI: both configured")
+        expectEqual(byProvider[.zai]?.usable, 1, "z.ai: only za-3 usable — stale and never-polled do not count")
+        expectEqual(byProvider[.zai]?.total, 3, "z.ai: all three configured")
+        expectEqual(byProvider.count, 3, "an empty provider has no tally entry at all — its absence is the empty answer")
+
+        let line = ProviderPoolSummary.summaryLine(tally, now: now)
+        expect(line.contains("4 usable") && line.contains("1 exhausted"),
+               "the summary line carries the counts: \(line)")
+        expect(line.contains("next reset"),
+               "the summary line names the next reset: \(line)")
+
+        var quiet = ProviderPoolSummary.Tally()
+        quiet.usable = 5
+        quiet.total = 5
+        expectEqual(ProviderPoolSummary.summaryLine(quiet, now: now),
+                    "5 usable",
+                    "a fully-idle tally's line is just the usable count — no exhausted or reset segment")
+    }
+
+    /// The persisted tab's fallback (#297): a stored provider that no longer
+    /// has any account demotes to `All`; a stored provider that does — and
+    /// `All` itself — survive the round trip unchanged.
+    private static func testPoolSummaryTabFallback() {
+        let accounts = [
+            poolAccount("an-1", .anthropic),
+            poolAccount("oa-1", .openai),
+        ]
+        expectEqual(ProviderTab(stored: nil), ProviderTab.all, "nothing stored → All")
+        expectEqual(ProviderTab(stored: "all"), ProviderTab.all, "an explicit All stores as All")
+        expectEqual(ProviderTab(stored: "anthropic"), .provider(.anthropic), "a stored provider restores")
+        expectEqual(ProviderTab(stored: "bogus"), ProviderTab.all, "an unknown stored value falls back to All, never crashes")
+        expectEqual(ProviderTab(stored: "zai").validated(among: accounts), ProviderTab.all,
+                    "a persisted tab whose provider has no accounts falls back to All")
+        expectEqual(ProviderTab(stored: "openai").validated(among: accounts), .provider(.openai),
+                    "a persisted tab whose provider still has accounts survives")
+        expectEqual(ProviderTab.all.validated(among: accounts), ProviderTab.all, "All never demotes")
     }
 
     // MARK: - Window model

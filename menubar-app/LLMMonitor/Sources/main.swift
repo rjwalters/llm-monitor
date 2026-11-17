@@ -40,6 +40,11 @@ class PopoverHeightManager: ObservableObject {
     /// Extra footer height while the calibration notice line (#243) is shown:
     /// one `.caption` line (~14) + its 4pt vertical padding × 2.
     static let calibrationNoticeHeight: CGFloat = 22
+    /// Height of the provider tab strip row (#297): one row of small tab
+    /// buttons plus its `.caption2` summary line, padded. Shown exactly
+    /// whenever the table has rows — i.e. whenever `contentHeight` is called
+    /// with a row count at all — so it needs no separate on/off state.
+    static let providerTabsHeight: CGFloat = 32
     /// Height for the setup/empty/error state (no table rows to size against).
     static let setupHeight: CGFloat = 360
 
@@ -82,9 +87,11 @@ class PopoverHeightManager: ObservableObject {
         return content.clamped(to: Self.minHeight...Self.maxHeight)
     }
 
-    /// Unclamped height that shows every row without scrolling.
+    /// Unclamped height that shows every row without scrolling. Includes the
+    /// provider tab strip (#297), which is present exactly when rows are.
     private func contentHeight(rowCount: Int) -> CGFloat {
-        Self.chromeHeight + (showsCalibrationNotice ? Self.calibrationNoticeHeight : 0)
+        Self.chromeHeight + Self.providerTabsHeight
+            + (showsCalibrationNotice ? Self.calibrationNoticeHeight : 0)
             + CGFloat(rowCount) * Self.rowHeight
     }
 

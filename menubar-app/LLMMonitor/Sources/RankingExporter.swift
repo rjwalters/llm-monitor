@@ -250,7 +250,55 @@ enum RankingExporter {
             return obj
         }
 
-        // Latest real (non-synthetic) usage reading for this account.
+        // Latest real (non-synthetic) usage reading for this account, and the
+        // status derived from it — one shared implementation with
+        // `accounts list` (#297).
+        let reading = RankingExporter.statusReading(db: db, accountId: accountId)
+
+        obj["status"] = reading.status
+
+        // utilization: DB stores 0–100 percentages; schema wants 0.0–1.0 fractions.
+        var utilization: [String: Any] = [:]
+        if let s = reading.sessionPercent { utilization["5h"] = fraction(s) }
+        if let w = reading.weeklyPercent { utilization["7d"] = fraction(w) }
+        if !utilization.isEmpty { obj["utilization"] = utilization }
+
+        // resets: pass through the stored ISO 8601 strings, normalizing to UTC.
+        var resets: [String: Any] = [:]
+        if let s = normalizedISO(reading.sessionReset) { resets["5h"] = s }
+        if let w = normalizedISO(reading.weeklyReset) { resets["7d"] = w }
+        if !resets.isEmpty { obj["resets"] = resets }
+
+        // models: optional / best-effort. Omitted entirely when unavailable.
+        if let models = fableModels(db: db, accountId: accountId) {
+            obj["models"] = models
+        }
+
+        if let updatedAt = normalizedISO(reading.updatedAt) {
+            obj["updated_at"] = updatedAt
+        }
+
+        return obj
+    }
+
+    // MARK: - Shared status reading (#297)
+
+    /// One account's exported status plus the reading it was computed from —
+    /// exactly what `ranking.json` reports for the account, factored out of
+    /// `buildAccount` so `llm-monitor accounts list` (#297) answers with the
+    /// same rule instead of a parallel re-derivation that could drift from it.
+    struct AccountStatusReading {
+        let status: String
+        let sessionPercent: Double?
+        let weeklyPercent: Double?
+        let sessionReset: String?
+        let weeklyReset: String?
+        let updatedAt: String?
+    }
+
+    /// The account's status and latest real (non-synthetic) usage reading, as
+    /// the export path sees them.
+    static func statusReading(db: Connection, accountId: String) -> AccountStatusReading {
         var sessionPercent: Double?
         var weeklyPercent: Double?
         var sessionReset: String?
@@ -277,8 +325,7 @@ enum RankingExporter {
         // Parse the per-poll status blob written by OAuthPoller.writePingToDB().
         let statuses = parseStatuses(rawData)
         let credential = credentialState(db: db, accountId: accountId)
-
-        obj["status"] = mapStatus(
+        let status = mapStatus(
             overallStatus: statuses.overall,
             sessionStatus: statuses.session,
             weeklyStatus: statuses.weekly,
@@ -286,28 +333,14 @@ enum RankingExporter {
             credentialRejected: credential.rejected
         )
 
-        // utilization: DB stores 0–100 percentages; schema wants 0.0–1.0 fractions.
-        var utilization: [String: Any] = [:]
-        if let s = sessionPercent { utilization["5h"] = fraction(s) }
-        if let w = weeklyPercent { utilization["7d"] = fraction(w) }
-        if !utilization.isEmpty { obj["utilization"] = utilization }
-
-        // resets: pass through the stored ISO 8601 strings, normalizing to UTC.
-        var resets: [String: Any] = [:]
-        if let s = normalizedISO(sessionReset) { resets["5h"] = s }
-        if let w = normalizedISO(weeklyReset) { resets["7d"] = w }
-        if !resets.isEmpty { obj["resets"] = resets }
-
-        // models: optional / best-effort. Omitted entirely when unavailable.
-        if let models = fableModels(db: db, accountId: accountId) {
-            obj["models"] = models
-        }
-
-        if let updatedAt = normalizedISO(updatedAt) {
-            obj["updated_at"] = updatedAt
-        }
-
-        return obj
+        return AccountStatusReading(
+            status: status,
+            sessionPercent: sessionPercent,
+            weeklyPercent: weeklyPercent,
+            sessionReset: sessionReset,
+            weeklyReset: weeklyReset,
+            updatedAt: updatedAt
+        )
     }
 
     // MARK: - Helpers
