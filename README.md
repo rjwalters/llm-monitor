@@ -489,6 +489,23 @@ duplicate. Accounts are keyed `zai:<email>` (else `zai:<label>`), so a
 rotation rolls the credential in place. In `ranking.json` they appear with
 `"provider": "zai"`, and a spent window reports `exhausted`/`rate_limited`.
 
+### All providers at a glance
+
+For a pool that mixes providers, `accounts list` prints one table per
+provider — usable / exhausted / earliest next reset, from the last stored
+readings, with the same per-account figures the popover shows. It is
+read-only: nothing is polled, nothing is written.
+
+```bash
+llm-monitor accounts list                        # every provider
+llm-monitor accounts list --provider codex       # claude|codex|zai
+llm-monitor accounts list --db /tmp/usage.db     # alternate database
+```
+
+The macOS popover shows the same tally as a tab strip — `All` plus one tab
+per configured provider, labelled `Name usable/total` — and remembers the
+selected tab and sort across launches.
+
 ### Rolling a Token (revoke + re-mint)
 
 > **Temporary workaround.** Anthropic exposes no supported API to list, revoke,
