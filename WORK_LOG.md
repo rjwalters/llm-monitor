@@ -2,6 +2,12 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-18
+
+- **PR #316**: ci: qualify Build workflow for GitHub merge queues
+- **Issue #318** (closed): ci: settle whether CodeQL default setup reports on merge_group before selecting required checks
+- **Issue #315** (closed): ci: qualify PR checks for GitHub merge queues
+
 ### 2026-11-17
 
 - **PR #312**: fix: walk flattenValue object keys in sorted order so archive truncation is deterministic
