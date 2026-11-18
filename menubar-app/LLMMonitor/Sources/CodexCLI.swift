@@ -15,6 +15,8 @@ import Foundation
 ///   reports **absent** (#135): an identity this host is expected to have but
 ///   was never provisioned with, carried here by an account copy/paste and
 ///   remediated by the `codex provision <label>` line printed beside it.
+/// - `codex readings` prints this host's own readings as the JSON document a
+///   peer host mirrors from (#320) — derived numbers only, never a credential.
 /// - `codex import` brings a credential in from Codex CLI's own store — the
 ///   original path, still supported.
 ///
@@ -50,6 +52,8 @@ enum CodexCLI {
             runList(Array(args.dropFirst()))
         case "provision":
             runProvision(Array(args.dropFirst()))
+        case "readings":
+            runReadings(Array(args.dropFirst()))
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -421,7 +425,11 @@ enum CodexCLI {
                         print(resetLine)
                     }
                     if account.isSnapshotOnly, let profileHome = account.codexHome {
-                        print("  → \(snapshotSummary(home: profileHome))")
+                        let summary = snapshotSummary(
+                            home: profileHome,
+                            stored: poller.latestCodexReading(accountId: account.accountId)
+                        )
+                        print("  → \(summary)")
                     }
                     if account.isAbsent {
                         let remediation = account.provisionLabel.map {
@@ -501,18 +509,136 @@ enum CodexCLI {
         return "  → " + parts.joined(separator: " · ")
     }
 
-    /// One line describing a Loom profile's latest rate-limit snapshot, read
-    /// from its rollout logs (never by probing the home).
-    static func snapshotSummary(home: String, now: Date = Date()) -> String {
-        guard let snap = CodexProfiles.latestSnapshot(home: home, now: now) else {
+    /// One line describing a Loom profile's latest rate-limit picture, from
+    /// whichever source this host knows to be freshest (#320): a stored
+    /// reading newer than the local rollout snapshot (usually a peer's, but
+    /// also this host's own live check), else the rollout snapshot itself
+    /// (never by probing the home).
+    ///
+    /// The stored reading names its origin — `via <host>` for a peer, `live
+    /// check` for the live probe — so a mirrored reading never masquerades as
+    /// local, and its age is stated beside it.
+    static func snapshotSummary(
+        home: String,
+        stored: OAuthPoller.CodexReadingSummary? = nil,
+        now: Date = Date()
+    ) -> String {
+        let local = CodexProfiles.latestSnapshot(home: home, now: now)
+        if let stored = stored,
+           stored.sessionPercent != nil || stored.weeklyPercent != nil,
+           local.map({ stored.observedAt > $0.observedAt }) ?? true {
+            let hours = now.timeIntervalSince(stored.observedAt) / 3600
+            let age = hours < 48 ? String(format: "%.0fh ago", hours) : String(format: "%.1fd ago", hours / 24)
+            func pct(_ value: Double?) -> String { value.map { String(format: "%.0f%%", $0) } ?? "—" }
+            var line = "5h \(pct(stored.sessionPercent)) · weekly \(pct(stored.weeklyPercent)) as of \(age)"
+            if let host = stored.peerHost {
+                line += " · via \(host)"
+            } else if stored.source == "loom-accounts-check-live" {
+                line += " · live check"
+            }
+            return line
+        }
+        guard let snap = local else {
             return "no rate-limit snapshot yet (one Codex turn on this account records one)"
         }
         let hours = now.timeIntervalSince(snap.observedAt) / 3600
         let age = hours < 48 ? String(format: "%.0fh ago", hours) : String(format: "%.1fd ago", hours / 24)
-        guard !snap.rateLimit.isEmpty else { return "last snapshot \(age) has rolled over; usage unknown" }
+        guard !snap.rateLimit.isEmpty else {
+            // "Inactive on this host", not "usage unknown" (#320): the account
+            // may simply be used on another host — point at the peer list
+            // instead of implying the numbers are a mystery.
+            return "last snapshot \(age) has rolled over — inactive on this host"
+        }
         func pct(_ w: RateLimitWindow?) -> String { w.map { String(format: "%.0f%%", $0.usedPercent) } ?? "—" }
         let reset = snap.rateLimit.weekly?.resetAt.map { " (weekly resets \(ISO8601DateFormatter().string(from: $0)))" } ?? ""
         return "5h \(pct(snap.rateLimit.session)) · weekly \(pct(snap.rateLimit.weekly)) as of \(age)\(reset)"
+    }
+
+    // MARK: - codex readings
+
+    private static func runReadings(_ args: [String]) -> Never {
+        var dbPath: String?
+
+        var i = 0
+        while i < args.count {
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
+                i += 1
+            case .help:
+                printUsage()
+                exit(0)
+            case .notMatched:
+                CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
+            }
+            i += 1
+        }
+
+        // The document is the endpoint a Codex peer mirrors from over ssh
+        // (`CodexPeerReadings`): derived readings only, never a credential,
+        // never an account bundle. Nothing reads it by eye — JSON on stdout,
+        // straight into a decoder on the requesting host.
+        print(String(decoding: readingsDocument(dbPath: dbPath), as: UTF8.self))
+        exit(0)
+    }
+
+    /// The peer wire document for this host's own Codex readings. Pure over
+    /// its inputs apart from the clock, so `SelfTest` drives it against a
+    /// scratch database offline.
+    ///
+    /// Every OpenAI row with a registered home is reported, keyed on the
+    /// home's own name — the join key `CodexPeerReadings` documents. A missing
+    /// database is an empty document, not an error: a peer that has never
+    /// launched the app still answers, with nothing to mirror.
+    // Not private: exercised directly by SelfTest.
+    static func readingsDocument(dbPath: String?) -> Data {
+        let path = dbPath ?? AppPaths.databasePath
+        var readings: [CodexPeerReadings.Reading] = []
+        if FileManager.default.fileExists(atPath: path),
+           let db = try? openDatabase(path, readonly: true) {
+            do {
+                let rows = try db.prepare("""
+                    SELECT a.id, a.codex_home, a.plan FROM accounts a
+                    WHERE COALESCE(a.provider, 'anthropic') = 'openai'
+                      AND a.codex_home IS NOT NULL AND TRIM(a.codex_home) != ''
+                    ORDER BY a.sort_order, a.id
+                """)
+                for row in rows {
+                    guard let id = row[0] as? String,
+                          let home = (row[1] as? String)?.trimmingCharacters(in: .whitespaces),
+                          !home.isEmpty else { continue }
+                    let profile = (home as NSString).lastPathComponent
+                    guard !profile.isEmpty else { continue }
+                    let plan = (row[2] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    let latest = try db.prepare("""
+                        SELECT timestamp, session_percent, weekly_all_percent,
+                               session_reset, weekly_reset
+                        FROM usage_history WHERE account_id = ? AND is_synthetic = 0
+                        ORDER BY timestamp DESC, rowid DESC LIMIT 1
+                    """)
+                    for usage in latest.bind(id) {
+                        guard let observedAt = UsageRecord.parseISO(usage[0] as? String) else { continue }
+                        let session = (usage[1] as? Double).map {
+                            RateLimitWindow(kind: .session, usedPercent: $0,
+                                            resetAt: UsageRecord.parseISO(usage[3] as? String))
+                        }
+                        let weekly = (usage[2] as? Double).map {
+                            RateLimitWindow(kind: .weekly, usedPercent: $0,
+                                            resetAt: UsageRecord.parseISO(usage[4] as? String))
+                        }
+                        readings.append(CodexPeerReadings.Reading(
+                            profile: profile, host: "", observedAt: observedAt, plan: plan,
+                            rateLimit: RateLimitSnapshot(session: session, weekly: weekly)
+                        ))
+                    }
+                }
+            } catch {
+                // A half-readable database yields an empty document, never a
+                // partial one: the requesting host keeps its local readings.
+                readings = []
+            }
+        }
+        return CodexPeerReadings.encodeDocument(readings: readings, generatedAt: Date())
     }
 
     /// The status word for a Loom Codex profile, which `codex list` reports
@@ -809,6 +935,7 @@ enum CodexCLI {
               llm-monitor codex provision <label> [--db <path>]
               llm-monitor codex add --home <path> [--db <path>]
               llm-monitor codex list [--db <path>]
+              llm-monitor codex readings [--db <path>]
               llm-monitor codex import [--auth <path>] [--db <path>]
 
             provision  Collapse home-create + login + register into one
@@ -887,6 +1014,13 @@ enum CodexCLI {
                     ever fails, the account's token dot turns yellow (still
                     valid, renewal failing) or red (expired). Re-running this
                     command re-imports a fresh credential.
+
+            readings Print this host's Codex readings as the JSON document a
+                    peer host mirrors from (`CodexPeerReadings`): profile
+                    name, windows, reset instants, observed-at — derived
+                    readings only. No credential, no `auth.json` content, no
+                    home path, and never an account export; the requesting
+                    host joins on the profile name and writes nothing here.
 
             --db <path> overrides ~/.llm-monitor/usage.db (writing
             ranking.json beside it) — mainly for exercising these commands end

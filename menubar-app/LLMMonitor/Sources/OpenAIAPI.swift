@@ -210,6 +210,20 @@ struct OpenAIUsageResponse: Decodable {
         )
     }
 
+    /// The reading's own source tag from a stored `usage_history.raw_data`
+    /// blob — `codex-rollout-snapshot`, `loom-accounts-check-live`, or
+    /// `peer:<host>` (#320), whichever writer produced the row. nil for rows
+    /// that predate the tag or carry no archive. One parse rule beside
+    /// `parseStoredReading`, so display surfaces cannot re-derive the key.
+    static func storedReadingSource(_ raw: String?) -> String? {
+        guard let raw = raw,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return (obj["source"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     // MARK: Mapping to the shared model
 
     /// This response in the provider-agnostic window model.

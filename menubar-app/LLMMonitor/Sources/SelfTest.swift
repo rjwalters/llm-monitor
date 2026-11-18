@@ -55,6 +55,11 @@ enum SelfTest {
         ("LoomDaemonBinaryAndWorkspaceResolution", { testLoomDaemonBinaryAndWorkspaceResolution() }),
         ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
         ("LoomLiveReadingPreferredOnlyWhenNewer", { testLoomLiveReadingPreferredOnlyWhenNewer() }),
+        ("CodexPeerHostResolution", { testCodexPeerHostResolution() }),
+        ("CodexPeerReadingsDocument", { testCodexPeerReadingsDocument() }),
+        ("CodexPeerFetchAgainstStub", { testCodexPeerFetchAgainstStub() }),
+        ("CodexPeerReadingPreferredOnlyWhenNewer", { testCodexPeerReadingPreferredOnlyWhenNewer() }),
+        ("CodexReadingsVerbDocument", { testCodexReadingsVerbDocument() }),
         ("ClaudeTokenFileScanning", { testClaudeTokenFileScanning() }),
         ("ClaudeTokenTargetAndAccountsEnv", { testClaudeTokenTargetAndAccountsEnv() }),
         ("ClaudeAccountRekey", { testClaudeAccountRekey() }),
@@ -1812,6 +1817,383 @@ enum SelfTest {
     private final class ReportBox: @unchecked Sendable {
         var report: LoomAccountsCheck.Report?
     }
+
+    /// `runBlockingReport`'s counterpart for the peer fetch, whose result type
+    /// is a `CodexPeerReadings.Document?`.
+    private static func runBlockingDocument(
+        _ operation: @escaping @Sendable () async -> CodexPeerReadings.Document?
+    ) -> CodexPeerReadings.Document? {
+        let box = DocumentBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.document = await operation()
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success else { return nil }
+        return box.document
+    }
+
+    /// `@unchecked Sendable` on the same basis as `ReportBox`.
+    private final class DocumentBox: @unchecked Sendable {
+        var document: CodexPeerReadings.Document?
+    }
+
+    // MARK: Codex peer readings (#320)
+
+    /// Peer-list resolution: empty by default (nothing changes for a host that
+    /// never configured peers), `$LLM_MONITOR_CODEX_PEERS` replacing the file,
+    /// and the file's comment/blank-line/indentation/dedupe rules.
+    private static func testCodexPeerHostResolution() {
+        expectEqual(CodexPeerReadings.resolveHosts(environment: [:], dbDirectory: nil), [],
+                    "no configuration at all is an empty peer list, not an error")
+        expectEqual(CodexPeerReadings.resolveHosts(environment: [:], dbDirectory: "/nonexistent-dir-xyz"), [],
+                    "a missing peers file is an empty list, never an error")
+        expectEqual(
+            CodexPeerReadings.resolveHosts(
+                environment: [CodexPeerReadings.peersEnvKey: "worker-1, worker-2 worker-1\nworker-3"],
+                dbDirectory: nil),
+            ["worker-1", "worker-2", "worker-3"],
+            "the env list splits on commas and whitespace and keeps the first occurrence of a duplicate")
+        expectEqual(
+            CodexPeerReadings.resolveHosts(environment: [CodexPeerReadings.peersEnvKey: "   "], dbDirectory: nil),
+            [], "a whitespace-only env value is not a peer list")
+        expectEqual(
+            CodexPeerReadings.resolveHosts(environment: [CodexPeerReadings.peersEnvKey: "worker-9"], dbDirectory: "/tmp"),
+            ["worker-9"], "the env override replaces the file entirely rather than merging with it")
+
+        withSelfTestTempDir("peers") { dir in
+            let path = dir.appendingPathComponent(CodexPeerReadings.peersFileBaseName).path
+            _ = FileManager.default.createFile(atPath: path, contents: Data("""
+                # Loom worker pool — one ssh host per line
+                worker-1
+                  worker-2   # inline comment
+                #worker-disabled
+                worker-1
+
+                """.utf8))
+            expectEqual(
+                CodexPeerReadings.resolveHosts(environment: [:], dbDirectory: dir.path),
+                ["worker-1", "worker-2"],
+                "the file: full-line and inline comments, blank lines, indentation, dedupe")
+        }
+    }
+
+    /// The peer wire document: decode tolerance (nameless rows skipped,
+    /// duration drives the kind, rolled-over windows dropped), the failure
+    /// shapes (undecodable, empty-but-valid), the encode → decode round trip,
+    /// and the newest-wins merge the fetch loop folds every peer through.
+    private static func testCodexPeerReadingsDocument() {
+        let now = Date()
+        let iso = ISO8601DateFormatter()
+        let ahead = iso.string(from: now.addingTimeInterval(3600))
+        let behind = iso.string(from: now.addingTimeInterval(-3600))
+        let document = """
+            {"schema":\(CodexPeerReadings.schemaVersion),"generated_at":"\(iso.string(from: now.addingTimeInterval(-30)))",
+             "readings":[
+               {"profile":"agent-1","observed_at":"\(iso.string(from: now.addingTimeInterval(-60)))","plan":"pro",
+                "windows":[{"kind":"5h","used_percent":12.0,"duration_seconds":18000,"reset_at":"\(ahead)"},
+                           {"kind":"7d","used_percent":43.0,"reset_at":"\(ahead)"}]},
+               {"profile":"agent-2","observed_at":"\(iso.string(from: now.addingTimeInterval(-60)))",
+                "windows":[{"kind":"7d","used_percent":90.0,"reset_at":"\(behind)"}]},
+               {"profile":"","observed_at":"\(ahead)","windows":[]}
+             ]}
+            """
+        guard let decoded = CodexPeerReadings.decode(Data(document.utf8), host: "worker-3", now: now) else {
+            expect(false, "a well-formed peer document decodes"); return
+        }
+        expectEqual(decoded.readings.count, 2, "a nameless row is skipped; a windowless-but-named one is kept")
+        let agent1 = decoded.readings.first { $0.profile == "agent-1" }
+        expect(agent1?.host == "worker-3", "the fetcher tags each reading with the peer it came from")
+        expectEqual(agent1?.rateLimit.session?.usedPercent, 12,
+                    "duration_seconds drives the kind: 18000s files as the session bucket")
+        expectEqual(agent1?.rateLimit.weekly?.usedPercent, 43,
+                    "the kind key falls back to the bucket when no duration is carried")
+        expect(agent1?.rateLimit.weekly?.resetAt != nil, "reset instants survive the decode")
+        expectEqual(agent1?.plan, "pro", "the plan name rides the wire")
+        expect(agent1?.hasMeasurement == true, "a row with live windows is a measurement")
+        let agent2 = decoded.readings.first { $0.profile == "agent-2" }
+        expect(agent2?.hasMeasurement == false,
+               "a row whose only window has rolled over measured nothing — never treated as a reading")
+
+        expect(CodexPeerReadings.decode(Data("not json".utf8), host: "h", now: now) == nil,
+               "undecodable output is not a document")
+        expect(CodexPeerReadings.decode(Data(#"{"schema":1,"readings":[]}"#.utf8), host: "h", now: now) != nil,
+               "an empty readings array is a valid, empty document — a peer with no Codex pool")
+
+        let reading = CodexPeerReadings.Reading(
+            profile: "agent-1", observedAt: now.addingTimeInterval(-60), plan: "pro",
+            rateLimit: RateLimitSnapshot(
+                session: RateLimitWindow(kind: .session, usedPercent: 12, resetAt: now.addingTimeInterval(3600)),
+                weekly: RateLimitWindow(kind: .weekly, usedPercent: 43, resetAt: now.addingTimeInterval(3 * 86400))))
+        let roundTripped = CodexPeerReadings.decode(
+            CodexPeerReadings.encodeDocument(readings: [reading], generatedAt: now),
+            host: "worker-1", now: now)
+        expectEqual(roundTripped?.readings.count, 1, "encode → decode round trips the row")
+        expectEqual(roundTripped?.readings.first?.rateLimit.session?.usedPercent, 12, "…with the session figure")
+        expectEqual(roundTripped?.readings.first?.rateLimit.weekly?.usedPercent, 43, "…and the weekly figure")
+        expect(roundTripped?.readings.first?.rateLimit.weekly?.resetAt != nil, "…and the reset instant")
+
+        var cache: [String: CodexPeerReadings.Reading] = ["agent-1": reading]
+        cache = CodexPeerReadings.merging(CodexPeerReadings.Document(generatedAt: now, readings: [
+            CodexPeerReadings.Reading(
+                profile: "agent-1", observedAt: now.addingTimeInterval(-120), plan: nil,
+                rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(kind: .weekly, usedPercent: 5))),
+            CodexPeerReadings.Reading(
+                profile: "agent-2", observedAt: now, plan: nil,
+                rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(kind: .weekly, usedPercent: 7))),
+        ]), into: cache)
+        expectEqual(cache["agent-1"]?.rateLimit.weekly?.usedPercent, 43,
+                    "an older peer reading never displaces the cache's incumbent")
+        expectEqual(cache["agent-2"]?.rateLimit.weekly?.usedPercent, 7,
+                    "a newer reading for another profile joins the cache")
+        cache = CodexPeerReadings.merging(CodexPeerReadings.Document(generatedAt: now, readings: [
+            CodexPeerReadings.Reading(profile: "agent-3", observedAt: now, plan: nil,
+                                      rateLimit: RateLimitSnapshot()),
+        ]), into: cache)
+        expect(cache["agent-3"] == nil, "a row that measured nothing never enters the cache")
+    }
+
+    /// The fetch, against a stub `ssh` (never a real connection): argv shape,
+    /// stderr noise ignored, the host tagged onto each reading, and the
+    /// failure shapes — garbage output, spawn failure — falling back to nil.
+    /// The request carries only the read-only verb: no home path, no bundle,
+    /// nothing credential-shaped ever leaves this host.
+    private static func testCodexPeerFetchAgainstStub() {
+        withSelfTestTempDir("peer-fetch") { dir in
+            do {
+                let now = Date()
+                let iso = ISO8601DateFormatter()
+                let payload = """
+                    {"schema":\(CodexPeerReadings.schemaVersion),
+                     "generated_at":"\(iso.string(from: now.addingTimeInterval(-30)))",
+                     "readings":[{"profile":"agent-1","observed_at":"\(iso.string(from: now.addingTimeInterval(-60)))",
+                       "windows":[{"kind":"7d","used_percent":61.0,"reset_at":"\(iso.string(from: now.addingTimeInterval(3 * 86400)))"}]}]}
+                    """
+                let oneLine = payload.replacingOccurrences(of: "\n", with: " ")
+                let argvFile = dir.appendingPathComponent("ssh-argv").path
+                let homePath = "/home/someone/.loom/codex-profiles/agent-1"
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    printf '%s\\n' "$*" > \(argvFile)
+                    echo 'banner noise on stderr' >&2
+                    echo '\(oneLine)'
+                    """)
+
+                // Resolved through the same environment seam `accounts push`
+                // uses (`remoteSyncTestEnvironment`), so the override key the
+                // poller's refresh hands to the resolver is the one proven here.
+                guard let resolved = AccountSyncRemote.resolveSSHBinary(
+                    environment: remoteSyncTestEnvironment(ssh: ssh)) else {
+                    expect(false, "the ssh override resolves the stub"); return
+                }
+                guard let document = runBlockingDocument({
+                    await CodexPeerReadings.run(
+                        host: "worker-3", sshBinary: resolved, timeout: 20, now: now)
+                }) else {
+                    expect(false, "a stub printing the document on stdout is read (stderr noise ignored)"); return
+                }
+                expectEqual(document.readings.count, 1, "the peer's reading decodes")
+                expectEqual(document.readings.first?.host, "worker-3", "…tagged with the peer it came from")
+                expectEqual(document.readings.first?.rateLimit.weekly?.usedPercent, 61, "…with its weekly figure")
+
+                let argv = (try? String(contentsOfFile: argvFile, encoding: .utf8)) ?? ""
+                expect(argv.contains("BatchMode=yes"), "the fetch runs ssh in batch mode; argv was: \(argv)")
+                expect(argv.contains("worker-3"), "the peer host is passed to ssh; argv was: \(argv)")
+                expect(argv.contains("'claude-monitor' codex readings"),
+                       "the remote command is exactly the read-only verb; argv was: \(argv)")
+                expect(!argv.contains("accounts export"),
+                       "never the credential-carrying export verb; argv was: \(argv)")
+                expect(!argv.contains(homePath) && !argv.contains("~"),
+                       "no home path crosses the request; argv was: \(argv)")
+
+                let silent = try writeStub(in: dir, name: "silent-ssh", body: "#!/bin/sh\necho oops >&2\nexit 255\n")
+                expect(runBlockingDocument({
+                    await CodexPeerReadings.run(host: "worker-3",
+                                                sshBinary: silent, timeout: 20, now: now)
+                }) == nil, "a peer that prints no JSON yields no document, and no error state")
+
+                expect(runBlockingDocument({
+                    await CodexPeerReadings.run(host: "worker-3",
+                                                sshBinary: dir.appendingPathComponent("gone").path,
+                                                timeout: 20, now: now)
+                }) == nil, "a spawn failure is a silent fallback to local sources")
+            } catch {
+                checks += 1
+                failures.append("codex peer fetch test threw: \(error)")
+            }
+        }
+    }
+
+    /// `pollCodexSnapshot`'s source choice with the peer added: a peer reading
+    /// wins only when it is strictly newer than both local sources, never when
+    /// it measured nothing, and the live check still outranks an older peer.
+    /// Drives the poller offline through its injection seam, exactly as the
+    /// live-check test does.
+    private static func testCodexPeerReadingPreferredOnlyWhenNewer() {
+        withSelfTestTempDir("codex-peer-poll") { dir in
+            let fm = FileManager.default
+            let root = dir.appendingPathComponent("codex-profiles").path
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+
+            let home = (root as NSString).appendingPathComponent("agent-1")
+            try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
+            let auth = try! JSONSerialization.data(withJSONObject: ["tokens": ["account_id": "acct-agent-1"]])
+            _ = fm.createFile(atPath: home + "/auth.json", contents: auth)
+
+            // The local rollout snapshot: recorded two hours ago, 43% weekly.
+            let snapshotAt = Date().addingTimeInterval(-7200)
+            let snapshotISO = ISO8601DateFormatter().string(from: snapshotAt)
+            let line = #"{"timestamp":"\#(snapshotISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
+            _ = fm.createFile(atPath: home + "/sessions/2026/09/23/rollout-a.jsonl",
+                              contents: Data((line + "\n").utf8))
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            expectEqual(poller.syncCodexProfiles(root: root), 1, "the fixture profile registers")
+            @MainActor func credential() -> OAuthCredential? {
+                poller.loadActiveCredentials().first { $0.isCodexSnapshotOnly }
+            }
+            func latestRow() -> (timestamp: String?, weekly: Double?, source: String?) {
+                let db = try! openDatabase(dbPath)
+                for r in try! db.prepare("""
+                    SELECT timestamp, weekly_all_percent, raw_data FROM usage_history
+                    WHERE account_id = 'acct-agent-1' AND is_synthetic = 0
+                    ORDER BY timestamp DESC, rowid DESC LIMIT 1
+                """) {
+                    return (r[0] as? String, r[1] as? Double,
+                            OpenAIUsageResponse.storedReadingSource(r[2] as? String))
+                }
+                return (nil, nil, nil)
+            }
+            func rowCount() -> Int {
+                let db = try! openDatabase(dbPath)
+                return (try! db.scalar(
+                    "SELECT COUNT(*) FROM usage_history WHERE account_id = 'acct-agent-1' AND is_synthetic = 0"
+                ) as? Int64).map({ Int($0) }) ?? 0
+            }
+            func peerReading(at observedAt: Date, weekly: Double?) -> CodexPeerReadings.Reading {
+                let window = weekly.map {
+                    RateLimitWindow(kind: .weekly, usedPercent: $0,
+                                    resetAt: Date().addingTimeInterval(3 * 86400), status: "allowed")
+                }
+                return CodexPeerReadings.Reading(
+                    profile: "agent-1", host: "worker-3", observedAt: observedAt, plan: nil,
+                    rateLimit: RateLimitSnapshot(weekly: window))
+            }
+            func liveReading(at observedAt: Date, weekly: Double) -> LoomAccountsCheck.Reading {
+                LoomAccountsCheck.Reading(
+                    name: "agent-1", status: "available", detail: nil, observedAt: observedAt,
+                    rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(
+                        kind: .weekly, usedPercent: weekly,
+                        resetAt: Date().addingTimeInterval(3 * 86400), status: "allowed")))
+            }
+
+            // 1. A peer reading OLDER than the local snapshot must not win.
+            poller.setCodexPeerReadings(
+                ["agent-1": peerReading(at: snapshotAt.addingTimeInterval(-3600), weekly: 5)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(latestRow().weekly, 43, "an older peer reading never overwrites the newer local snapshot")
+            expectEqual(latestRow().source, "codex-rollout-snapshot", "…and the row keeps the local snapshot's source")
+
+            // 2. A newer peer reading wins, and the row carries the peer's own
+            //    timestamp and source host — so staleness and origin both read
+            //    back from the store.
+            let peerAt = snapshotAt.addingTimeInterval(3600)
+            let peerISO = ISO8601DateFormatter().string(from: peerAt)
+            poller.setCodexPeerReadings(["agent-1": peerReading(at: peerAt, weekly: 61)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(latestRow().weekly, 61, "a newer peer reading is preferred over the local snapshot")
+            expectEqual(latestRow().timestamp, peerISO, "the row carries the peer observation's own timestamp")
+            expectEqual(latestRow().source, "peer:worker-3", "the row records which peer it came from")
+
+            // 3. A newer peer row that measured NOTHING is not a reading at all.
+            poller.setCodexPeerReadings(
+                ["agent-1": peerReading(at: peerAt.addingTimeInterval(3600), weekly: nil)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(latestRow().weekly, 61,
+                        "a measurement-less peer row never displaces real numbers")
+
+            // 4. The live check still outranks an older peer reading.
+            poller.setLoomCodexLiveReadings(
+                ["agent-1": liveReading(at: peerAt.addingTimeInterval(3600), weekly: 77)])
+            poller.setCodexPeerReadings(["agent-1": peerReading(at: peerAt, weekly: 61)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(latestRow().weekly, 77, "the live check outranks an older peer reading")
+            expectEqual(latestRow().source, "loom-accounts-check-live", "…as the live row's own source records")
+
+            // 5. No peer readings at all: the rollout snapshot still polls,
+            //    unchanged, and a re-read writes no duplicate row.
+            poller.setCodexPeerReadings([:])
+            poller.setLoomCodexLiveReadings([:])
+            let before = rowCount()
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(rowCount(), before, "no peer readings: the unchanged snapshot writes no duplicate row")
+            expectEqual(try! openDatabase(dbPath).scalar(
+                "SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'acct-agent-1' AND last_error IS NOT NULL"
+            ) as? Int64, 0, "the local fallback is a normal successful poll, not an error state")
+
+            // 6. The no-current-reading diagnostic says the account is
+            //    inactive on this host and points at the peer list — never
+            //    "usage unknown", which implied the numbers were unknowable
+            //    rather than just not local (#320).
+            let rolledOver = OAuthPoller.rolledOverCodexSnapshotMessage
+            expect(rolledOver.contains("inactive"), "the rolled-over diagnostic reads as inactive-on-this-host")
+            expect(rolledOver.contains("peer"), "…and names the peer list as the fix when the account is active elsewhere")
+            expect(!rolledOver.lowercased().contains("usage unknown"), "…and never says 'usage unknown'")
+        }
+    }
+
+    /// `codex readings` — the verb a peer host mirrors from. Only OpenAI rows
+    /// with a registered home are reported, keyed on the profile name (never a
+    /// path), the newest non-synthetic reading per row, and nothing
+    /// credential-shaped anywhere in the payload. A host that never launched
+    /// the app answers with an empty document, not an error.
+    private static func testCodexReadingsVerbDocument() {
+        withSelfTestTempDir("peer-verb") { dir in
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            guard let empty = CodexPeerReadings.decode(CodexCLI.readingsDocument(dbPath: dbPath), host: "self") else {
+                expect(false, "a missing database yields a decodable empty document"); return
+            }
+            expectEqual(empty.readings.count, 0, "a peer with nothing to mirror answers with an empty document")
+
+            UsageStore(dbPath: dbPath).ensureDatabase()
+            let db = try! openDatabase(dbPath)
+            try! db.run("""
+                INSERT INTO accounts (id, account_name, email, provider, codex_home) VALUES
+                    ('acct-1', 'agent-1', NULL, 'openai', '/home/u/.loom/codex-profiles/agent-1'),
+                    ('acct-2', NULL, NULL, 'anthropic', '/home/u/.claude'),
+                    ('acct-3', NULL, NULL, 'openai', NULL)
+            """)
+            let observed = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-120))
+            try! db.run("""
+                INSERT INTO usage_history (account_id, timestamp, session_percent, weekly_all_percent,
+                                           session_reset, weekly_reset, is_synthetic)
+                VALUES ('acct-1', '\(observed)', 12.0, 43.0, NULL, NULL, 0)
+            """)
+            // A synthetic reset-bracketing row, deliberately the newest: it
+            // must never be what the verb mirrors.
+            try! db.run("""
+                INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                VALUES ('acct-1', '\(ISO8601DateFormatter().string(from: Date()))', 99.0, 1)
+            """)
+
+            let data = CodexCLI.readingsDocument(dbPath: dbPath)
+            let text = String(decoding: data, as: UTF8.self)
+            expect(!text.lowercased().contains("token"), "the wire carries no token key")
+            expect(!text.contains("/home/u"), "the wire carries no home path — only the profile name")
+            guard let document = CodexPeerReadings.decode(data, host: "requester") else {
+                expect(false, "the verb's own output decodes"); return
+            }
+            expectEqual(document.readings.count, 1, "only OpenAI rows with a registered home are mirrored")
+            let reading = document.readings.first
+            expectEqual(reading?.profile, "agent-1", "keyed on the profile name, never the home path")
+            expectEqual(reading?.rateLimit.session?.usedPercent, 12, "the stored session figure rides the wire")
+            expectEqual(reading?.rateLimit.weekly?.usedPercent, 43, "…and the weekly figure")
+            expectEqual(reading?.observedAt, UsageRecord.parseISO(observed),
+                        "…stamped with the reading's own timestamp, never the synthetic row's")
+        }
+    }
+
 
     // MARK: Data directory rename (2.0)
 
