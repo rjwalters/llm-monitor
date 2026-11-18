@@ -12,6 +12,9 @@ on:
   # builds the integrated tree, not a PR head or main.
   merge_group:
     types: [checks_requested]
+    # No `branches:` filter here (unlike push/pull_request above): a merge
+    # group is only ever created against the branch the queue protects —
+    # the default branch — so a filter would be redundant.
   # Fires when `/repo:release` (or a manual `gh release create`) publishes a
   # GitHub Release — used below to attach the static Linux binary as a
   # release asset. Does NOT fire for draft releases, only `published`.
@@ -27,12 +30,21 @@ on:
 
 # Merge-queue runs must never be cancelled or superseded by PR/push runs:
 # they get their own group keyed by the group's unique head SHA
-# (`github.sha` — the merge-group commit). PR/push runs keep their old
-# behavior (keyed by ref, no cancellation — there was no concurrency block
-# before merge groups), so they can never share a group with — or cancel —
-# a queue run.
+# (`github.sha` — the merge-group commit), and `cancel-in-progress: false`
+# keeps a running queue run safe within it.
+#
+# Every other event keeps the pre-merge-group behavior exactly: there was
+# NO concurrency block before this trigger was added, so same-ref runs
+# executed in parallel — nothing was queued and nothing was cancelled. That
+# is preserved by giving each non-merge-group run a UNIQUE group (keyed by
+# `github.run_id`, unique per run): a group of one is never queued behind,
+# evicted by, or cancelled because of another run. Keying those runs by ref
+# instead would serialize them — and let a newly queued run evict a pending
+# one, because `cancel-in-progress: false` protects only RUNNING runs, not
+# pending ones. (A manual `workflow_dispatch` against `main` therefore still
+# runs independently of any push run, as the fallback above intends.)
 concurrency:
-  group: ${{ github.event_name == 'merge_group' && format('{0}-merge-group-{1}', github.workflow, github.sha) || format('{0}-{1}', github.workflow, github.ref) }}
+  group: ${{ github.event_name == 'merge_group' && format('{0}-merge-group-{1}', github.workflow, github.sha) || format('{0}-{1}-{2}', github.workflow, github.ref, github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +52,13 @@ jobs:
   # check contexts on a merge group as on a PR. The context names are the
   # bare job ids `build-macos` / `build-linux` (verified against real check
   # runs — no workflow prefix); those are the names a merge queue can
-  # require. `publish-linux-release-asset` stays gated to `release` events
+  # require. This file is the repo's only *repo-owned* workflow, but not the
+  # only suite on a PR head: CodeQL default setup (a GitHub-managed dynamic
+  # workflow, no file in this repo) adds four more contexts (`CodeQL`,
+  # `Analyze (actions)`, `Analyze (swift)`, `Analyze (python)`) beside them —
+  # its merge_group behavior is unverified until a queue exists, and is an
+  # open prerequisite for any required-check selection that names a CodeQL
+  # context. `publish-linux-release-asset` stays gated to `release` events
   # below: it is release packaging, not a merge-gating suite.
   build-macos:
     runs-on: macos-15
