@@ -5,6 +5,13 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  # GitHub merge queue: fires for each group when the queue requests checks
+  # on the *combined* tree (base + all queued PRs). `GITHUB_SHA` for this
+  # event is the merge-group commit itself, and the default
+  # `actions/checkout` below checks out `github.sha` — so every job here
+  # builds the integrated tree, not a PR head or main.
+  merge_group:
+    types: [checks_requested]
   # Fires when `/repo:release` (or a manual `gh release create`) publishes a
   # GitHub Release — used below to attach the static Linux binary as a
   # release asset. Does NOT fire for draft releases, only `published`.
@@ -18,7 +25,23 @@ on:
   # workflow" button. No inputs needed.
   workflow_dispatch:
 
+# Merge-queue runs must never be cancelled or superseded by PR/push runs:
+# they get their own group keyed by the group's unique head SHA
+# (`github.sha` — the merge-group commit). PR/push runs keep their old
+# behavior (keyed by ref, no cancellation — there was no concurrency block
+# before merge groups), so they can never share a group with — or cancel —
+# a queue run.
+concurrency:
+  group: ${{ github.event_name == 'merge_group' && format('{0}-merge-group-{1}', github.workflow, github.sha) || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: false
+
 jobs:
+  # build-macos / build-linux run unconditionally, so they report the same
+  # check contexts on a merge group as on a PR. The context names are the
+  # bare job ids `build-macos` / `build-linux` (verified against real check
+  # runs — no workflow prefix); those are the names a merge queue can
+  # require. `publish-linux-release-asset` stays gated to `release` events
+  # below: it is release packaging, not a merge-gating suite.
   build-macos:
     runs-on: macos-15
     steps:
