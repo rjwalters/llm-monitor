@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the provider pool is short, or a reset expiring within 14 days. It shows
   in `ranking.json` (`reset_advice`), an `accounts list` column, the popover row,
   and an orange marker on the menu-bar percentage. Unknown reset data reads
-  "resets: unknown", never 0.
+  "resets: unknown" in `accounts list`, never 0; the popover row shows only the
+  actionable badges, not the unknown case.
 
 ### Fixed
 
