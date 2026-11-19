@@ -11,6 +11,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-19
 
+- **Issue #333** (closed): Popover: compareRows re-derives effectiveSortBy/visibleProviders and rateLimit per comparison (residual of #330/#331)
+- **PR #335**: perf(popover): prepare sort keys once per sort instead of per comparison
 - **Issue #331** (closed): Popover: hoist poolTallies/visibleProviders out of the per-row ForEach closure (residual of #330)
 - **PR #332**: perf(popover): hoist poolTallies/visibleProviders out of the per-row closure
 - **PR #329**: fix(popover): drop the per-row "resets: unknown" label

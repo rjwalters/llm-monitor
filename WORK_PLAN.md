@@ -3,7 +3,7 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-19T07:29:00Z (snapshot; compare against live labels)_
+_Generated: 2026-11-19T17:35:00Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -35,7 +35,6 @@ Issues currently being built (`loom:building`).
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
-- **#333**: Popover: compareRows re-derives effectiveSortBy/visibleProviders and rateLimit per comparison (residual of #330/#331)
 
 ## PRs Awaiting Review
 
@@ -48,7 +47,6 @@ _None._
 PRs that passed review (`loom:pr`). Held PRs require a human merge decision.
 
 - **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
-- **#335**: perf(popover): prepare sort keys once per sort instead of per comparison
 
 ## Proposed
 
@@ -59,7 +57,6 @@ Issues carrying `loom:curated`.
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization *(curated)*
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
-- **#333**: Popover: compareRows re-derives effectiveSortBy/visibleProviders and rateLimit per comparison (residual of #330/#331) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -77,10 +74,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
-| In Progress (`loom:building`) | 4 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 6 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
