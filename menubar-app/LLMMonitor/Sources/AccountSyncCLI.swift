@@ -207,6 +207,7 @@ enum AccountSyncCLI {
     private static func runList(_ args: [String]) -> Never {
         var providerFilter: AccountProvider?
         var dbPath = AccountSync.defaultDBPath
+        var asJSON = false
 
         var i = 0
         while i < args.count {
@@ -222,6 +223,8 @@ enum AccountSyncCLI {
                 case "--provider":
                     providerFilter = parseProviderFilter(CLIArgs.requireValue(args, i, option: "--provider"))
                     i += 1
+                case "--json":
+                    asJSON = true
                 default:
                     CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
                 }
@@ -272,6 +275,11 @@ enum AccountSyncCLI {
             exit(0)
         }
 
+        if asJSON {
+            printListJSON(inputs.filter { providers.contains($0.account.provider) })
+            exit(0)
+        }
+
         for provider in providers {
             let rows = inputs.filter { $0.account.provider == provider }
             let tally = ProviderPoolSummary.tally(rows)
@@ -284,6 +292,49 @@ enum AccountSyncCLI {
         }
         print("")
         exit(0)
+    }
+
+    /// `accounts list --json` (#285): one object per account with the reset
+    /// state. `reset_credits` is omitted when unknown, never zeroed; the
+    /// `resets` line is the same shared wording the table prints.
+    private static func printListJSON(_ inputs: [PoolAccountInput]) {
+        let tallies = ProviderPoolSummary.tallyByProvider(inputs)
+        var out: [[String: Any]] = []
+        for input in inputs {
+            var obj: [String: Any] = [
+                "account": input.account.displayName,
+                "provider": input.account.provider.rawValue,
+            ]
+            if let usage = input.usage {
+                let r = ResetAdvisor.resets(for: usage)
+                var credits: [String: Any] = [:]
+                if let c = r.count { credits["available_count"] = c }
+                if let u = r.usableNow { credits["usable_now"] = u }
+                if let e = r.endsAt { credits["ends_at"] = ISO8601DateFormatter().string(from: e) }
+                if let claude = usage.claudeResets {
+                    credits["observed_at"] = ISO8601DateFormatter().string(from: claude.observedAt)
+                    if ClaudeResetCredits.isStale(claude) { credits["stale"] = true }
+                    credits["grants"] = claude.grants.map { g -> [String: Any] in
+                        var d: [String: Any] = [:]
+                        if let v = g.type { d["type"] = v }
+                        if let v = g.resetsLeft { d["resets_left"] = v }
+                        if let v = g.endsAt { d["ends_at"] = v }
+                        return d
+                    }
+                }
+                if !credits.isEmpty { obj["reset_credits"] = credits }
+                obj["resets"] = ResetAdvisor.displayLine(
+                    record: usage, poolTally: tallies[input.account.provider], now: Date()) ?? "none"
+            } else {
+                obj["resets"] = "resets: unknown"
+            }
+            out.append(obj)
+        }
+        if let data = try? JSONSerialization.data(
+            withJSONObject: out, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+           let text = String(data: data, encoding: .utf8) {
+            print(text)
+        }
     }
 
     /// `--provider` accepts the operator vocabulary — `claude`/`codex`/`zai`,
@@ -356,7 +407,7 @@ enum AccountSyncCLI {
                                           [--remote-bin <path>] [--ssh-option <opt>] [--db <path>]
               llm-monitor accounts export [--output <path>] [--compact] [--db <path>]
               llm-monitor accounts import <path|-> [--dry-run] [--db <path>]
-              llm-monitor accounts list [--provider claude|codex|zai] [--db <path>]
+              llm-monitor accounts list [--provider claude|codex|zai] [--json] [--db <path>]
 
             push is the primary path: it exports this host's bundle in memory
             and streams it over ssh straight into `accounts import -` on each
@@ -407,7 +458,7 @@ enum AccountSyncCLI {
             limit reset (the operator triggers resets by hand; the app never
             spends one), a quiet notice when a held reset expires soon, or
             "resets: unknown" when the reading carries no reset data.
-            --provider narrows to
+            --json prints one object per account (reset_credits omitted when unknown). --provider narrows to
             one provider (claude|codex|zai; anthropic/openai accepted too).
             Nothing is polled and nothing is written.
 

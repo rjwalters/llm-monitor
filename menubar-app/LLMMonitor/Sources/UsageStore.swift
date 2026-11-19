@@ -104,6 +104,9 @@ struct UsageRecord: Identifiable {
     /// never 0 — because most readings (Anthropic, `app-server`, rollout
     /// snapshots) carry no such object.
     var resetCredits: OpenAIUsageResponse.ResetCredits? = nil
+    /// The latest pasted Claude `cedar_ember` reading for this account (#285),
+    /// from `claude_reset_readings`. nil = none imported (unknown, never 0).
+    var claudeResets: ClaudeResetCredits.Reading? = nil
 
     /// This stored reading expressed in the shared, provider-agnostic window
     /// model. The `usage_history` columns are already kind-keyed (a session
@@ -603,6 +606,15 @@ class UsageStore: ObservableObject {
                 ON quota_calibration_daily(day, scope, IFNULL(account_id, ''));
             CREATE INDEX IF NOT EXISTS idx_quota_calibration_day
                 ON quota_calibration_daily(day DESC);
+
+            -- Latest pasted Claude limit-reset reading per account (#285). Not
+            -- a usage_history column: a pasted reading is not tied to a poll.
+            -- `grants_json` is the trimmed grant list only (no identity fields).
+            CREATE TABLE IF NOT EXISTS claude_reset_readings (
+                account_id TEXT PRIMARY KEY,
+                observed_at TEXT NOT NULL,
+                grants_json TEXT NOT NULL
+            );
         """)
 
         // Migration: add token_rolled_at to older DBs. `updated_at` can't serve
@@ -1321,6 +1333,7 @@ class UsageStore: ObservableObject {
                     // Unused Codex limit resets ride the row's `raw_data`
                     // archive (#298); nil for every reading that carries none.
                     record.resetCredits = OpenAIUsageResponse.parseStoredReading(usageRow[8] as? String).credits
+                    record.claudeResets = Self.loadClaudeResets(db: db, accountId: accountId)
 
                     // Premium/Fable allocation + overage come from the latest
                     // Fable probe snapshot's raw headers.
@@ -1561,6 +1574,42 @@ class UsageStore: ObservableObject {
         for row in stmt.bind(accountId) {
             return OpenAIUsageResponse.parseStoredReading(row[0] as? String)
         }
+        return nil
+    }
+
+    /// The latest pasted Claude reset reading for an account (#285), or nil.
+    nonisolated static func loadClaudeResets(db: Connection, accountId: String) -> ClaudeResetCredits.Reading? {
+        guard let stmt = try? db.prepare(
+            "SELECT observed_at, grants_json FROM claude_reset_readings WHERE account_id = ?"
+        ) else { return nil }
+        for row in stmt.bind(accountId) {
+            guard let observed = UsageRecord.parseISO(row[0] as? String),
+                  let grants = ClaudeResetCredits.decode(row[1] as? String) else { return nil }
+            return ClaudeResetCredits.Reading(grants: grants, observedAt: observed)
+        }
+        return nil
+    }
+
+    /// Store the latest pasted reading for an existing account, replacing any
+    /// earlier one. Returns false (writing nothing) for an unknown account.
+    nonisolated func saveClaudeResets(accountId: String, grants: [ClaudeResetCredits.Grant], observedAt: Date) -> Bool {
+        guard let db = try? openDatabase(dbPath),
+              let json = ClaudeResetCredits.encode(grants),
+              (try? db.scalar("SELECT 1 FROM accounts WHERE id = ?", accountId)) != nil
+        else { return false }
+        let stamp = ISO8601DateFormatter().string(from: observedAt)
+        return (try? db.run(
+            "INSERT OR REPLACE INTO claude_reset_readings (account_id, observed_at, grants_json) VALUES (?, ?, ?)",
+            accountId, stamp, json)) != nil
+    }
+
+    /// Resolve `<id|email>` to a Claude account id, or nil.
+    nonisolated func claudeAccountId(matching key: String) -> String? {
+        guard let db = try? openDatabase(dbPath, readonly: true),
+              let stmt = try? db.prepare(
+                "SELECT id FROM accounts WHERE provider = 'anthropic' AND (id = ? OR LOWER(email) = LOWER(?)) LIMIT 1")
+        else { return nil }
+        for row in stmt.bind(key, key) { return row[0] as? String }
         return nil
     }
 

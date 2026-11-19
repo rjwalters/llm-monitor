@@ -42,6 +42,7 @@ enum SelfTest {
         ("ProviderParsing", { testProviderParsing() }),
         ("OpenAIUsageResponseMapping", { testOpenAIUsageResponseMapping() }),
         ("OpenAIResetCredits", { testOpenAIResetCredits() }),
+        ("ClaudeResetCredits", { testClaudeResetCredits() }),
         ("OpenAIRawFieldRedaction", { testOpenAIRawFieldRedaction() }),
         ("OpenAIFlattenTruncationIsDeterministic", { testOpenAIFlattenTruncationIsDeterministic() }),
         ("OpenAITokenExpiryParsing", { testOpenAITokenExpiryParsing() }),
@@ -2077,6 +2078,124 @@ enum SelfTest {
     /// the reply carries it, and a reply without the object — or with `null` —
     /// decodes exactly as before. Also pins the one stored-reading parse rule
     /// every display surface shares, and the `codex list` line it feeds.
+    /// #285: the Claude `cedar_ember` parser, storage, advisor mapping and
+    /// import path. The fixture is RECONSTRUCTED from the field list in the
+    /// 2026-11-17 operator test (two grants, both `resets_left = 0`), not a raw
+    /// capture; the identity-looking values are deliberately fake. The
+    /// `resets_left > 0` variant is hand-edited (synthetic).
+    private static func testClaudeResetCredits() {
+        let zeroBody = """
+        {"organization_id": "org-SECRET-123", "email": "leak@example.com",
+         "cedar_ember": {"eligible": true, "at_limit": false, "weekly_resets_at": "2026-11-24T00:00:00Z",
+          "grants": [
+           {"id": "weekly-2611", "label": "Weekly reset", "type": "weekly", "resets_total": 1, "resets_left": 0,
+            "starts_at": "2026-11-01T00:00:00Z", "ends_at": "2026-12-01T00:00:00Z",
+            "clears": ["seven_day"], "usable_now": false, "account_uuid": "acct-SECRET-456"},
+           {"id": "full-reset-2611", "label": "Full reset", "type": "full", "resets_total": 1, "resets_left": 0,
+            "ends_at": "2026-12-10T00:00:00Z", "clears": ["five_hour", "seven_day"], "usable_now": false}
+          ]}}
+        """
+        // Synthetic variant: one grant now holds a usable reset.
+        let heldBody = """
+        {"cedar_ember": {"grants": [
+          {"id": "weekly-2611", "type": "weekly", "resets_total": 1, "resets_left": 1,
+           "ends_at": "2026-12-01T00:00:00Z", "usable_now": true},
+          {"id": "full-reset-2611", "type": "full", "resets_total": 1, "resets_left": 0,
+           "ends_at": "2026-12-10T00:00:00Z", "usable_now": false}]}}
+        """
+        let now = ISO8601DateFormatter().date(from: "2026-11-19T00:00:00Z")!
+        do {
+            guard case .grants(let zero) = try ClaudeResetCredits.parse(Data(zeroBody.utf8)) else {
+                expect(false, "zero-grant fixture parses to grants"); return
+            }
+            expectEqual(zero.count, 2, "two grants parse")
+            expectEqual(zero.first?.type, "weekly", "type parses")
+            expectEqual(zero.first?.clears ?? [], ["seven_day"], "clears parses")
+            let zeroResets = ClaudeResetCredits.resets(from: .init(grants: zero, observedAt: now))
+            expectEqual(zeroResets.count, 0, "both grants spent: count 0")
+            expectEqual(zeroResets.usableNow, false, "both grants spent: not usable")
+            expect(zeroResets.endsAt == nil, "no expiry when nothing is held")
+
+            guard case .grants(let held) = try ClaudeResetCredits.parse(Data(heldBody.utf8)) else {
+                expect(false, "held fixture parses"); return
+            }
+            let heldResets = ClaudeResetCredits.resets(from: .init(grants: held, observedAt: now))
+            expectEqual(heldResets.count, 1, "synthetic held reset counts")
+            expectEqual(heldResets.usableNow, true, "resets_left > 0 && usable_now")
+            expectEqual(heldResets.endsAt, ISO8601DateFormatter().date(from: "2026-12-01T00:00:00Z"),
+                        "endsAt is the held grant's expiry")
+
+            // resets_left > 0 but usable_now false: held, not usable.
+            let unusable = ClaudeResetCredits.resets(from: .init(
+                grants: [.init(resetsLeft: 2, usableNow: false)], observedAt: now))
+            expectEqual(unusable.count, 2, "held count")
+            expectEqual(unusable.usableNow, false, "held but not usable now")
+
+            // A grant with no ends_at: held, no expiry, never a guessed one.
+            let noEnds = ClaudeResetCredits.resets(from: .init(
+                grants: [.init(resetsLeft: 1, usableNow: true)], observedAt: now))
+            expect(noEnds.endsAt == nil, "missing ends_at stays unknown")
+
+            // A grant reporting nothing is unknown, not zero.
+            let blank = ClaudeResetCredits.resets(from: .init(grants: [.init()], observedAt: now))
+            expect(!blank.isKnown, "a grant with no fields reads as unknown")
+            expect(!ClaudeResetCredits.resets(from: nil).isKnown, "no reading is unknown")
+
+            // An expired ends_at advises nothing (existing advisor rule).
+            let pastEnd = ResetAdvisor.Resets(usableNow: true, count: 1,
+                                              endsAt: now.addingTimeInterval(-60))
+            expectEqual(ResetAdvisor.advise(usage: .init(weeklyUsedPercent: 99, weeklyResetsAt: nil,
+                                                         sessionUsedPercent: nil),
+                                            resets: pastEnd, pool: .init(usableFraction: 0.1), now: now).state,
+                        .none, "a reset past its expiry advises nothing")
+
+            // cedar_ember null / absent: no reset data, never zero.
+            expectEqual(try ClaudeResetCredits.parse(Data("{\"cedar_ember\": null}".utf8)), .noResetData,
+                        "null cedar_ember is no reset data")
+            expectEqual(try ClaudeResetCredits.parse(Data("{\"five_hour\": {}}".utf8)), .noResetData,
+                        "absent cedar_ember is no reset data")
+            expectEqual(try ClaudeResetCredits.parse(Data(
+                "{\"grants\": [{\"resets_left\": 1}]}".utf8)),
+                        .grants([.init(resetsLeft: 1)]), "a bare cedar_ember object parses")
+            var threw = false
+            do { _ = try ClaudeResetCredits.parse(Data("not json".utf8)) } catch { threw = true }
+            expect(threw, "non-JSON input throws")
+
+            // Staleness is labelled, never silent.
+            let stale = ClaudeResetCredits.Reading(grants: held, observedAt: now.addingTimeInterval(-86400))
+            expect(ClaudeResetCredits.isStale(stale, now: now), "a day-old paste is stale")
+            expect(ClaudeResetCredits.summaryLine(stale, now: now).contains("stale"), "summary labels stale")
+            expectEqual(ClaudeResetCredits.summaryLine(nil, now: now), "resets: unknown", "nil reading is unknown")
+
+            // Store round trip + identity never reaches the DB.
+            try withSelfTestTempDir("claude-resets") { dir in
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('org-a', 'a@example.com', 'a@example.com', 'max', ?, 0, 'anthropic')
+                """, ISO8601DateFormatter().string(from: Date()))
+                expect(store.claudeAccountId(matching: "A@example.com") == "org-a", "email resolves case-insensitively")
+                expect(store.claudeAccountId(matching: "nobody@example.com") == nil, "unknown account resolves to nil")
+                expect(!store.saveClaudeResets(accountId: "ghost", grants: held, observedAt: now),
+                       "an unknown account is refused")
+                expect((try db.scalar("SELECT COUNT(*) FROM claude_reset_readings") as? Int64) == 0,
+                       "a refused import writes nothing")
+                expect(store.saveClaudeResets(accountId: "org-a", grants: held, observedAt: now), "import stores")
+                let loaded = UsageStore.loadClaudeResets(db: db, accountId: "org-a")
+                expectEqual(loaded?.grants, held, "stored grants round-trip")
+                let json = (try db.scalar("SELECT grants_json FROM claude_reset_readings") as? String) ?? ""
+                for secret in ["SECRET", "leak@example.com", "org-SECRET-123"] {
+                    expect(!json.contains(secret), "no identity field reaches the DB (\(secret))")
+                }
+            }
+        } catch {
+            expect(false, "ClaudeResetCredits threw: \(error)")
+        }
+    }
+
     private static func testOpenAIResetCredits() {
         do {
             // With the object: both counts decode, and flatten archives them

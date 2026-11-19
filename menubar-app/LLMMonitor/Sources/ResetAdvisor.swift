@@ -147,6 +147,13 @@ enum ResetAdvisor {
         )
     }
 
+    /// The resets for one stored reading, whichever provider fed it: a pasted
+    /// Claude `cedar_ember` reading (#285) if present, else the Codex credits.
+    static func resets(for record: UsageRecord) -> Resets {
+        if let claude = record.claudeResets { return ClaudeResetCredits.resets(from: claude) }
+        return resets(from: record.resetCredits)
+    }
+
     /// The one rule. Pure: same inputs, same advice, no clock reads.
     static func advise(usage: Usage, resets: Resets, pool: Pool, now: Date) -> Advice {
         guard resets.isKnown else { return .none }
@@ -214,21 +221,24 @@ enum ResetAdvisor {
         return advice.state == .none ? nil : advice.reason
     }
 
+    /// The record-aware line. A Claude row with a pasted reading says what it
+    /// holds (count, scope, expiry, age — labelled stale when old, #285)
+    /// unless the advisor has something actionable to say, in which case the
+    /// advice leads and a stale reading is flagged after it.
+    static func displayLine(record: UsageRecord, poolTally: ProviderPoolSummary.Tally?, now: Date) -> String? {
+        let inputs = recordInputs(record, poolTally: poolTally)
+        let base = displayLine(usage: inputs.usage, resets: inputs.resets, pool: inputs.pool, now: now)
+        guard let claude = record.claudeResets else { return base }
+        let summary = ClaudeResetCredits.summaryLine(claude, now: now)
+        guard let advice = base else { return summary }
+        return ClaudeResetCredits.isStale(claude, now: now) ? advice + " [stale reading]" : advice
+    }
+
     /// Advisor inputs from one stored reading plus its provider's tally — the
     /// wiring every surface repeats otherwise (#303).
     static func advise(record: UsageRecord, poolTally: ProviderPoolSummary.Tally?, now: Date) -> Advice {
         let inputs = recordInputs(record, poolTally: poolTally)
         return advise(usage: inputs.usage, resets: inputs.resets, pool: inputs.pool, now: now)
-    }
-
-    /// The record-based `displayLine` — the same shared wording, over the same
-    /// single row's figures, that the popover tooltip, the menubar marker and
-    /// `accounts list`'s advice column all render (#305). Reset credits come
-    /// from the record itself (`record.resetCredits`), so one `advise` call
-    /// never mixes figures from two `usage_history` rows.
-    static func displayLine(record: UsageRecord, poolTally: ProviderPoolSummary.Tally?, now: Date) -> String? {
-        let inputs = recordInputs(record, poolTally: poolTally)
-        return displayLine(usage: inputs.usage, resets: inputs.resets, pool: inputs.pool, now: now)
     }
 
     private static func recordInputs(
@@ -241,7 +251,7 @@ enum ResetAdvisor {
                 weeklyResetsAt: UsageRecord.parseISO(record.weeklyReset),
                 sessionUsedPercent: record.sessionPercent
             ),
-            resets: resets(from: record.resetCredits),
+            resets: resets(for: record),
             pool: Pool(tally: poolTally)
         )
     }

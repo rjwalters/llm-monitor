@@ -11,6 +11,7 @@ import Foundation
 @MainActor
 enum ClaudeCLI {
     static func main(_ args: [String]) -> Never {
+        if args.first == "resets" { resetsMain(Array(args.dropFirst())) }
         guard args.first == "sync" else {
             if let first = args.first, !["--help", "-h", "help"].contains(first) {
                 FileHandle.standardError.write(Data("Unknown 'claude' subcommand '\(first)'\n\n".utf8))
@@ -75,9 +76,85 @@ enum ClaudeCLI {
         dispatchMain()
     }
 
+    /// `llm-monitor claude resets import --account <id|email> [--db] <file|->`
+    /// (#285). Offline and read-only: parses a pasted `cedar_ember` body and
+    /// stores the latest reading; never fetches, spends, or stores identity.
+    private static func resetsMain(_ args: [String]) -> Never {
+        guard args.first == "import" else {
+            if args.first == "--help" || args.first == "-h" { printUsage(); exit(0) }
+            CLIArgs.fail("Usage: llm-monitor claude resets import --account <id|email> [--db <path>] <file|->")
+        }
+        var dbPath: String?
+        var account: String?
+        var input: String?
+        let rest = Array(args.dropFirst())
+        var i = 0
+        while i < rest.count {
+            switch CLIArgs.matchCommon(rest, i) {
+            case .db(let value):
+                dbPath = value
+                i += 1
+            case .help:
+                printUsage()
+                exit(0)
+            case .notMatched:
+                if rest[i] == "--account" {
+                    account = CLIArgs.requireValue(rest, i, option: "--account")
+                    i += 1
+                } else if input == nil, rest[i] == "-" || !rest[i].hasPrefix("-") {
+                    input = rest[i]
+                } else {
+                    CLIArgs.fail("Unknown option '\(rest[i])' (see --help)")
+                }
+            }
+            i += 1
+        }
+        guard let account = account, let input = input else {
+            CLIArgs.fail("claude resets import needs --account <id|email> and a <file|->")
+        }
+        let data: Data
+        if input == "-" {
+            data = FileHandle.standardInput.readDataToEndOfFile()
+        } else {
+            guard let d = FileManager.default.contents(atPath: (input as NSString).expandingTildeInPath) else {
+                CLIArgs.fail("Could not read '\(input)'")
+            }
+            data = d
+        }
+        let grants: [ClaudeResetCredits.Grant]
+        do {
+            switch try ClaudeResetCredits.parse(data) {
+            case .noResetData:
+                FileHandle.standardError.write(Data(
+                    "No reset data in the body (cedar_ember is null or absent; fetch with ?cedar_ember=1). Nothing stored.\n".utf8))
+                exit(1)
+            case .grants(let g):
+                grants = g
+            }
+        } catch {
+            CLIArgs.fail("The input is not a JSON object")
+        }
+        let store = UsageStore(dbPath: dbPath)
+        guard FileManager.default.fileExists(atPath: dbPath ?? AppPaths.databasePath),
+              let id = store.claudeAccountId(matching: account) else {
+            CLIArgs.fail("No Claude account matches '\(account)'. Nothing stored.")
+        }
+        guard store.saveClaudeResets(accountId: id, grants: grants, observedAt: Date()) else {
+            CLIArgs.fail("Could not store the reading.")
+        }
+        let held = grants.reduce(0) { $0 + ($1.resetsLeft ?? 0) }
+        print("Stored \(grants.count) grant(s), \(held) reset(s) held, for \(account).")
+        exit(0)
+    }
+
     private static func printUsage() {
         print("""
-            Usage: llm-monitor claude sync [--dir <path>]... [--db <path>]
+            Usage: llm-monitor claude resets import --account <id|email> [--db <path>] <file|->
+                   llm-monitor claude sync [--dir <path>]... [--db <path>]
+
+            resets import: store a pasted claude.ai/OAuth usage body's cedar_ember
+            limit-reset grants for one account (read-only; the app never fetches or
+            spends resets, and keeps no org id or token from the body).
 
             Map rolled Claude OAuth tokens onto their accounts now. Reads every
             <name>.token in the token directories (default: ~/.claude-oauth, then the
