@@ -786,13 +786,19 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil, onAddAccount: onAddAccount)
             } else {
+                // Resolved once per render, not once per row: the tab strip,
+                // header row and every row closure used to re-evaluate each of
+                // these per element (poolTallies walks every account and builds
+                // rateLimit per window, visibleProviders rescans each account).
+                let tallies = poolTallies
+                let providers = visibleProviders
                 ProviderTabStrip(
-                    tabs: providerTabs(poolTallies),
+                    tabs: providerTabs(tallies),
                     selection: $selectedTab,
-                    summary: selectedSummaryLine(poolTallies)
+                    summary: selectedSummaryLine(tallies)
                 )
                 Divider()
-                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: visibleProviders)
+                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: providers)
                 Divider()
 
                 ScrollView {
@@ -807,8 +813,8 @@ struct UsagePopoverView: View {
                                 store: store,
                                 oauthPoller: oauthPoller,
                                 isMenubarSelected: item.account.id == menubarAccountId,
-                                visibleProviders: visibleProviders,
-                                poolTally: poolTallies.byProvider[item.account.provider],
+                                visibleProviders: providers,
+                                poolTally: tallies.byProvider[item.account.provider],
                                 onRemove: {
                                     accountToRemove = item.account
                                     showRemoveConfirmation = true
