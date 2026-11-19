@@ -843,14 +843,14 @@ struct UsagePopoverView: View {
     /// only** — its email, provider, and home label — so the destination host
     /// can name the identity it is missing (#135).
     private func copyAccounts() {
-        // `exportAccountsEnv` returns nil only when there is truly nothing to
-        // report: the store is empty, or every credential is inactive for a
-        // reason unrelated to being a Codex identity. A Codex-only host still
-        // gets a non-nil result (count 0, identityOnly > 0) so its status
-        // message can name what was copied instead of reading a bare,
-        // misleading "Nothing to copy" (#129).
-        guard let (env, count, identityOnly) = oauthPoller.exportAccountsEnv() else {
+        guard let (env, count, identityOnly, skippedPersonal) = oauthPoller.exportAccountsEnv() else {
             flashTransferStatus("Nothing to copy")
+            return
+        }
+
+        let skipped = skippedPersonal == 0 ? "" : " · skipped \(skippedPersonal) personal"
+        guard !env.isEmpty else {
+            flashTransferStatus("Nothing to copy\(skipped)")
             return
         }
 
@@ -863,9 +863,9 @@ struct UsagePopoverView: View {
             ? ""
             : " + \(identityOnly) Codex \(identityOnly == 1 ? "identity" : "identities") (no credential)"
         if count == 0 {
-            flashTransferStatus("Copied \(identityOnly) Codex \(identityOnly == 1 ? "identity" : "identities") (no credentials — provision each host)")
+            flashTransferStatus("Copied \(identityOnly) Codex \(identityOnly == 1 ? "identity" : "identities") (no credentials — provision each host)\(skipped)")
         } else {
-            flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")\(identityNote)")
+            flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")\(identityNote)\(skipped)")
         }
     }
 
@@ -1430,6 +1430,15 @@ struct SummaryRow: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .foregroundColor(isAbsent ? .secondary : .primary)
+                        if account.scope == .personal {
+                            Text("Personal")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 4)
+                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                                .fixedSize()
+                                .help("Skipped by Copy and by default when syncing accounts")
+                        }
                         if isAbsent {
                             AbsentBadge()
                         }

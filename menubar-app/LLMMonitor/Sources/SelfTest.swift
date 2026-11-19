@@ -150,6 +150,8 @@ enum SelfTest {
         ("DeclaredIdentityRePropagates", { testDeclaredIdentityRePropagates() }),
         ("HeadlessEnvFileCanDeclareIdentities", { testHeadlessEnvFileCanDeclareIdentities() }),
         ("AbsentVocabularyIsDistinct", { testAbsentVocabularyIsDistinct() }),
+        ("AccountScopeTransfers", { testAccountScopeTransfers() }),
+        ("AccountScopePull", { testAccountScopePull() }),
         ("AccountSyncExcludesOpenAIAccounts", { testAccountSyncExcludesOpenAIAccounts() }),
         ("AccountSyncExportHasUniqueEmailsAndNoOpenAI", { testAccountSyncExportHasUniqueEmailsAndNoOpenAI() }),
         ("AccountImportCreatesMissingDatabase", { testAccountImportCreatesMissingDatabase() }),
@@ -6709,7 +6711,7 @@ enum SelfTest {
                 """)
 
                 let poller = OAuthPoller(dbPath: dbPath)
-                guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                guard let (env, count, excludedHostLocal, _) = poller.exportAccountsEnv() else {
                     checks += 1
                     failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
                     return
@@ -6778,7 +6780,7 @@ enum SelfTest {
                 """)
 
                 let poller = OAuthPoller(dbPath: dbPath)
-                guard let (env, count, identityOnly) = poller.exportAccountsEnv() else {
+                guard let (env, count, identityOnly, _) = poller.exportAccountsEnv() else {
                     checks += 1
                     failures.append("exportAccountsEnv returned nil for a mixed host with a tokenless Codex account")
                     return
@@ -6836,7 +6838,7 @@ enum SelfTest {
                 """)
 
                 let poller = OAuthPoller(dbPath: dbPath)
-                guard let (env, count, identityOnly) = poller.exportAccountsEnv() else {
+                guard let (env, count, identityOnly, _) = poller.exportAccountsEnv() else {
                     checks += 1
                     failures.append("exportAccountsEnv returned nil for a Codex-only host — it must carry the identity instead")
                     return
@@ -6932,7 +6934,7 @@ enum SelfTest {
                 """)
 
                 let poller = OAuthPoller(dbPath: dbPath)
-                guard let (env, _, _) = poller.exportAccountsEnv() else {
+                guard let (env, _, _, _) = poller.exportAccountsEnv() else {
                     checks += 1
                     failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
                     return
@@ -7675,7 +7677,7 @@ enum SelfTest {
 
             poller.declareCodexIdentity(email: "agent3@example.com", homeLabel: "agent3")
 
-            guard let (env, count, identityOnly) = poller.exportAccountsEnv() else {
+            guard let (env, count, identityOnly, _) = poller.exportAccountsEnv() else {
                 checks += 1
                 failures.append("a host holding only a declared identity exported nothing at all")
                 return
@@ -8088,6 +8090,149 @@ enum SelfTest {
         expectEqual(AccountSyncRemote.resolveSSHBinary(
             environment: [AccountSyncRemote.sshOverrideEnvKey: "/nonexistent/ssh", "PATH": "/usr/bin"]),
                     nil, "a non-executable ssh override resolves to nil instead of falling back to PATH")
+    }
+
+    private static func testAccountScopeTransfers() {
+        guard let cli = resolveCLIBinary() else {
+            print("selftest: skipping account scope CLI checks (set LLM_MONITOR_CLI to the built CLI)")
+            return
+        }
+        withSelfTestTempDir("account-scope") { dir in
+            do {
+                let path = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: path).ensureDatabase()
+                let poller = OAuthPoller(dbPath: path)
+                poller.saveCredentialForAccount(accountId: "team", email: "team@example.test", orgName: nil,
+                                                plan: "Max", accessToken: "fixture-team-token")
+                poller.saveCredentialForAccount(accountId: "home", email: "home@example.test", orgName: nil,
+                                                plan: "GLM", accessToken: "fixture-private-token", provider: .zai)
+                let codex = poller.declareCodexIdentity(email: "team@example.test", homeLabel: "team-codex")
+                poller.saveCredentialForAccount(accountId: "no-email", email: nil, orgName: "Offline",
+                                                plan: "Max", accessToken: "fixture-other-token")
+
+                @MainActor func accounts(_ args: [String]) throws -> AccountSyncRemote.RemoteResult {
+                    try AccountSyncRemote.runProcess(
+                        executable: "/usr/bin/env",
+                        arguments: ["\(reentryGuardEnvKey)=1", cli, "accounts"] + args + ["--db", path],
+                        timeout: TimeInterval(remoteSyncCheckTimeoutSeconds)
+                    )
+                }
+
+                expectEqual(try accounts(["scope", "home@example.test", "personal"]).status, 0, "set scope by email")
+                expectEqual(try accounts(["scope", "no-email", "personal"]).status, 0, "set scope by id without email")
+                for selector in ["missing", "team@", "team@example.test"] {
+                    expect(try accounts(["scope", selector, "personal"]).status != 0,
+                           "unknown, partial and shared selectors must fail: \(selector)")
+                }
+                let db = try openDatabase(path)
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, primary_percent)
+                    VALUES ('home', '2026-01-01T00:00:00Z', 41)
+                    """)
+                let reopened = UsageStore(dbPath: path)
+                reopened.ensureDatabase()
+                reopened.loadFromDatabase()
+                expectEqual(reopened.latestUsage["home"]?.primaryPercent, 41, "personal usage still loads after restart")
+                let listing = String(decoding: try accounts(["list"]).stdout, as: UTF8.self)
+                expect(listing.split(separator: "\n").contains { $0.contains("home@example.test") && $0.contains("personal") },
+                       "a separate list process reads the persisted scope")
+
+                let captured = dir.appendingPathComponent("stdin.json")
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    cat > \(AccountSyncRemote.shellQuote(captured.path))
+                    """)
+                for includePersonal in [false, true] {
+                    let flags = includePersonal ? ["--include-personal"] : []
+                    let options = try AccountSyncRemote.parseArgs(["worker", "--db", path] + flags, verb: .push)
+                    var errors: [String] = []
+                    let status = AccountSyncRemote.runPush(options, environment: remoteSyncTestEnvironment(ssh: ssh),
+                        output: AccountSyncRemote.Output(info: { _ in }, error: { errors.append($0) }))
+                    expectEqual(status, 0, "push delivers the bundle")
+                    let exported = try accounts(["export", "--compact"] + flags)
+                    expectEqual(exported.status, 0, "export writes a bundle")
+                    for payload in [try Data(contentsOf: captured), exported.stdout] {
+                        let json = String(decoding: payload, as: UTF8.self)
+                        expect(json.contains("fixture-team-token"), "the work credential is present")
+                        expectEqual(json.contains("fixture-private-token"), includePersonal, "Z.ai credential follows scope")
+                        expectEqual(json.contains("fixture-other-token"), includePersonal, "Claude credential follows scope")
+                        let bundle = try JSONDecoder().decode(AccountSync.ExportBundle.self, from: payload)
+                        expectEqual(bundle.accounts.contains { $0.id == "home" }, includePersonal, "personal identity follows scope")
+                        expect(!bundle.accounts.contains { $0.provider == "openai" }, "Codex remains host-local")
+                    }
+                    if !includePersonal {
+                        expect(errors.joined().contains("home@example.test"), "push names the skipped account")
+                        expect(String(decoding: exported.stderr, as: UTF8.self).contains("home@example.test"),
+                               "export names the skipped account on stderr")
+                    }
+                }
+
+                let copy = poller.exportAccountsEnv()
+                expectEqual(copy?.skippedPersonal, 2, "Copy reports the number of personal accounts")
+                expectEqual(copy?.count, 1, "Copy emits only the work credential")
+                expectEqual(copy?.identityOnly, 1, "Copy includes the work Codex identity")
+                expect(copy?.env.contains("fixture-team-token") == true, "Copy retains the work token")
+                expect(copy?.env.contains("fixture-private-token") == false, "Copy omits the personal token")
+                guard let codexId = codex.accountId else {
+                    expect(false, "scope fixture must include a Codex identity")
+                    return
+                }
+                expectEqual(try accounts(["scope", codexId, "personal"]).status, 0, "mark the Codex identity personal")
+                expectEqual(try accounts(["scope", "team", "personal"]).status, 0, "mark the remaining account personal")
+                let personalOnly = poller.exportAccountsEnv()
+                expectEqual(personalOnly?.env, "", "an all-personal Copy leaves the clipboard alone")
+                expectEqual(personalOnly?.skippedPersonal, 4, "an all-personal Copy reports every exclusion")
+                expectEqual(try accounts(["scope", "home", "work"]).status, 0, "restore work scope")
+                expect(poller.exportAccountsEnv()?.env.contains("fixture-private-token") == true,
+                       "restoring work scope takes effect on the next Copy")
+            } catch {
+                checks += 1
+                failures.append("account scope transfer test threw: \(error)")
+            }
+        }
+    }
+
+    private static func testAccountScopePull() {
+        guard let cli = resolveCLIBinary() else {
+            print("selftest: skipping account scope pull check (set LLM_MONITOR_CLI to the built CLI)")
+            return
+        }
+        withSelfTestTempDir("scope-pull") { dir in
+            do {
+                let source = dir.appendingPathComponent("source.db").path
+                UsageStore(dbPath: source).ensureDatabase()
+                let db = try openDatabase(source)
+                try db.run("INSERT INTO accounts (id, scope) VALUES ('private-id', 'personal')")
+                // SSH passes its last argument to the peer's shell. Run that command
+                // against the synthetic source DB, as a peer running the CLI would.
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    export \(reentryGuardEnvKey)=1
+                    for command do :; done
+                    exec /bin/sh -c "$command"' --db "$1"' sh \(AccountSyncRemote.shellQuote(source))
+                    """)
+                for includePersonal in [false, true] {
+                    let dest = dir.appendingPathComponent("dest-\(includePersonal).db").path
+                    let flags = includePersonal ? ["--include-personal"] : []
+                    let options = try AccountSyncRemote.parseArgs(["peer", "--db", dest, "--remote-bin", cli] + flags, verb: .pull)
+                    var errors: [String] = []
+                    let status = AccountSyncRemote.runPull(options, environment: remoteSyncTestEnvironment(ssh: ssh),
+                        output: AccountSyncRemote.Output(info: { _ in }, error: { errors.append($0) }))
+                    expectEqual(status, 0, "pull succeeds")
+                    let peer = UsageStore(dbPath: dest)
+                    peer.loadFromDatabase()
+                    expectEqual(peer.accounts.map(\.id), includePersonal ? ["private-id"] : [], "pull filters at the source")
+                    if includePersonal {
+                        expectEqual(peer.accounts.first?.scope, .work, "scope stays local to the sending host")
+                    } else {
+                        expect(errors.joined().contains("private-id"), "pull relays the source's exclusion on stderr")
+                    }
+                }
+            } catch {
+                checks += 1
+                failures.append("account scope pull test threw: \(error)")
+            }
+        }
     }
 
     /// End-to-end `accounts push` against a stub `ssh`, asserting the property
@@ -8810,6 +8955,8 @@ enum SelfTest {
                             '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '2026-01-05T00:00:00Z')
                 """, nativeId)
 
+                try db.run("UPDATE accounts SET scope = 'personal' WHERE id = ?", legacyId)
+
                 // The user had pinned the legacy row as their primary account.
                 try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", legacyId)
 
@@ -8820,6 +8967,8 @@ enum SelfTest {
                     "SELECT id FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'"
                 ).map { $0[0] as? String }
                 expectEqual(openaiRows.count, 1, "the openai duplicate pair merges into one row")
+                expectEqual(try db.scalar("SELECT scope FROM accounts WHERE id = ?", nativeId) as? String,
+                            "personal", "the merged identity retains its personal scope")
                 expectEqual(openaiRows.first.flatMap { $0 } ?? "", nativeId,
                             "the provider-native id survives over the locally generated UUID")
 
@@ -9517,6 +9666,11 @@ enum SelfTest {
                        "fixture must start without the provider column")
                 expect(!tableColumns(legacy, "accounts").contains("codex_home"),
                        "fixture must start without the codex_home column")
+                expect(!tableColumns(legacy, "accounts").contains("scope"), "the fixture predates account scopes")
+                expectEqual(try AccountSync.exportBundle(dbPath: dbPath).accounts.first?.id, "org-legacy",
+                            "a database without a scope column still exports its accounts")
+                expectEqual(OAuthPoller(dbPath: dbPath).exportAccountsEnv()?.count, 1,
+                            "Copy exports work accounts before the migration has run")
 
                 // --- What launching the current build does. ---
                 let store = UsageStore(dbPath: dbPath)
@@ -9547,6 +9701,8 @@ enum SelfTest {
                 // The pre-migration account keeps working with no user action.
                 store.loadFromDatabase()
                 expectEqual(store.accounts.count, 1, "migrated account still loads")
+                expectEqual(store.accounts.first?.scope, .work, "the migrated account defaults to work")
+                expect(tableColumns(db, "accounts").contains("scope"), "migration adds accounts.scope")
                 expectEqual(store.accounts.first?.provider, .anthropic, "loaded account resolves to anthropic")
                 expectEqual(headroomScore(store.latestUsage["org-legacy"]), 60, "usage still reads through the window model")
 

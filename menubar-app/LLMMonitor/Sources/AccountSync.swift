@@ -85,10 +85,22 @@ enum AccountSync {
 
     // MARK: - Export
 
-    static func exportBundle(dbPath: String = defaultDBPath) throws -> ExportBundle {
+    /// Pin schema discovery and credential reads to one SQLite snapshot. A failed
+    /// scope lookup must abort an export, since only a truly old schema implies work.
+    static func openExportSource(dbPath: String) throws -> (db: Connection, scopeColumn: String) {
+        let db = try openDatabase(dbPath, readonly: true)
+        try db.execute("BEGIN")
+        let scope = try db.scalar("SELECT name FROM pragma_table_info('accounts') WHERE name = 'scope'")
+        return (db, scope == nil ? "NULL" : "a.scope")
+    }
+
+    static func exportBundle(
+        dbPath: String = defaultDBPath, includePersonal: Bool = false,
+        reportSkipped: (String) -> Void = { _ in }
+    ) throws -> ExportBundle {
         guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing(dbPath) }
         do {
-            let db = try openDatabase(dbPath, readonly: true)
+            let (db, scopeColumn) = try openExportSource(dbPath: dbPath)
             var accounts: [ExportedAccount] = []
 
             // Provider columns are selected only when present, so exporting
@@ -100,11 +112,16 @@ enum AccountSync {
 
             let acctStmt = try db.prepare("""
                 SELECT id, account_name, email, plan, last_updated, sort_order,
-                       \(hasAcctProvider ? "provider" : "NULL")
-                FROM accounts ORDER BY sort_order, id
+                       \(hasAcctProvider ? "provider" : "NULL"), \(scopeColumn)
+                FROM accounts a ORDER BY sort_order, id
             """)
             for row in acctStmt {
                 guard let id = row[0] as? String else { continue }
+                if !includePersonal, AccountScope(stored: row[7] as? String) == .personal {
+                    let name = row[2] as? String ?? row[1] as? String ?? id
+                    reportSkipped("Skipped personal account: \(name)")
+                    continue
+                }
                 let provider = AccountProvider(stored: row[6] as? String)
 
                 // Codex/OpenAI accounts are host-local (#104): `codex_home`
@@ -119,7 +136,7 @@ enum AccountSync {
                 let credStmt = try db.prepare("""
                     SELECT label, source, access_token, refresh_token, expires_at,
                            scopes, subscription_type, rate_limit_tier, is_active,
-                           created_at, updated_at, token_rolled_at,
+                           created_at, updated_at, \(credColumns.contains("token_rolled_at") ? "token_rolled_at" : "NULL"),
                            \(hasCredProvider ? "provider" : "NULL"),
                            \(hasTokenExpiry ? "token_expires_at" : "NULL")
                     FROM oauth_credentials WHERE account_id = ?
@@ -170,8 +187,11 @@ enum AccountSync {
         }
     }
 
-    static func exportJSON(pretty: Bool = true, dbPath: String = defaultDBPath) throws -> Data {
-        let bundle = try exportBundle(dbPath: dbPath)
+    static func exportJSON(
+        pretty: Bool = true, dbPath: String = defaultDBPath, includePersonal: Bool = false,
+        reportSkipped: (String) -> Void = { _ in }
+    ) throws -> Data {
+        let bundle = try exportBundle(dbPath: dbPath, includePersonal: includePersonal, reportSkipped: reportSkipped)
         let encoder = JSONEncoder()
         encoder.outputFormatting = pretty ? [.prettyPrinted, .sortedKeys] : [.sortedKeys]
         return try encoder.encode(bundle)

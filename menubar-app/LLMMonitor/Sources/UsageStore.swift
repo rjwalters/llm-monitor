@@ -28,6 +28,7 @@ struct Account: Identifiable {
     /// Which upstream this account belongs to. Rows written before
     /// multi-provider support resolve to `.anthropic` via the schema migration.
     let provider: AccountProvider
+    let scope: AccountScope
     let accountName: String?
     let email: String?
     let plan: String?
@@ -50,6 +51,7 @@ struct Account: Identifiable {
     init(
         id: String,
         provider: AccountProvider = .anthropic,
+        scope: AccountScope = .work,
         accountName: String?,
         email: String?,
         plan: String?,
@@ -60,6 +62,7 @@ struct Account: Identifiable {
     ) {
         self.id = id
         self.provider = provider
+        self.scope = scope
         self.accountName = accountName
         self.email = email
         self.plan = plan
@@ -636,6 +639,8 @@ class UsageStore: ObservableObject {
         addColumnIfMissing(db, table: "oauth_credentials",
                            column: "token_expires_at", definition: "TEXT")
 
+        addAccountScopeColumn(db)
+
         // Migration (per-account Codex home, #103): which `CODEX_HOME` speaks
         // for this account. Deliberately **nullable with no DEFAULT** — NULL
         // means "the ambient home" (`$CODEX_HOME`, else `~/.codex`), so every
@@ -859,6 +864,10 @@ class UsageStore: ObservableObject {
         }
     }
 
+    nonisolated static func addAccountScopeColumn(_ db: Connection) {
+        addColumnIfMissing(db, table: "accounts", column: "scope", definition: "TEXT DEFAULT 'work'")
+    }
+
     /// Adds a column only when it isn't already there. `ALTER TABLE ... ADD
     /// COLUMN` throws on a duplicate; checking first keeps the (expected)
     /// already-migrated path free of spurious errors and lets us log the one
@@ -1015,6 +1024,12 @@ class UsageStore: ObservableObject {
             } else {
                 try db.run("DELETE FROM oauth_credentials WHERE account_id = ?", loserId)
             }
+
+            // Either row may carry the local privacy preference for this identity.
+            try db.run("""
+                UPDATE accounts SET scope = ? WHERE id = ?
+                  AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND scope = ?)
+            """, AccountScope.personal.rawValue, survivorId, loserId, AccountScope.personal.rawValue)
 
             // The user's pinned "primary" account (if it was the row being
             // removed) must keep pointing at a live account after the merge.
@@ -1259,7 +1274,7 @@ class UsageStore: ObservableObject {
                 SELECT id, account_name, email, plan, last_updated,
                        \(hasProvider ? "provider" : "NULL"),
                        \(hasCodexHome ? "codex_home" : "NULL"),
-                       \(storedTokenCount), \(localReading)
+                       \(storedTokenCount), \(localReading), \(accountColumns.contains("scope") ? "scope" : "NULL")
                 FROM accounts ORDER BY last_updated DESC
             """)
 
@@ -1292,6 +1307,7 @@ class UsageStore: ObservableObject {
                 let account = Account(
                     id: accountId,
                     provider: acctProvider,
+                    scope: AccountScope(stored: row[9] as? String),
                     accountName: acctName,
                     email: acctEmail,
                     plan: acctPlan,
@@ -1792,11 +1808,14 @@ class UsageStore: ObservableObject {
                 let updatedAccount = Account(
                     id: oldAccount.id,
                     provider: oldAccount.provider,
+                    scope: oldAccount.scope,
                     accountName: newName,
                     email: backfilledEmail ?? oldAccount.email,
                     plan: oldAccount.plan,
                     lastUpdated: oldAccount.lastUpdated,
-                    latestPercent: oldAccount.latestPercent
+                    latestPercent: oldAccount.latestPercent,
+                    codexHome: oldAccount.codexHome,
+                    isAbsent: oldAccount.isAbsent
                 )
                 accounts[index] = updatedAccount
                 onAccountsChanged?()

@@ -18,6 +18,16 @@ import Foundation
 ///
 /// Portable core: no AppKit / SwiftUI / Combine / os.Logger — builds on Linux.
 
+/// Local sharing preference. Rows created before account scopes default to work.
+enum AccountScope: String {
+    case work
+    case personal
+
+    init(stored: String?) {
+        self = stored.flatMap(Self.init(rawValue:)) ?? .work
+    }
+}
+
 // MARK: - Provider identity
 
 /// Which upstream an account belongs to.

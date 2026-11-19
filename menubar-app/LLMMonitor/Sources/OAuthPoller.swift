@@ -1337,15 +1337,12 @@ class OAuthPoller: ObservableObject {
     /// older build's `parseAccountPairs()` requires `ACCOUNT_KEY_N` and simply
     /// skips the entry, creating nothing.
     ///
-    /// Returns the serialized env text, the number of *credentialed* accounts
-    /// it contains, and the number of identity-only (tokenless, non-Anthropic)
-    /// entries alongside them, so callers can report an accurate count and
-    /// name the difference rather than re-deriving either from
-    /// `store.accounts.count`.
-    func exportAccountsEnv() -> (env: String, count: Int, identityOnly: Int)? {
+    /// A personal-only selection returns an empty payload and the skipped count
+    /// so Copy can report the exclusion without replacing the clipboard.
+    func exportAccountsEnv() -> (env: String, count: Int, identityOnly: Int, skippedPersonal: Int)? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
         do {
-            let db = try openDatabase(dbPath, readonly: true)
+            let (db, scopeColumn) = try AccountSync.openExportSource(dbPath: dbPath)
             // `provider`/`codex_home` (accounts) and `token_expires_at`
             // (oauth_credentials) are migrated columns (#28, #103) — select
             // them only when present so a database opened before those
@@ -1373,7 +1370,7 @@ class OAuthPoller: ObservableObject {
                        c.refresh_token,
                        \(hasTokenExpiry ? "c.token_expires_at" : "NULL") AS token_expires_at,
                        \(hasCodexHome ? "a.codex_home" : "NULL") AS codex_home,
-                       a.account_name
+                       a.account_name, a.id, \(scopeColumn)
                 FROM accounts a
                 LEFT JOIN oauth_credentials c ON c.account_id = a.id AND c.is_active = 1
                 ORDER BY a.sort_order, a.id
@@ -1383,7 +1380,12 @@ class OAuthPoller: ObservableObject {
             var n = 0
             var credentialed = 0
             var identityOnly = 0
+            var skippedPersonal = Set<String>()
             for row in stmt {
+                if AccountScope(stored: row[8] as? String) == .personal {
+                    if let id = row[7] as? String { skippedPersonal.insert(id) }
+                    continue
+                }
                 let provider = AccountProvider(stored: row[2] as? String)
                 let token = (row[1] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 if token == nil && provider == .anthropic {
@@ -1424,7 +1426,9 @@ class OAuthPoller: ObservableObject {
                 }
             }
 
-            guard n > 0 else { return nil }
+            guard n > 0 else {
+                return skippedPersonal.isEmpty ? nil : ("", 0, 0, skippedPersonal.count)
+            }
 
             let header = """
                 # LLM Monitor accounts — \(credentialed) account(s)\
@@ -1432,7 +1436,7 @@ class OAuthPoller: ObservableObject {
                 # Paste into the app (Add Account → Bulk Import) or save as ~/.llm-monitor/accounts.env
 
                 """
-            return (header + lines.joined(separator: "\n") + "\n", credentialed, identityOnly)
+            return (header + lines.joined(separator: "\n") + "\n", credentialed, identityOnly, skippedPersonal.count)
         } catch {
             flog.error("exportAccountsEnv failed: \(error.localizedDescription)", category: fcat)
             return nil
