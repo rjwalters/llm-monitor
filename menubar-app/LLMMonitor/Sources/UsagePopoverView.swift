@@ -796,6 +796,9 @@ struct UsagePopoverView: View {
                 Divider()
 
                 ScrollView {
+                    // Resolved once per render, not once per row: it sorts
+                    // every account, and each row used to ask several times.
+                    let menubarAccountId = store.effectivePrimaryAccountId
                     VStack(spacing: 0) {
                         ForEach(tabRows, id: \.account.id) { item in
                             SummaryRow(
@@ -803,6 +806,7 @@ struct UsagePopoverView: View {
                                 usage: item.usage,
                                 store: store,
                                 oauthPoller: oauthPoller,
+                                isMenubarSelected: item.account.id == menubarAccountId,
                                 visibleProviders: visibleProviders,
                                 poolTally: poolTallies.byProvider[item.account.provider],
                                 onRemove: {
@@ -1251,6 +1255,11 @@ struct SummaryRow: View {
     let usage: UsageRecord?
     let store: UsageStore
     let oauthPoller: OAuthPoller
+    /// True when this row is the one whose usage is shown in the menubar.
+    /// Passed in by the owner, which resolves `store.effectivePrimaryAccountId`
+    /// once per render: computing it here re-sorted every account several
+    /// times per row and froze the main thread.
+    var isMenubarSelected: Bool = false
     /// Providers visible in the table — decides whether this row draws the
     /// provider-specific cells at all (`SummaryColumns.shows`, #227).
     var visibleProviders: Set<AccountProvider> = Set(AccountProvider.allCases)
@@ -1453,11 +1462,6 @@ struct SummaryRow: View {
         formatter.dateStyle = .none
         formatter.timeStyle = .short
         return formatter.string(from: usage.timestamp)
-    }
-
-    /// True when this row is the one whose usage is shown in the menubar.
-    private var isMenubarSelected: Bool {
-        store.effectivePrimaryAccountId == account.id
     }
 
     /// True when the user has explicitly pinned this row (vs. just being the
