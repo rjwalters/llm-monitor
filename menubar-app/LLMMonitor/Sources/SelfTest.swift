@@ -29,6 +29,9 @@ enum SelfTest {
     private static let suiteEntries: [(name: String, run: @MainActor () -> Void)] = [
         ("NaturalSort", { testNaturalSort() }),
         ("SortedAccountsForPopoverTieBreak", { testSortedAccountsForPopoverTieBreak() }),
+        ("PopoverSortColumns", { testPopoverSortColumns() }),
+        ("PopoverSortTieRules", { testPopoverSortTieRules() }),
+        ("PopoverSortHiddenColumnFallback", { testPopoverSortHiddenColumnFallback() }),
         ("GatingResetOrdering", { testGatingResetOrdering() }),
         ("StalenessBackstop", { testStalenessBackstop() }),
         ("BadgePercentSuppression", { testBadgePercentSuppression() }),
@@ -566,6 +569,295 @@ enum SelfTest {
         expectEqual(store.sortedAccountsForPopover.map { $0.displayName },
                     ["agent-3", "agent-1", "agent-2"],
                     "capped accounts order by time until they are usable again")
+    }
+
+    // MARK: Popover sort pipeline (#333)
+
+    /// Shared fixture for the `PopoverSort` comparator cases: a fixed `now`
+    /// (so expectations are absolute), mixed providers, natural-name traps,
+    /// tied headroom at the bottom of the table, tied reset timestamps, an
+    /// unknown-recovery row, missing windows and a row with no reading at
+    /// all. `PopoverSort.sortedRows` takes `now` as a parameter, so every
+    /// expectation below is deterministic.
+    private static func popoverSortFixture()
+        -> (accounts: [Account], usage: [String: UsageRecord], statuses: [String: TokenStatus], now: Date) {
+        let now = ISO8601DateFormatter().date(from: "2026-11-19T12:00:00Z")!
+        func iso(_ offset: TimeInterval) -> String {
+            ISO8601DateFormatter().string(from: now.addingTimeInterval(offset))
+        }
+        func record(
+            _ id: String, _ n: Int64,
+            session: Double?, weekly: Double?,
+            sessionReset: TimeInterval?, weeklyReset: TimeInterval?,
+            fable: Double? = nil,
+            overageStatus: String? = nil, overageDisabledReason: String? = nil,
+            overageInUse: Bool? = nil,
+            age: TimeInterval = 0
+        ) -> UsageRecord {
+            var r = UsageRecord(
+                id: n, accountId: id, timestamp: now.addingTimeInterval(-age),
+                primaryPercent: weekly, sessionPercent: session,
+                weeklyAllPercent: weekly, weeklySONnetPercent: nil,
+                sessionReset: sessionReset.map(iso), weeklyReset: weeklyReset.map(iso)
+            )
+            r.fablePercent = fable
+            r.overageStatus = overageStatus
+            r.overageDisabledReason = overageDisabledReason
+            r.overageInUse = overageInUse
+            return r
+        }
+        func account(_ id: String, _ name: String, _ provider: AccountProvider) -> Account {
+            Account(id: id, provider: provider, accountName: name, email: nil,
+                    plan: "Max", lastUpdated: now, latestPercent: nil)
+        }
+
+        let accounts: [Account] = [
+            account("a-nil", "a-nil", .anthropic),       // no reading at all → nil rows go last
+            account("a10",   "agent-10", .anthropic),
+            account("a9",    "agent-9",  .anthropic),    // ties a10's headroom; session resets sooner
+            account("a2",    "agent-2",  .anthropic),    // weekly exhausted, no session window
+            account("z1",    "glm-main", .zai),
+            account("o1",    "codex-a",  .openai),
+            account("tw-1",  "twin",     .anthropic),    // identical name and identical stamps to tw-2
+            account("tw-2",  "twin",     .anthropic),    // → only the account-id tiebreak can order them
+            account("t1",    "beta",     .anthropic),    // identical stamps to t2 → name tiebreak
+            account("t2",    "alpha",    .anthropic),
+            account("u1",    "unknown-rec", .anthropic), // exhausted, recovery unknown
+        ]
+        var usage: [String: UsageRecord] = [:]
+        usage["a10"] = record("a10", 10, session: 50, weekly: 40, sessionReset: 7200, weeklyReset: 3 * 86400,
+                              fable: 30, overageStatus: "allowed", overageInUse: false, age: 120)
+        usage["a9"] = record("a9", 9, session: 50, weekly: 40, sessionReset: 3600, weeklyReset: 3 * 86400,
+                             fable: 30, overageStatus: "allowed", overageInUse: false, age: 60)
+        usage["a2"] = record("a2", 2, session: nil, weekly: 100, sessionReset: nil, weeklyReset: 10 * 86400,
+                             fable: 60, overageStatus: "rejected", overageDisabledReason: "out_of_credits", age: 3600)
+        usage["z1"] = record("z1", 20, session: nil, weekly: 20, sessionReset: nil, weeklyReset: 2 * 86400, age: 600)
+        usage["o1"] = record("o1", 21, session: nil, weekly: 70, sessionReset: nil, weeklyReset: 86400, age: 300)
+        usage["tw-1"] = record("tw-1", 1, session: 0, weekly: 0, sessionReset: 5 * 3600, weeklyReset: 6 * 86400,
+                               fable: 10, overageStatus: "rejected", overageDisabledReason: "org_level_disabled", age: 7200)
+        usage["tw-2"] = record("tw-2", 2, session: 0, weekly: 0, sessionReset: 5 * 3600, weeklyReset: 6 * 86400,
+                               fable: 10, overageStatus: "rejected", overageDisabledReason: "org_level_disabled", age: 7200)
+        usage["t1"] = record("t1", 3, session: 100, weekly: 100, sessionReset: 4 * 3600, weeklyReset: 7 * 86400,
+                             fable: 80, overageStatus: "allowed", overageInUse: true, age: 5400)
+        usage["t2"] = record("t2", 4, session: 100, weekly: 100, sessionReset: 4 * 3600, weeklyReset: 7 * 86400,
+                             fable: 80, overageStatus: "allowed", overageInUse: true, age: 5400)
+        usage["u1"] = record("u1", 5, session: 100, weekly: 100, sessionReset: nil, weeklyReset: nil,
+                             fable: 90, age: 900)
+        // a-nil: deliberately no reading.
+
+        let statuses: [String: TokenStatus] = [
+            "a9": .valid, "a10": .expired, "u1": .revoked,
+            "a-nil": .refreshing, "z1": .refreshing,
+            "tw-1": .valid, "tw-2": .valid, "t1": .valid, "t2": .valid,
+            // a2 and o1 deliberately absent → .missing, the worst rank.
+        ]
+        return (accounts, usage, statuses, now)
+    }
+
+    /// The production table sort for all ten columns in both directions, with
+    /// fixed timestamps and expected account IDs: nil usage and missing
+    /// windows last, identical dates reaching the name tiebreak, natural
+    /// names, equal names resolved by ascending id, and a missing token
+    /// status ranked worst.
+    private static func testPopoverSortColumns() {
+        let (accounts, usage, statuses, now) = popoverSortFixture()
+        func ids(_ sortBy: SummarySort, _ direction: SortDirection) -> [String] {
+            PopoverSort.sortedRows(
+                accounts: accounts, latestUsage: usage, sortBy: sortBy, direction: direction,
+                premiumColumnShown: true, extraColumnShown: true,
+                tokenStatusByAccount: statuses, now: now).map { $0.account.id }
+        }
+
+        expectEqual(ids(.headroom, .desc),
+                    ["tw-1", "tw-2", "z1", "a9", "a10", "o1", "t2", "t1", "a2", "u1", "a-nil"],
+                    "headroom desc: score desc, equal scores by sooner recovery, unknown last, nil last")
+        expectEqual(ids(.headroom, .asc),
+                    ["a2", "t2", "t1", "u1", "o1", "a10", "a9", "z1", "tw-1", "tw-2", "a-nil"],
+                    "headroom asc: score asc with the same ties, recovery trailing when flipped, nil still last")
+
+        expectEqual(ids(.sessionPercent, .desc),
+                    ["t2", "t1", "u1", "a9", "a10", "tw-1", "tw-2", "a-nil", "a2", "o1", "z1"],
+                    "session desc: percent desc, ties by name/id, missing session window last")
+        expectEqual(ids(.sessionPercent, .asc),
+                    ["tw-1", "tw-2", "a9", "a10", "t2", "t1", "u1", "a-nil", "a2", "o1", "z1"],
+                    "session asc: percent asc, missing session window still last")
+
+        expectEqual(ids(.weeklyPercent, .desc),
+                    ["a2", "t2", "t1", "u1", "o1", "a9", "a10", "z1", "tw-1", "tw-2", "a-nil"],
+                    "weekly desc: ties at 100% fall to the name tiebreak, 0% last, nil last")
+        expectEqual(ids(.weeklyPercent, .asc),
+                    ["tw-1", "tw-2", "z1", "a9", "a10", "o1", "a2", "t2", "t1", "u1", "a-nil"],
+                    "weekly asc: same tie rules mirrored")
+
+        expectEqual(ids(.sessionReset, .desc),
+                    ["tw-1", "tw-2", "t2", "t1", "a10", "a9", "a-nil", "a2", "o1", "z1", "u1"],
+                    "session reset desc: later reset first, missing session window last")
+        expectEqual(ids(.sessionReset, .asc),
+                    ["a9", "a10", "t2", "t1", "tw-1", "tw-2", "a-nil", "a2", "o1", "z1", "u1"],
+                    "session reset asc: sooner reset first")
+
+        expectEqual(ids(.weeklyReset, .desc),
+                    ["a2", "t2", "t1", "tw-1", "tw-2", "a9", "a10", "z1", "o1", "a-nil", "u1"],
+                    "weekly reset desc: unknown weekly reset last")
+        expectEqual(ids(.weeklyReset, .asc),
+                    ["o1", "z1", "a9", "a10", "tw-1", "tw-2", "t2", "t1", "a2", "a-nil", "u1"],
+                    "weekly reset asc: sooner weekly reset first")
+
+        expectEqual(ids(.fablePercent, .desc),
+                    ["u1", "t2", "t1", "a2", "a9", "a10", "tw-1", "tw-2", "a-nil", "o1", "z1"],
+                    "premium desc: fable desc, no-reading and non-anthropic rows last")
+        expectEqual(ids(.fablePercent, .asc),
+                    ["tw-1", "tw-2", "a9", "a10", "a2", "t2", "t1", "u1", "a-nil", "o1", "z1"],
+                    "premium asc: fable asc")
+
+        expectEqual(ids(.extraUsage, .desc),
+                    ["tw-1", "tw-2", "a9", "a10", "t2", "t1", "a2", "a-nil", "o1", "z1", "u1"],
+                    "extra desc: off → ready → active → empty, no probe last")
+        expectEqual(ids(.extraUsage, .asc),
+                    ["a2", "t2", "t1", "a9", "a10", "tw-1", "tw-2", "a-nil", "o1", "z1", "u1"],
+                    "extra asc: needs-attention first, no probe last")
+
+        expectEqual(ids(.fresh, .desc),
+                    ["tw-1", "tw-2", "t2", "t1", "a2", "u1", "z1", "o1", "a10", "a9", "a-nil"],
+                    "fresh desc: stalest first, equal ages by name/id, no reading last")
+        expectEqual(ids(.fresh, .asc),
+                    ["a9", "a10", "o1", "z1", "u1", "a2", "t2", "t1", "tw-1", "tw-2", "a-nil"],
+                    "fresh asc: freshest first")
+
+        expectEqual(ids(.token, .asc),
+                    ["a9", "t2", "t1", "tw-1", "tw-2", "a-nil", "z1", "a10", "u1", "a2", "o1"],
+                    "token asc: valid first, missing status ranked worst")
+        expectEqual(ids(.token, .desc),
+                    ["a2", "o1", "u1", "a10", "a-nil", "z1", "a9", "t2", "t1", "tw-1", "tw-2"],
+                    "token desc: missing status first (rank mirrored), ties keep name order")
+
+        expectEqual(ids(.account, .asc),
+                    ["a-nil", "a2", "a9", "a10", "t2", "t1", "o1", "z1", "tw-1", "tw-2", "u1"],
+                    "account asc: natural order — agent-2, agent-9, agent-10 — equal names by id")
+        expectEqual(ids(.account, .desc),
+                    ["u1", "tw-1", "tw-2", "z1", "o1", "t1", "t2", "a10", "a9", "a2", "a-nil"],
+                    "account desc: names reversed, equal names still by ascending id")
+    }
+
+    /// The tie rules the columns test exercises en passant, spelled out:
+    /// identical timestamps reach the deterministic name tiebreak (the single
+    /// reference instant, #333), equal Headroom orders by sooner recovery in
+    /// descending order and trails in ascending order, the gating reset is
+    /// the weekly one once the week is spent, unknown recovery goes last, and
+    /// the order is stable across repeated sorts.
+    private static func testPopoverSortTieRules() {
+        let (accounts, usage, statuses, now) = popoverSortFixture()
+        func headroomIds(_ direction: SortDirection) -> [String] {
+            PopoverSort.sortedRows(
+                accounts: accounts, latestUsage: usage, sortBy: .headroom, direction: direction,
+                premiumColumnShown: true, extraColumnShown: true,
+                tokenStatusByAccount: statuses, now: now).map { $0.account.id }
+        }
+
+        // Equal headroom, different recovery: sooner recovery leads in
+        // descending order and trails in ascending order (agent-9's session
+        // reset is an hour out, agent-10's two).
+        expect(headroomIds(.desc).firstIndex(of: "a9")! < headroomIds(.desc).firstIndex(of: "a10")!,
+               "equal headroom desc: sooner recovery leads")
+        expect(headroomIds(.asc).firstIndex(of: "a10")! < headroomIds(.asc).firstIndex(of: "a9")!,
+               "equal headroom asc: sooner recovery trails")
+
+        // Unknown recovery (u1) goes last among the tied zero-headroom rows
+        // in both directions — unknown, never imminent. In descending order
+        // the 0-group trails the table (after a2); in ascending it leads
+        // (after t1), but u1 trails its tie group either way, with only the
+        // no-reading row ever sorting below it.
+        let desc = headroomIds(.desc), asc = headroomIds(.asc)
+        expect(desc.firstIndex(of: "u1") == desc.firstIndex(of: "a2")! + 1 && desc.last == "a-nil",
+               "desc: unknown recovery trails its tie group, only the no-reading row after it")
+        expect(asc.firstIndex(of: "u1") == asc.firstIndex(of: "t1")! + 1 && asc.last == "a-nil",
+               "asc: unknown recovery trails its tie group, only the no-reading row after it")
+
+        // Identical reset timestamps (t1/t2: same stamps, tied headroom;
+        // tw-1/tw-2: same stamps and same name) must tie deterministically —
+        // via the name, then the account id — not by clock skew mid-sort.
+        expect(headroomIds(.desc) == headroomIds(.desc),
+               "repeated sorts with identical inputs produce identical order")
+
+        // The gating reset is the weekly one once the week is spent: two
+        // weekly-exhausted rows where the session resets point the *other*
+        // way (g1's session is hours out but its week returns sooner than
+        // g2's) must order by the week, not the session.
+        func exhausted(_ id: String, _ n: Int64, _ name: String, sessionReset: TimeInterval, weeklyReset: TimeInterval)
+            -> (Account, UsageRecord) {
+            let a = Account(id: id, provider: .anthropic, accountName: name, email: nil,
+                            plan: "Max", lastUpdated: now, latestPercent: nil)
+            let r = UsageRecord(
+                id: n, accountId: id, timestamp: now, primaryPercent: 100,
+                sessionPercent: 100, weeklyAllPercent: 100, weeklySONnetPercent: nil,
+                sessionReset: ISO8601DateFormatter().string(from: now.addingTimeInterval(sessionReset)),
+                weeklyReset: ISO8601DateFormatter().string(from: now.addingTimeInterval(weeklyReset))
+            )
+            return (a, r)
+        }
+        let (g1Account, g1Usage) = exhausted("g1", 30, "gated-1",
+                                             sessionReset: 2 * 3600, weeklyReset: 5 * 86400)
+        let (g2Account, g2Usage) = exhausted("g2", 31, "gated-2",
+                                             sessionReset: 1800, weeklyReset: 6 * 86400)
+        let gated = PopoverSort.sortedRows(
+            accounts: [g2Account, g1Account],
+            latestUsage: [g1Account.id: g1Usage, g2Account.id: g2Usage],
+            sortBy: .headroom, direction: .desc,
+            premiumColumnShown: true, extraColumnShown: true,
+            tokenStatusByAccount: [:], now: now).map { $0.account.id }
+        expectEqual(gated, ["g1", "g2"],
+                    "weekly-exhausted rows order by the weekly reset even when the session resets point the other way")
+
+        // The provider-tab filter runs after the sort and the comparator
+        // never looks at other rows, so filtering a sorted roster must equal
+        // sorting that provider's rows alone.
+        let openai = accounts.filter { $0.provider == .openai }
+        let filtered = PopoverSort.sortedRows(
+            accounts: accounts, latestUsage: usage, sortBy: .headroom, direction: .desc,
+            premiumColumnShown: true, extraColumnShown: true,
+            tokenStatusByAccount: statuses, now: now).filter { $0.account.provider == .openai }
+        let alone = PopoverSort.sortedRows(
+            accounts: openai, latestUsage: usage, sortBy: .headroom, direction: .desc,
+            premiumColumnShown: true, extraColumnShown: true,
+            tokenStatusByAccount: statuses, now: now)
+        expectEqual(filtered.map { $0.account.id }, alone.map { $0.account.id },
+                    "a provider tab shows the same relative order as sorting that provider alone")
+    }
+
+    /// Hidden-column fallback (#227 via #333): with no provider that declares
+    /// Premium or Extra applicable, a stored selection of either column must
+    /// fall back to Headroom using the selected direction — and the view's
+    /// per-render inputs (both `shows` answers resolved once) feed exactly
+    /// that rule.
+    private static func testPopoverSortHiddenColumnFallback() {
+        let (accounts, usage, statuses, now) = popoverSortFixture()
+        let inapplicable = accounts.filter { $0.provider != .anthropic }
+        func ids(_ sortBy: SummarySort, premium: Bool, extra: Bool) -> [String] {
+            PopoverSort.sortedRows(
+                accounts: inapplicable, latestUsage: usage, sortBy: sortBy, direction: .desc,
+                premiumColumnShown: premium, extraColumnShown: extra,
+                tokenStatusByAccount: statuses, now: now).map { $0.account.id }
+        }
+        let headroom = ids(.headroom, premium: true, extra: true)
+        expectEqual(ids(.fablePercent, premium: false, extra: true), headroom,
+                    "hidden premium on an inapplicable roster falls back to headroom")
+        expectEqual(ids(.extraUsage, premium: true, extra: false), headroom,
+                    "hidden extra on an inapplicable roster falls back to headroom")
+        expect(ids(.fablePercent, premium: true, extra: true) != headroom || inapplicable.isEmpty,
+               "sanity: with premium applicable the fable sort is reachable")
+        expect(!headroom.isEmpty, "fallback fixture is populated")
+
+        // Same fallback, ascending direction.
+        let headroomAsc = PopoverSort.sortedRows(
+            accounts: inapplicable, latestUsage: usage, sortBy: .headroom, direction: .asc,
+            premiumColumnShown: true, extraColumnShown: true,
+            tokenStatusByAccount: statuses, now: now).map { $0.account.id }
+        let fallbackAsc = PopoverSort.sortedRows(
+            accounts: inapplicable, latestUsage: usage, sortBy: .fablePercent, direction: .asc,
+            premiumColumnShown: false, extraColumnShown: true,
+            tokenStatusByAccount: statuses, now: now).map { $0.account.id }
+        expectEqual(fallbackAsc, headroomAsc,
+                    "hidden premium falls back to headroom using the selected direction")
     }
 
     /// The cause-independent staleness backstop (#148): an account whose
