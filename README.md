@@ -185,6 +185,35 @@ Snapshots have trade-offs:
 
 `llm-monitor codex list` shows each profile's latest snapshot and its age.
 
+#### Seeing readings from hosts that still run Codex (peers)
+
+A snapshot is only as fresh as its host's last Codex turn. When the accounts
+move — the profiles stay on a Mac while the work happens on Linux workers,
+say — this host's readings go stale even though the pool itself is fine. The
+fix is read-only mirroring from peers over the existing ssh channel (#320).
+
+Name the peers in `~/.llm-monitor/codex-peers.txt` beside the database (one
+ssh host per line, `#` comments; per-host ssh tuning goes through
+`~/.ssh/config` aliases), or set `LLM_MONITOR_CODEX_PEERS="worker-1
+worker-2"`. The list is empty by default, so nothing changes for a host that
+never configures it. Once a poll cycle, llm-monitor asks each peer for its
+Codex readings with one read-only command — `'claude-monitor' codex readings`
+— and joins them by Loom profile name. **Only derived readings cross the
+channel** (profile name, windows, reset instants, observed-at): no
+credential, no `auth.json` content, no home path, and never `accounts
+export`'s plaintext-token bundle. Nothing is written to the peer, and every
+failure — peer unreachable, no ssh, timeout, undecodable output — falls back
+silently to the local sources.
+
+A peer's reading wins only when it is **newer** than this host's own, and
+only when it actually measured something — the same newer-wins rule the
+local live check follows. The row is written with the peer's own timestamp
+and records which host it came from: `codex list` prints the origin beside
+the age (`… as of 3h ago · via worker-3`), and the popover's freshness
+tooltip names it the same way. A profile with no local activity and no peer
+reading shows as *inactive on this host* rather than "usage unknown" — the
+numbers aren't unknowable, they just live somewhere else.
+
 ### Adding an OpenAI (Codex) Account
 
 ChatGPT subscription accounts (Plus/Pro, the ones Codex CLI uses) are polled

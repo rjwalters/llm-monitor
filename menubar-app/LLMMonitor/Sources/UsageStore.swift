@@ -104,6 +104,21 @@ struct UsageRecord: Identifiable {
     /// never 0 — because most readings (Anthropic, `app-server`, rollout
     /// snapshots) carry no such object.
     var resetCredits: OpenAIUsageResponse.ResetCredits? = nil
+    /// The reading's own source tag from the same archive
+    /// (`OpenAIUsageResponse.storedReadingSource`): `codex-rollout-snapshot`,
+    /// `loom-accounts-check-live`, or `peer:<host>` (#320). nil for rows that
+    /// predate the tag. Display-only — `peerHost` renders it as "via <host>"
+    /// so a mirrored reading never masquerades as local.
+    var readingSource: String? = nil
+
+    /// The peer host when this reading was mirrored from one (`source` =
+    /// `peer:<host>`, written by `pollCodexSnapshot`), else nil.
+    var peerHost: String? {
+        guard let source = readingSource,
+              source.hasPrefix(CodexPeerReadings.peerSourcePrefix) else { return nil }
+        let host = String(source.dropFirst(CodexPeerReadings.peerSourcePrefix.count))
+        return host.isEmpty ? nil : host
+    }
 
     /// This stored reading expressed in the shared, provider-agnostic window
     /// model. The `usage_history` columns are already kind-keyed (a session
@@ -1321,6 +1336,9 @@ class UsageStore: ObservableObject {
                     // Unused Codex limit resets ride the row's `raw_data`
                     // archive (#298); nil for every reading that carries none.
                     record.resetCredits = OpenAIUsageResponse.parseStoredReading(usageRow[8] as? String).credits
+                    // The reading's own source tag (#320) — what names a
+                    // peer-fed row's origin host in the row tooltip.
+                    record.readingSource = OpenAIUsageResponse.storedReadingSource(usageRow[8] as? String)
 
                     // Premium/Fable allocation + overage come from the latest
                     // Fable probe snapshot's raw headers.

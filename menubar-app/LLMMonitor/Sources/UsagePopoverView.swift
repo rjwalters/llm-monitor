@@ -1404,13 +1404,16 @@ struct SummaryRow: View {
     private var freshnessLabel: String {
         if isAbsent { return "Not provisioned on this host — nothing has ever been polled" }
         guard let age = dataAge else { return "No data" }
-        if isDrifted { return tokenStatusHelp }
+        // A reading mirrored from a peer (#320) names its origin, wherever the
+        // freshness itself is reported — the numbers are not this host's own.
+        let peerSuffix = usage?.peerHost.map { " · via \($0)" } ?? ""
+        if isDrifted { return tokenStatusHelp + peerSuffix }
         let interval = oauthPoller.pollInterval
-        if age < interval { return "Fresh (\(Int(age / 60)) min)" }
+        if age < interval { return "Fresh (\(Int(age / 60)) min)" + peerSuffix }
         if age < AccountFreshness.staleThreshold(pollInterval: interval) {
-            return "Aging (\(Int(age / 60)) min) — as of \(asOfTimeString)"
+            return "Aging (\(Int(age / 60)) min) — as of \(asOfTimeString)" + peerSuffix
         }
-        return "Stale — as of \(asOfTimeString)"
+        return "Stale — as of \(asOfTimeString)" + peerSuffix
     }
 
     /// One line explaining a row that has no current figures to show, laid
@@ -1425,7 +1428,11 @@ struct SummaryRow: View {
         if let usage {
             guard isStale else { return nil }
             let since = "Last reading \(Self.idleSinceFormatter.string(from: usage.timestamp))"
-            return reason.map { "\(since) · \($0)" } ?? since
+            var parts: [String] = []
+            // A mirrored reading keeps its origin even once stale (#320).
+            if let host = usage.peerHost { parts.append("via \(host)") }
+            if let reason { parts.append(reason) }
+            return parts.isEmpty ? since : since + " · " + parts.joined(separator: " · ")
         }
         // Never read at all. Only worth a line when there is a reason to give.
         return reason.map { "No reading yet · \($0)" }

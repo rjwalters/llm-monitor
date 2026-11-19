@@ -879,8 +879,16 @@ class OAuthPoller: ObservableObject {
         + "account records one; this app never queries a Loom-owned profile directly."
 
     /// What a snapshot-mode row says once its newest reading has rolled over.
+    ///
+    /// Deliberately no longer says "usage unknown" (#320): a rolled-over
+    /// snapshot means this host has seen no Codex activity lately — the
+    /// account reads as **inactive on this host**, and the actionable fix when
+    /// the account is active elsewhere is the peer list, not waiting for a
+    /// turn that may never come here.
     nonisolated static let rolledOverCodexSnapshotMessage =
-        "Last Codex snapshot has rolled over; usage is unknown until the account's next Codex turn."
+        "No current Codex reading on this host — the account reads as inactive here. "
+            + "If it is active on another host, add that host to the Codex peer list "
+            + "(\(CodexPeerReadings.peersEnvKey) or \(CodexPeerReadings.peersFileBaseName)) to mirror its readings."
 
     /// What a snapshot-mode row says when its profile has no login at all —
     /// the one case where "wait for a Codex turn" is the wrong advice, because
@@ -900,22 +908,31 @@ class OAuthPoller: ObservableObject {
         return rolledOver ? rolledOverCodexSnapshotMessage : noCodexSnapshotMessage
     }
 
-    /// Read one Loom profile's current rate limits, from whichever of the two
+    /// Read one Loom profile's current rate limits, from whichever of the three
     /// read-only sources saw the account most recently. Never spawns `codex`,
-    /// never reads a credential (see `CodexProfiles` / `LoomAccountsCheck`).
+    /// never reads a credential (see `CodexProfiles` / `LoomAccountsCheck` /
+    /// `CodexPeerReadings`).
     ///
     /// 1. **Loom's live check** (`LoomAccountsCheck`, #230) — measured inside
     ///    the profile's own session container by the process that owns its
     ///    refresh chain, and cached by `refreshLoomCodexLiveReadings`.
     /// 2. **The profile's rollout snapshot** (`CodexProfiles`) — whatever Codex
     ///    itself last recorded on disk during normal use.
+    /// 3. **A peer host's reading** (`CodexPeerReadings`, #320) — mirrored over
+    ///    ssh from a host where the account is still active, cached by
+    ///    `refreshCodexPeerReadings`. This is what keeps the pool visible on a
+    ///    host Codex no longer runs on.
     ///
-    /// The live reading wins **only when it is newer**, never merely because it
-    /// is live: a host whose container is down reports `session_unavailable`
-    /// with no measurement at all, and letting that displace a good local
-    /// reading is precisely the stale-overwrite the freshness rules (#148)
-    /// exist to prevent. Either way the row carries *the observation's own*
-    /// timestamp, so `AccountFreshness`'s backstop applies unchanged.
+    /// **Newer-wins, strictly.** The freshest observation takes the row, and a
+    /// candidate displaces an equally-old one only in list order (live →
+    /// rollout → peer), so a source wins only when it is genuinely newer than
+    /// what is already chosen — never merely because it is live, local, or a
+    /// peer: a host whose container is down reports `session_unavailable` with
+    /// no measurement at all, and a peer that measured nothing carries no
+    /// evidence about the account. Letting either displace a good reading is
+    /// precisely the stale-overwrite the freshness rules (#148) exist to
+    /// prevent. Either way the row carries *the observation's own* timestamp,
+    /// so `AccountFreshness`'s backstop applies unchanged.
     // Not private: SelfTest drives it directly (it is synchronous, so the
     // real poll path runs without an async hop), like `updateCredentialStatus`.
     func pollCodexSnapshot(_ credential: OAuthCredential) {
@@ -936,23 +953,33 @@ class OAuthPoller: ObservableObject {
         let rollout = CodexProfiles.latestSnapshot(home: home)
         let usableRollout = rollout.flatMap { $0.rateLimit.isEmpty ? nil : $0 }
         let live = loomCodexLiveReading(home: home)
+        let peer = codexPeerReading(home: home)
 
-        let observedAt: Date
-        let rateLimit: RateLimitSnapshot
-        let plan: String?
-        let source: String
-        if let live = live, usableRollout.map({ live.observedAt > $0.observedAt }) ?? true {
-            observedAt = live.observedAt
-            rateLimit = live.rateLimit
-            plan = nil  // `accounts check` reports availability, not the plan name.
-            source = "loom-accounts-check-live"
-        } else if let snapshot = usableRollout {
-            observedAt = snapshot.observedAt
-            rateLimit = snapshot.rateLimit
-            plan = snapshot.plan
-            source = "codex-rollout-snapshot"
-        } else {
-            // Neither source has a current reading. `rolledOver` distinguishes
+        // Candidates in precedence order; each displaces the incumbent only
+        // when strictly newer (an equal timestamp keeps the incumbent), which
+        // reproduces the pre-peer two-source rule exactly and adds the peer as
+        // the last-resort claim.
+        var best: (observedAt: Date, rateLimit: RateLimitSnapshot, plan: String?, source: String)?
+        func prefer(observedAt: Date, rateLimit: RateLimitSnapshot, plan: String?, source: String) {
+            if let current = best, current.observedAt >= observedAt { return }
+            best = (observedAt, rateLimit, plan, source)
+        }
+        if let live = live {
+            prefer(observedAt: live.observedAt, rateLimit: live.rateLimit,
+                   plan: nil,  // `accounts check` reports availability, not the plan name.
+                   source: "loom-accounts-check-live")
+        }
+        if let snapshot = usableRollout {
+            prefer(observedAt: snapshot.observedAt, rateLimit: snapshot.rateLimit,
+                   plan: snapshot.plan, source: "codex-rollout-snapshot")
+        }
+        if let peer = peer {
+            prefer(observedAt: peer.observedAt, rateLimit: peer.rateLimit,
+                   plan: peer.plan, source: CodexPeerReadings.peerSourcePrefix + peer.host)
+        }
+
+        guard let chosen = best else {
+            // No source has a current reading. `rolledOver` distinguishes
             // "this profile has never recorded one" from "its newest one has
             // since rolled over", because the two have different remedies.
             reportNoReading(rolledOver: rollout != nil)
@@ -960,11 +987,11 @@ class OAuthPoller: ObservableObject {
         }
         writeSnapshotToDB(accountId: accountId, snapshot: ProviderUsageSnapshot(
             provider: .openai, accountKey: accountId, httpStatus: 200,
-            rateLimit: rateLimit, plan: plan,
-            rawFields: ["source": source,
-                        "observed_at": ISO8601DateFormatter().string(from: observedAt)]
-        ), observedAt: observedAt)
-        if let plan = plan, let db = try? openDatabase(dbPath) {
+            rateLimit: chosen.rateLimit, plan: chosen.plan,
+            rawFields: ["source": chosen.source,
+                        "observed_at": ISO8601DateFormatter().string(from: chosen.observedAt)]
+        ), observedAt: chosen.observedAt)
+        if let plan = chosen.plan, let db = try? openDatabase(dbPath) {
             try? db.run("UPDATE accounts SET plan = ? WHERE id = ?", plan, accountId)
         }
         updateCredentialLastPoll(credential, error: nil)
@@ -1058,6 +1085,150 @@ class OAuthPoller: ObservableObject {
         flog.info("Loom live Codex check: \(measured)/\(report.readings.count) profile(s) measured",
                   category: fcat)
         return measured
+    }
+
+    // MARK: - Codex peer readings (#320)
+
+    /// How often peers are fetched, in seconds. Matched to the usage poll and
+    /// to `loomLiveCheckInterval`: it *is* the usage reading for a profile
+    /// whose local sources went quiet, and a peer is one ssh round trip per
+    /// cycle, not per account.
+    var codexPeerInterval: TimeInterval = 600
+
+    private var lastCodexPeerCheck: Date?
+    /// The freshest peer reading per profile name, merged newest-wins across
+    /// every peer. Empty until the first successful fetch, and deliberately
+    /// **cleared** when the peer list is configured empty: an operator who
+    /// removes the peers is removing the source, and its readings must not
+    /// outlive it (unlike the live check's cache, which survives a failed
+    /// probe because its source never went away).
+    private var codexPeerReadingsByProfile: [String: CodexPeerReadings.Reading] = [:]
+    /// A host with no `ssh` binary cannot reach any peer. That is a normal
+    /// steady state (and a silent fallback either way), so it is said once per
+    /// process.
+    private var reportedCodexPeerSSHUnavailable = false
+
+    /// The newest peer reading for a profile home, or nil when no peer has a
+    /// measurement for it. Keyed on the profile's own name — the same key
+    /// `loomCodexLiveReading` matches on — and gated on `hasMeasurement`, so a
+    /// peer row that measured nothing is never a reading.
+    func codexPeerReading(home: String) -> CodexPeerReadings.Reading? {
+        let profile = (home as NSString).lastPathComponent
+        guard !profile.isEmpty, let reading = codexPeerReadingsByProfile[profile],
+              reading.hasMeasurement else { return nil }
+        return reading
+    }
+
+    /// Test seam: inject peer readings without spawning ssh. `SelfTest` uses
+    /// it to drive `pollCodexSnapshot`'s newer-wins rule offline, the same way
+    /// `setLoomCodexLiveReadings` drives the live-check path.
+    func setCodexPeerReadings(_ readings: [String: CodexPeerReadings.Reading]) {
+        codexPeerReadingsByProfile = readings
+    }
+
+    /// Fetch every configured peer's readings once per cadence, merging them
+    /// newest-wins into the cache. Called once per poll cycle beside
+    /// `refreshLoomCodexLiveReadings`, never once per account.
+    ///
+    /// Every failure mode — an empty peer list (the default, and a no-op by
+    /// design), no ssh binary, a refused connection, a timeout, undecodable
+    /// output — leaves behaviour exactly as it was before peers were
+    /// configured: the local sources are a complete fallback, and none of
+    /// these is a fault worth marking an account unhealthy for.
+    @discardableResult
+    func refreshCodexPeerReadings(
+        for credentials: [OAuthCredential] = [], force: Bool = false,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) async -> Int {
+        let hosts = CodexPeerReadings.resolveHosts(
+            environment: environment,
+            dbDirectory: (dbPath as NSString).deletingLastPathComponent
+        )
+        guard !hosts.isEmpty else {
+            codexPeerReadingsByProfile = [:]
+            return 0
+        }
+        // A host with no snapshot-mode rows has no profile to join a peer
+        // reading onto — the same gate the live check applies (#230).
+        guard credentials.isEmpty || credentials.contains(where: { $0.isCodexSnapshotOnly }) else {
+            return 0
+        }
+        let now = Date()
+        if !force, let last = lastCodexPeerCheck, now.timeIntervalSince(last) < codexPeerInterval {
+            return 0
+        }
+        // Stamped before the run, not after: a slow or failing peer must not
+        // become a hot loop (the same rule the live check follows).
+        lastCodexPeerCheck = now
+        guard let ssh = AccountSyncRemote.resolveSSHBinary(environment: environment) else {
+            if !reportedCodexPeerSSHUnavailable {
+                reportedCodexPeerSSHUnavailable = true
+                flog.info("Codex peer readings unavailable (no ssh binary; set "
+                          + "\(AccountSyncRemote.sshOverrideEnvKey) to override) — using local sources only",
+                          category: fcat)
+            }
+            return 0
+        }
+
+        var merged: [String: CodexPeerReadings.Reading] = [:]
+        for host in hosts {
+            guard let document = await CodexPeerReadings.run(host: host, sshBinary: ssh) else { continue }
+            merged = CodexPeerReadings.merging(document, into: merged)
+        }
+        codexPeerReadingsByProfile = merged
+        flog.info("Codex peer readings: \(merged.count) profile(s) freshest across \(hosts.count) peer(s)",
+                  category: fcat)
+        return merged.count
+    }
+
+    // MARK: - Stored Codex reading summary (for `codex list`)
+
+    /// One account's newest stored reading, reduced to what `codex list`'s
+    /// snapshot line prints. The raw `source` tag is what names a peer-fed
+    /// reading's origin host (#320).
+    struct CodexReadingSummary {
+        let observedAt: Date
+        let sessionPercent: Double?
+        let weeklyPercent: Double?
+        let source: String?
+
+        /// The peer host when this reading was mirrored from one
+        /// (`source` = `peer:<host>`), else nil.
+        var peerHost: String? {
+            guard let source = source,
+                  source.hasPrefix(CodexPeerReadings.peerSourcePrefix) else { return nil }
+            let host = String(source.dropFirst(CodexPeerReadings.peerSourcePrefix.count))
+            return host.isEmpty ? nil : host
+        }
+    }
+
+    /// The newest non-synthetic `usage_history` row for an account, as a
+    /// `CodexReadingSummary`. Nil when the row (or the database) is absent.
+    /// Read-only, resolved against the same database the poller writes.
+    func latestCodexReading(accountId: String) -> CodexReadingSummary? {
+        guard FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath, readonly: true) else { return nil }
+        do {
+            let stmt = try db.prepare("""
+                SELECT timestamp, session_percent, weekly_all_percent, raw_data
+                FROM usage_history WHERE account_id = ? AND is_synthetic = 0
+                ORDER BY timestamp DESC, rowid DESC LIMIT 1
+            """)
+            for row in stmt.bind(accountId) {
+                guard let timestamp = UsageRecord.parseISO(row[0] as? String) else { return nil }
+                let source = OpenAIUsageResponse.storedReadingSource(row[3] as? String)
+                return CodexReadingSummary(
+                    observedAt: timestamp,
+                    sessionPercent: row[1] as? Double,
+                    weeklyPercent: row[2] as? Double,
+                    source: source
+                )
+            }
+            return nil
+        } catch {
+            flog.error("latestCodexReading failed: \(error.localizedDescription)", category: fcat)
+            return nil
+        }
     }
 
     /// Whether `home` lives under Loom's Codex profile root, i.e. is owned by
@@ -2079,6 +2250,8 @@ class OAuthPoller: ObservableObject {
         // Warmed before the loop so every snapshot-mode row in this pass reads
         // the same report, rather than one probe per account (#230).
         await refreshLoomCodexLiveReadings(for: credentials)
+        // And the peers fetched once per cycle too, not once per account (#320).
+        await refreshCodexPeerReadings(for: credentials)
 
         for credential in credentials {
             await pollWithRetry(credential)
@@ -2099,6 +2272,7 @@ class OAuthPoller: ObservableObject {
         // Self-throttling on its own cadence, so calling it every tick is cheap
         // when it is not due (#230).
         await refreshLoomCodexLiveReadings(for: credentials)
+        await refreshCodexPeerReadings(for: credentials)
 
         let now = Date()
         var polled = 0
