@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-11-19
+
+- **Issue #326** (closed): Finish the repository-owner rename: stale rjwalters references outside the #323 scope
+
 ### 2026-11-18
 
 - **PR #316**: ci: qualify Build workflow for GitHub merge queues
