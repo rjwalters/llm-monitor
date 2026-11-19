@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-provider tabs in the popover, and `llm-monitor accounts list`** (#297,
+  #302). The popover gains a tab strip (`All` plus one tab per provider, labelled
+  `Name usable/total`) with a summary line such as
+  `14 usable · 3 exhausted · next reset in 2 hrs`. The new read-only
+  `accounts list [--provider claude|codex|zai]` prints the same tally per
+  provider, using exactly the status `ranking.json` exports. A stale, absent, or
+  never-polled account counts as neither usable nor exhausted.
+- **Codex unused limit resets are shown** (#298, #299). `wham/usage` already
+  returned `rate_limit_reset_credits`; it is now decoded. `codex list` prints the
+  count per account, the popover shows a small `N↻` suffix when it is above 0,
+  and `ranking.json` gains an optional `reset_credits` object (omitted when
+  unknown, never 0; `schema` stays 1).
+- **The app flags when an account should spend a stored limit reset** (#303,
+  #304, #305). A read-only advisor (`ResetAdvisor`): it never spends a reset.
+  It flags a weekly window at ≥97% whose natural reset is more than 24 h away
+  while the provider pool is short, or a reset expiring within 14 days. It shows
+  in `ranking.json` (`reset_advice`), an `accounts list` column, the popover row,
+  and an orange marker on the menu-bar percentage. Unknown reset data reads
+  "resets: unknown" in `accounts list`, never 0; the popover row shows only the
+  actionable badges, not the unknown case.
+
+### Fixed
+
+- **Codex usage archives no longer truncate differently on every poll** (#301,
+  #312). Over the 200-field cap, the archived field set depended on dictionary
+  order; keys are now walked in sorted order.
+- **The latest reading no longer shows 0% right after a reset** (#310, #311).
+  The synthetic reset row could share a timestamp with the real row and win the
+  "newest row" read; reads now tie-break on insertion order.
+
 ## [2.2.0] - 2026-11-14
 
 ### Added

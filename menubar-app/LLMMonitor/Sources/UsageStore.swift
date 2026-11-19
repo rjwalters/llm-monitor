@@ -1124,11 +1124,33 @@ class UsageStore: ObservableObject {
     /// recommendation — but two accounts of the same freshness still compare
     /// on their actual figures, so this changes nothing when every account is
     /// fresh (the common case, including every Anthropic-only fixture).
+    ///
+    /// Every sort key is computed **once per account**, before the sort. The
+    /// comparator used to rebuild `rateLimit` (two ISO-8601 parses through
+    /// ICU) on both sides of every comparison, and this getter runs on the
+    /// main thread from the popover's rows, so one redraw cost tens of
+    /// thousands of date parses and beachballed the app.
     var sortedAccountsForPopover: [Account] {
-        let pairs = accounts.map { account in
-            (account: account, usage: latestUsage[account.id])
+        struct Keyed {
+            let account: Account
+            let stale: Bool
+            let effective: Double
+            let reset: TimeInterval
         }
-        let sorted = pairs.sorted { a, b in
+        let keyed = accounts.map { account -> Keyed in
+            // An absent window contributes nothing (rather than a fabricated
+            // 0%), so an OpenAI account reporting only a weekly figure ranks on
+            // that figure. Unchanged for Anthropic rows, which always carry both.
+            let windows = latestUsage[account.id]?.rateLimit
+            return Keyed(
+                account: account,
+                stale: isStale(account),
+                effective: max(windows?.session?.usedPercent ?? 0, windows?.weekly?.usedPercent ?? 0),
+                // Same value `resetSeconds` returns, without re-parsing.
+                reset: windows?.secondsUntilRecovery ?? .greatestFiniteMagnitude
+            )
+        }
+        let sorted = keyed.sorted { a, b in
             // An absent identity (#135) is a placeholder for an account this
             // host doesn't have — it carries no reading at all, so without this
             // gate its empty windows would score as a perfect 0% "most
@@ -1141,21 +1163,10 @@ class UsageStore: ObservableObject {
             // last reported, because that percentage is exactly what's no
             // longer trustworthy. Only breaks the tie when the two sides
             // differ in freshness.
-            let aStale = isStale(a.account)
-            let bStale = isStale(b.account)
-            if aStale != bStale { return !aStale }
+            if a.stale != b.stale { return !a.stale }
 
-            // An absent window contributes nothing (rather than a fabricated
-            // 0%), so an OpenAI account reporting only a weekly figure ranks on
-            // that figure. Unchanged for Anthropic rows, which always carry both.
-            let aWindows = a.usage?.rateLimit
-            let bWindows = b.usage?.rateLimit
-            let aEffective = max(aWindows?.session?.usedPercent ?? 0, aWindows?.weekly?.usedPercent ?? 0)
-            let bEffective = max(bWindows?.session?.usedPercent ?? 0, bWindows?.weekly?.usedPercent ?? 0)
-            if aEffective != bEffective { return aEffective < bEffective }
-            let aReset = UsageStore.resetSeconds(a.usage)
-            let bReset = UsageStore.resetSeconds(b.usage)
-            if aReset != bReset { return aReset < bReset }
+            if a.effective != b.effective { return a.effective < b.effective }
+            if a.reset != b.reset { return a.reset < b.reset }
             // Usage and reset both tie (common for freshly-added or idle
             // accounts that all read 0%): order by natural display name
             // instead of falling through to arbitrary insertion/UUID order.

@@ -3,11 +3,12 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
+_Generated: 2026-11-19T17:35:00Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-_None._
+- **#325**: feat: add in-app update check and one-click self-install for macOS
 
 ## Very Important
 
@@ -31,7 +32,9 @@ _None._
 
 Issues currently being built (`loom:building`).
 
+- **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
+- **#323**: Offer an in-app "Update now" when a newer release is available
 
 ## PRs Awaiting Review
 
@@ -41,9 +44,9 @@ _None._
 
 ## Approved (Awaiting Merge)
 
-PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
+PRs that passed review (`loom:pr`). Held PRs require a human merge decision.
 
-_None._
+- **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
 
 ## Proposed
 
@@ -51,7 +54,9 @@ Issues carrying `loom:curated`.
 
 - **#231**: Live-verify LoomAccountsCheck against a populated 'accounts check --live' report *(curated)* *(held)*
 - **#249**: z.ai seats invisible on Loom workers: also discover keys from Loom's shared api-keys pool (~/.loom/api-keys/zai), show sub-1% burn *(curated)* *(held)*
+- **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization *(curated)*
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
+- **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -65,14 +70,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
+| Operator merge-risk holds | 1 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 0 |
-| Curated | 3 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

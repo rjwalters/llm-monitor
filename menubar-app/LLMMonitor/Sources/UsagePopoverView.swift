@@ -161,44 +161,12 @@ func columnHeading(
 
 // MARK: - Sorting
 
-enum SummarySort: String {
-    case account, headroom, sessionPercent, sessionReset, weeklyPercent, weeklyReset, fablePercent, extraUsage, fresh, token
-
-    /// First-click direction for this column — "best first" intuition.
-    var defaultDirection: SortDirection {
-        switch self {
-        case .headroom: return .desc   // higher score = better, show first
-        default: return .asc           // lower % / sooner reset / fresher / better-status first
-        }
-    }
-}
-
-enum SortDirection: String {
-    case asc, desc
-    func toggled() -> SortDirection { self == .asc ? .desc : .asc }
-}
-
-// `headroomScore` now lives in the portable core (UsageStore.swift) and reads
-// through `UsageRecord.rateLimit`, so the headless Linux daemon scores accounts
-// the same way this popover does.
-
-/// Sort key for the Extra-usage column. Lower = more attention needed.
-/// nil (no probe yet) sorts last.
-func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
-    guard let usage = usage else { return nil }
-    switch usage.extraUsageState {
-    case .unknown:        return nil
-    case .empty:          return 0            // depleted — needs a recharge
-    case .percent(let r): return 1 + r        // metered: lower remaining sorts first
-    case .active:         return 200          // drawing (unmetered/unlimited) — fine
-    case .ready:          return 300          // available, unused
-    case .off:            return 400          // not configured
-    }
-}
-
-// Reset-time sorting now reads `RateLimitWindow.resetAt` (already a `Date`) via
-// `UsageRecord.rateLimit`, so the string-parsing helper that used to live here
-// is gone; `UsageRecord.parseISO` is the single ISO-8601 parse point.
+// The sort vocabulary (`SummarySort`, `SortDirection`), the extra-usage
+// urgency key, the token status rank and the sort pipeline itself now live in
+// the portable core (`PopoverSort.swift`) so `selftest` covers them on every
+// platform, not just where the popover renders (#333). This view resolves the
+// per-render inputs — provider column visibility, the token status lookup —
+// exactly once and hands them to it.
 
 // MARK: - Provider badge
 
@@ -376,19 +344,6 @@ private struct PixelSprite: View {
             }
         }
         .frame(width: cell * CGFloat(columns), height: cell * CGFloat(rows.count))
-    }
-}
-
-/// Lower rank = "better" status (valid first, missing last).
-func tokenStatusRank(_ status: TokenStatus) -> Int {
-    switch status {
-    case .valid: return 0
-    case .refreshing: return 1
-    case .expired: return 2
-    case .revoked: return 3
-    case .error: return 4
-    case .drifted: return 5
-    case .missing: return 6
     }
 }
 
@@ -676,9 +631,22 @@ struct UsagePopoverView: View {
 
     /// Accounts paired with latest usage, sorted by the user-selected column.
     /// Recomputed every render so the table sorts live as usage updates.
+    ///
+    /// The pipeline itself lives in the portable core (`PopoverSort`, #333):
+    /// it resolves the effective column, each populated row's key from a
+    /// single snapshot, and the token status lookup once per sort instead of
+    /// per comparison. This site resolves the two provider-visibility answers
+    /// — the same `SummaryColumns.shows` rule the header, rows and width read
+    /// (#227) — exactly once and hands them in.
     private var sortedRows: [(account: Account, usage: UsageRecord?)] {
-        let pairs = store.accounts.map { ($0, store.latestUsage[$0.id]) }
-        return pairs.sorted { compareRows($0, $1) }
+        PopoverSort.sortedRows(
+            accounts: store.accounts,
+            latestUsage: store.latestUsage,
+            sortBy: sortBy,
+            direction: sortDir,
+            premiumColumnShown: SummaryColumns.shows(.premium, among: visibleProviders),
+            extraColumnShown: SummaryColumns.shows(.extra, among: visibleProviders),
+            tokenStatusByAccount: tokenStatusByAccount)
     }
 
     /// The sorted rows the selected provider tab asks for (#297). The filter
@@ -748,116 +716,6 @@ struct UsagePopoverView: View {
         return map
     }
 
-    /// Final tiebreak when a column's primary comparison is exactly equal
-    /// (common for freshly-added or idle accounts that all read 0%): order by
-    /// natural display name instead of falling through to arbitrary
-    /// insertion/UUID order, and only fall back to account id when even the
-    /// display names are indistinguishable, so the order stays total and
-    /// stable.
-    private func stableTiebreak(_ a: Account, _ b: Account) -> Bool {
-        let cmp = NaturalSort.compare(a.displayName, b.displayName)
-        if cmp != .orderedSame { return cmp == .orderedAscending }
-        return a.id < b.id
-    }
-
-    /// Sort comparator for two rows under the current column/direction.
-    /// Rows without data sort to the bottom regardless of direction.
-    /// The sort actually applied: a column hidden by #227 cannot be the sort
-    /// key the user sees selected, so it falls back to the default.
-    private var effectiveSortBy: SummarySort {
-        switch sortBy {
-        case .fablePercent where !SummaryColumns.shows(.premium, among: visibleProviders),
-             .extraUsage where !SummaryColumns.shows(.extra, among: visibleProviders):
-            return .headroom
-        default:
-            return sortBy
-        }
-    }
-
-    private func compareRows(_ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?)) -> Bool {
-        // Account name sorts naturally: digit runs compare by value, so
-        // agent-10 follows agent-9 instead of landing next to agent-1.
-        if case .account = effectiveSortBy {
-            let cmp = NaturalSort.compare(a.0.displayName, b.0.displayName)
-            if cmp == .orderedSame { return stableTiebreak(a.0, b.0) }
-            return sortDir == .asc
-                ? (cmp == .orderedAscending)
-                : (cmp == .orderedDescending)
-        }
-
-        let (av, bv) = sortValues(a, b, for: effectiveSortBy)
-        switch (av, bv) {
-        case (nil, nil): return stableTiebreak(a.0, b.0)
-        case (nil, _):   return false          // nil rows go last
-        case (_, nil):   return true
-        case let (.some(x), .some(y)):
-            if x != y { return sortDir == .asc ? (x < y) : (x > y) }
-            if case .headroom = effectiveSortBy, let ordered = recoveryTiebreak(a.1, b.1) { return ordered }
-            return stableTiebreak(a.0, b.0)
-        }
-    }
-
-    /// Tiebreak for the Headroom column. Equal scores are the norm at the
-    /// bottom of the table, where every capped account reads 0 — so order those
-    /// by how soon they come back. The gating reset is the weekly one once the
-    /// week is spent, and the session one otherwise: a session window rolling
-    /// over in minutes means nothing to an account that is out for the week.
-    ///
-    /// Returns nil when the two rows are indistinguishable (equal or both
-    /// unknown), leaving the caller to fall through to the name tiebreak.
-    private func recoveryTiebreak(_ a: UsageRecord?, _ b: UsageRecord?) -> Bool? {
-        switch (a?.rateLimit.secondsUntilRecovery, b?.rateLimit.secondsUntilRecovery) {
-        case (nil, nil): return nil
-        case (nil, _):   return false          // unknown recovery goes last
-        case (_, nil):   return true
-        case let (.some(x), .some(y)):
-            if x == y { return nil }
-            // Coming back sooner is the better row, so it leads under the
-            // "best first" direction and trails when the sort is flipped.
-            return sortDir == .desc ? (x < y) : (x > y)
-        }
-    }
-
-    /// Numeric value to compare for each column. `nil` = no data → sorts last.
-    private func sortValues(
-        _ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?),
-        for column: SummarySort
-    ) -> (Double?, Double?) {
-        switch column {
-        case .headroom:
-            return (headroomScore(a.1), headroomScore(b.1))
-        case .sessionPercent:
-            // Read through the shared window model: a provider that reports no
-            // session window yields nil here and sorts last, rather than
-            // pretending to be at 0%.
-            return (a.1?.rateLimit.session?.usedPercent, b.1?.rateLimit.session?.usedPercent)
-        case .weeklyPercent:
-            return (a.1?.rateLimit.weekly?.usedPercent, b.1?.rateLimit.weekly?.usedPercent)
-        case .fablePercent:
-            // Sort by Fable used (asc = most remaining last, matching other % columns).
-            return (a.1?.fablePercent, b.1?.fablePercent)
-        case .extraUsage:
-            // Ascending = "needs attention first": empty → low balance → in use → ready → off.
-            return (extraUsageUrgency(a.1), extraUsageUrgency(b.1))
-        case .sessionReset:
-            return (a.1?.rateLimit.session?.resetAt?.timeIntervalSinceNow,
-                    b.1?.rateLimit.session?.resetAt?.timeIntervalSinceNow)
-        case .weeklyReset:
-            return (a.1?.rateLimit.weekly?.resetAt?.timeIntervalSinceNow,
-                    b.1?.rateLimit.weekly?.resetAt?.timeIntervalSinceNow)
-        case .fresh:
-            // Data age in seconds (lower = fresher). nil usage → nil → sorts last.
-            return (a.1.map { -$0.timestamp.timeIntervalSinceNow },
-                    b.1.map { -$0.timestamp.timeIntervalSinceNow })
-        case .token:
-            let lookup = tokenStatusByAccount
-            return (Double(tokenStatusRank(lookup[a.0.id] ?? .missing)),
-                    Double(tokenStatusRank(lookup[b.0.id] ?? .missing)))
-        case .account:
-            return (nil, nil)  // handled above
-        }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -919,16 +777,25 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil, onAddAccount: onAddAccount)
             } else {
+                // Resolved once per render, not once per row: the tab strip,
+                // header row and every row closure used to re-evaluate each of
+                // these per element (poolTallies walks every account and builds
+                // rateLimit per window, visibleProviders rescans each account).
+                let tallies = poolTallies
+                let providers = visibleProviders
                 ProviderTabStrip(
-                    tabs: providerTabs(poolTallies),
+                    tabs: providerTabs(tallies),
                     selection: $selectedTab,
-                    summary: selectedSummaryLine(poolTallies)
+                    summary: selectedSummaryLine(tallies)
                 )
                 Divider()
-                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: visibleProviders)
+                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: providers)
                 Divider()
 
                 ScrollView {
+                    // Resolved once per render, not once per row: it sorts
+                    // every account, and each row used to ask several times.
+                    let menubarAccountId = store.effectivePrimaryAccountId
                     VStack(spacing: 0) {
                         ForEach(tabRows, id: \.account.id) { item in
                             SummaryRow(
@@ -936,8 +803,9 @@ struct UsagePopoverView: View {
                                 usage: item.usage,
                                 store: store,
                                 oauthPoller: oauthPoller,
-                                visibleProviders: visibleProviders,
-                                poolTally: poolTallies.byProvider[item.account.provider],
+                                isMenubarSelected: item.account.id == menubarAccountId,
+                                visibleProviders: providers,
+                                poolTally: tallies.byProvider[item.account.provider],
                                 onRemove: {
                                     accountToRemove = item.account
                                     showRemoveConfirmation = true
@@ -1400,6 +1268,11 @@ struct SummaryRow: View {
     let usage: UsageRecord?
     let store: UsageStore
     let oauthPoller: OAuthPoller
+    /// True when this row is the one whose usage is shown in the menubar.
+    /// Passed in by the owner, which resolves `store.effectivePrimaryAccountId`
+    /// once per render: computing it here re-sorted every account several
+    /// times per row and froze the main thread.
+    var isMenubarSelected: Bool = false
     /// Providers visible in the table — decides whether this row draws the
     /// provider-specific cells at all (`SummaryColumns.shows`, #227).
     var visibleProviders: Set<AccountProvider> = Set(AccountProvider.allCases)
@@ -1604,11 +1477,6 @@ struct SummaryRow: View {
         return formatter.string(from: usage.timestamp)
     }
 
-    /// True when this row is the one whose usage is shown in the menubar.
-    private var isMenubarSelected: Bool {
-        store.effectivePrimaryAccountId == account.id
-    }
-
     /// True when the user has explicitly pinned this row (vs. just being the
     /// auto-sorted first account). Determines whether re-clicking clears.
     private var isExplicitlyPinned: Bool {
@@ -1622,17 +1490,6 @@ struct SummaryRow: View {
     private var resetAdvice: ResetAdvisor.Advice? {
         guard let usage = displayUsage else { return nil }
         return ResetAdvisor.advise(record: usage, poolTally: poolTally, now: Date())
-    }
-
-    /// True when the row's current reading reports nothing about resets at
-    /// all — the "resets: unknown" case. Every provider's accounts hold
-    /// stored limit resets (the issue's premise), so an unreadable or
-    /// unimplemented feed — a Claude token rejected on scope (#285), an
-    /// `app-server`/rollout Codex reading — is a statement about this
-    /// reading, shown as unknown and never rendered as 0.
-    private var resetsUnknown: Bool {
-        guard displayUsage != nil else { return false }
-        return !ResetAdvisor.resets(from: displayUsage?.resetCredits).isKnown
     }
 
     /// Short badge text for a flagged row. The full reason — and the reset's
@@ -1728,8 +1585,10 @@ struct SummaryRow: View {
                         // #303: the reset advisor's verdict. Orange "use reset"
                         // when a stored reset should be spent (the operator
                         // triggers it by hand), a quieter grey notice when a
-                        // held reset expires soon, and "resets: unknown" when
-                        // the reading carries no reset data — never a zero.
+                        // held reset expires soon. A reading with no reset data
+                        // shows nothing: the row is silent unless there is
+                        // something to act on (a per-row "resets: unknown" was
+                        // noise on every account and was removed).
                         if let advice = resetAdvice, advice.state != .none {
                             Text(resetBadgeText(advice))
                                 .font(.caption2)
@@ -1746,11 +1605,6 @@ struct SummaryRow: View {
                                     )
                                 )
                                 .help(resetAdviceHelp(advice))
-                        } else if resetsUnknown {
-                            Text("resets: unknown")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .help("This reading carries no reset-credit data — unknown, not zero (e.g. an app-server or rollout reading).")
                         }
                     }
                     .opacity(isAbsent ? 0.6 : 1.0)
