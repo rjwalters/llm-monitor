@@ -36,6 +36,10 @@ enum SelfTest {
         ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
         ("PoolInputAssembly", { testPoolInputAssembly() }),
         ("ResetAdvisor", { testResetAdvisor() }),
+        ("UpdateVersionComparison", { testUpdateVersionComparison() }),
+        ("UpdateFeedSelection", { testUpdateFeedSelection() }),
+        ("UpdateCheckerStateTransitions", { testUpdateCheckerStateTransitions() }),
+        ("SHA256KnownVectors", { testSHA256KnownVectors() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
         ("MissingSessionWindow", { testMissingSessionWindow() }),
@@ -1065,6 +1069,222 @@ enum SelfTest {
             ),
             "resets: unknown",
             "a reading with no reset-credit archive says unknown, never 0")
+    }
+
+    // MARK: - In-app update selection (#323)
+
+    /// Version arithmetic behind "strictly newer": zero-padded component
+    /// comparison, strict inequality, and malformed-never-newer (the failure
+    /// mode of the old `compactMap { Int($0) }` comparer, which silently
+    /// dropped the "-rc1" component and ranked prereleases as releases).
+    private static func testUpdateVersionComparison() {
+        expect(Version.isNewer("2.10.0", than: "2.9.0"), "2.10.0 beats 2.9.0 numerically, not lexically")
+        expect(Version.isNewer("2.2.1", than: "2.2.0"), "patch bump is newer")
+        expect(Version.isNewer("3.0", than: "2.99.99"), "major bump wins over lower components")
+        expect(!Version.isNewer("2.2", than: "2.2.0"), "2.2 equals 2.2.0 (zero padding)")
+        expect(!Version.isNewer("2.1.9", than: "2.2.0"), "older release is not newer")
+        expect(!Version.isNewer("2.1.0-rc1", than: "2.1.0"), "prerelease-suffixed tag is malformed, never newer")
+        expect(!Version.isNewer("release-2026", than: "2.0.0"), "non-numeric tag is malformed, never newer")
+        expect(!Version.isNewer("2.1.0", than: "release-9"), "malformed current version is never superseded")
+        expectEqual(Version.parse("2.10.0"), [2, 10, 0], "well-formed version parses to components")
+        expectEqual(Version.parse("v2.10.0"), nil, "parse takes the bare version; tag stripping is ReleaseFeed's job")
+        expectEqual(Version.parse(""), nil, "empty string is malformed")
+        expectEqual(Version.parse("2..3"), nil, "empty component is malformed")
+        expectEqual(Version.parse("2.-1.0"), nil, "negative component is malformed")
+        expectEqual(Version.parse("2.x.0"), nil, "non-numeric component is malformed")
+        expectEqual(Version.parse("99999999999999999999.0"), nil, "overflowing component is malformed")
+        expectEqual(ReleaseFeed.strippedTag("v2.10.0"), "2.10.0", "leading v is stripped")
+        expectEqual(ReleaseFeed.strippedTag("V2.10.0"), "2.10.0", "leading capital V is stripped")
+        expectEqual(ReleaseFeed.strippedTag("release-2.10.0"), nil, "prefixed tag stays malformed")
+        expectEqual(ReleaseFeed.strippedTag("v2.10.0-rc1"), nil, "suffixed tag stays malformed")
+    }
+
+    /// A GitHub Releases payload shaped like the real feed (verified against
+    /// `api.github.com/repos/2AMLogic/llm-monitor/releases/tags/v2.1.0`,
+    /// 2026-11: `LLMMonitor.zip` plus the two Linux binaries, each carrying a
+    /// `sha256:` digest), with the knobs the selection tests vary.
+    private static func releaseFeedFixture(
+        tag: String,
+        prerelease: Bool = false,
+        draft: Bool = false,
+        macOSAssetName: String? = ReleaseFeed.macOSAssetName,
+        digest: String? = "sha256:" + String(repeating: "ab", count: 32),
+        downloadURL: String = "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/LLMMonitor.zip"
+    ) -> Data {
+        var assets: [[String: Any]] = []
+        if let macOSAssetName {
+            var asset: [String: Any] = [
+                "name": macOSAssetName,
+                "browser_download_url": downloadURL,
+                "size": 2_563_992,
+            ]
+            if let digest { asset["digest"] = digest }
+            assets.append(asset)
+        }
+        // The Linux binaries ride along exactly as the real feed has them:
+        // the selector must skip them, not trip over them.
+        assets.append([
+            "name": "llm-monitor-linux-x64",
+            "browser_download_url": "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/llm-monitor-linux-x64",
+            "digest": "sha256:" + String(repeating: "cd", count: 32),
+        ])
+        assets.append([
+            "name": "claude-monitor-linux-x64",
+            "browser_download_url": "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/claude-monitor-linux-x64",
+            "digest": "sha256:" + String(repeating: "ef", count: 32),
+        ])
+        let payload: [String: Any] = [
+            "tag_name": tag,
+            "prerelease": prerelease,
+            "draft": draft,
+            "html_url": "https://github.com/2AMLogic/llm-monitor/releases/tag/\(tag)",
+            "assets": assets,
+        ]
+        // A fixture builder may never fail silently.
+        return try! JSONSerialization.data(withJSONObject: payload)
+    }
+
+    private static func expectUptodate(_ payload: Data, current: String, _ label: String) {
+        let outcome = ReleaseFeed.selection(currentVersion: current, payload: payload, errorText: nil)
+        expectEqual(outcome, .uptodate, label)
+    }
+
+    private static func expectUpdateCheckFailure(
+        payload: Data?, errorText: String?, current: String, _ label: String
+    ) {
+        checks += 1
+        guard case .failed = ReleaseFeed.selection(currentVersion: current, payload: payload, errorText: errorText) else {
+            failures.append(label)
+            return
+        }
+    }
+
+    /// Release selection over fixtures: strictly-newer stable releases with a
+    /// verifiable macOS archive offer; equal/older, prereleases (flagged or
+    /// merely shaped), malformed tags, missing assets/digests and non-HTTPS
+    /// URLs clear the offer; unreadable feeds and network errors surface a
+    /// reason instead (#323's curated fixture matrix).
+    private static func testUpdateFeedSelection() {
+        let current = "2.9.0"
+        let happy = releaseFeedFixture(tag: "v2.10.0")
+
+        // The happy path: strictly newer stable release with a digest-verified zip.
+        guard case .offer(let info) = ReleaseFeed.selection(currentVersion: current, payload: happy, errorText: nil) else {
+            expect(false, "newer stable release with a digest-verified zip offers an update")
+            return
+        }
+        expectEqual(info.version, "2.10.0", "offered version strips the leading v")
+        expectEqual(info.sha256, String(repeating: "ab", count: 32), "offered digest is the lowercase hex part")
+        expect(info.archiveURL.hasPrefix("https://"), "offered archive URL is the asset's https URL")
+        expectEqual(info.releaseURL, "https://github.com/2AMLogic/llm-monitor/releases/tag/v2.10.0",
+                    "release page URL comes from html_url")
+
+        // Equal and older versions clear the offer (an equal version must
+        // clear, not merely fail to set — that is the "clears the offer" AC).
+        expectUptodate(releaseFeedFixture(tag: "v2.9.0"), current: current, "equal version is up-to-date")
+        expectUptodate(releaseFeedFixture(tag: "v2.9"), current: current, "equal version with fewer components is up-to-date")
+        expectUptodate(releaseFeedFixture(tag: "v2.9.1"), current: "2.10.0", "older version is up-to-date")
+
+        // Prereleases never offer — flagged by GitHub…
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", prerelease: true), current: current, "prerelease flag suppresses the offer")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", draft: true), current: current, "draft flag suppresses the offer")
+        // …and merely shaped like one even when mis-flagged stable.
+        expectUptodate(releaseFeedFixture(tag: "v2.11.0-rc1"), current: current, "prerelease-shaped tag never offers even when flagged stable")
+
+        // Malformed tags never offer and never crash.
+        expectUptodate(releaseFeedFixture(tag: "release-2026"), current: current, "non-numeric tag never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.x.0"), current: current, "non-numeric component never offers")
+        expectUpdateCheckFailure(payload: releaseFeedFixture(tag: ""), errorText: nil, current: current,
+                                 "empty tag_name is a failed check, not a silent all-clear")
+
+        // No verifiable macOS archive → no offer: the updater refuses to
+        // install bytes it cannot check or fetch securely.
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", macOSAssetName: nil), current: current, "feed without the macOS archive never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: nil), current: current, "asset without a digest never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: "sha256:" + String(repeating: "zz", count: 32)), current: current, "non-hex digest never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: "sha256:abc"), current: current, "truncated digest never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: "md5:" + String(repeating: "ab", count: 16)), current: current, "non-SHA-256 digest never offers")
+        expectUptodate(
+            releaseFeedFixture(tag: "v2.10.0", downloadURL: "http://github.com/2AMLogic/llm-monitor/releases/download/fixture/LLMMonitor.zip"),
+            current: current, "non-https download URL never offers")
+
+        // A check that cannot read the feed is a failure with a reason, not
+        // "up-to-date": a failed re-check must not clear a standing offer.
+        expectUpdateCheckFailure(payload: nil, errorText: "offline", current: current, "network error is a failed check")
+        expectUpdateCheckFailure(payload: Data("not json".utf8), errorText: nil, current: current, "garbage payload is a failed check")
+        expectUpdateCheckFailure(payload: Data("{\"message\":\"Not Found\"}".utf8), errorText: nil, current: current, "tagless 404 body is a failed check")
+
+        // Digest parsing details.
+        expectEqual(ReleaseFeed.parseDigest("sha256:" + String(repeating: "0a", count: 32)),
+                    String(repeating: "0a", count: 32), "sha256 digest parses to lowercase hex")
+        expectEqual(ReleaseFeed.parseDigest("SHA256:" + String(repeating: "0A", count: 32)),
+                    String(repeating: "0a", count: 32), "digest parsing is case-insensitive")
+        expectEqual(ReleaseFeed.parseDigest("sha256:abc"), nil, "short digest is rejected")
+        expectEqual(ReleaseFeed.parseDigest("sha256:" + String(repeating: "0a", count: 33)), nil, "overlong digest is rejected")
+        expectEqual(ReleaseFeed.parseDigest(nil), nil, "absent digest is rejected")
+    }
+
+    /// The checker's published state machine, driven offline through the same
+    /// `apply` seam the network path uses: offers show, up-to-date clears, a
+    /// failed re-check keeps a standing offer, and install progress can never
+    /// resurrect a failed state (#323).
+    private static func testUpdateCheckerStateTransitions() {
+        let checker = UpdateChecker()
+        let offer = UpdateInfo(
+            version: "9.9.9",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.9",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.9/LLMMonitor.zip",
+            sha256: String(repeating: "ab", count: 32))
+
+        expect(!checker.hasNotice, "fresh checker has nothing to show")
+        expectEqual(checker.installState, UpdateInstallState.idle, "fresh checker is idle")
+
+        checker.apply(.offer(offer))
+        expect(checker.hasNotice, "offer publishes availability")
+        expectEqual(checker.updateAvailable, offer, "the offered candidate is the applied one")
+
+        checker.apply(.failed("offline"))
+        expectEqual(checker.updateAvailable, offer, "a failed re-check keeps the standing offer")
+        expectEqual(checker.lastCheckFailure, "offline", "a failed check records its reason")
+
+        checker.apply(.uptodate)
+        expect(!checker.hasNotice, "an up-to-date check clears offer and failure")
+
+        checker.apply(.failed("offline"))
+        expect(checker.hasNotice, "a failed check alone is still visible")
+
+        checker.beginInstall()
+        expectEqual(checker.installState, UpdateInstallState.running("Downloading…"), "install begins as running")
+        checker.updateInstallProgress("Verifying…")
+        expectEqual(checker.installState, .running("Verifying…"), "progress advances the label")
+        checker.failInstall("digest mismatch")
+        expectEqual(checker.installState, .failed("digest mismatch"), "failure records its reason")
+        checker.updateInstallProgress("Installing…")
+        expectEqual(checker.installState, .failed("digest mismatch"), "progress after failure is ignored")
+        checker.apply(.offer(offer))
+        expectEqual(checker.installState, .idle, "a fresh offer resets stale install state")
+    }
+
+    /// The hand-rolled SHA-256 against published FIPS 180-4 vectors — what
+    /// makes `AppUpdater`'s digest comparison trustworthy despite the
+    /// package's zero-dependency rule. Vectors cross-checked with
+    /// coreutils `sha256sum`.
+    private static func testSHA256KnownVectors() {
+        expectEqual(SHA256.hex(Data()),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "empty-message vector")
+        expectEqual(SHA256.hex(Data("abc".utf8)),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                    "abc vector")
+        expectEqual(SHA256.hex(Data("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".utf8)),
+                    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+                    "55-byte vector (length field pushes into a second block)")
+        expectEqual(SHA256.hex(Data(repeating: 0x61, count: 64)),
+                    "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+                    "exactly-one-block message")
+        expectEqual(SHA256.hex(Data(repeating: 0x61, count: 128)),
+                    "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e",
+                    "multi-block message")
     }
 
     // MARK: - Window model
