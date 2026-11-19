@@ -39,6 +39,7 @@ enum SelfTest {
         ("UpdateVersionComparison", { testUpdateVersionComparison() }),
         ("UpdateFeedSelection", { testUpdateFeedSelection() }),
         ("UpdateCheckerStateTransitions", { testUpdateCheckerStateTransitions() }),
+        ("UpdateSignatureGate", { testUpdateSignatureGate() }),
         ("SHA256KnownVectors", { testSHA256KnownVectors() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
@@ -1263,6 +1264,120 @@ enum SelfTest {
         expectEqual(checker.installState, .failed("digest mismatch"), "progress after failure is ignored")
         checker.apply(.offer(offer))
         expectEqual(checker.installState, .idle, "a fresh offer resets stale install state")
+    }
+
+    /// The signature gate over a staged update (operator ruling 2026-11-19):
+    /// every refusal branch — codesign verification error, Gatekeeper
+    /// rejection, unsigned release, wrong team, unsigned *running* app —
+    /// refuses, and only a fully-verified same-team bundle installs. Plus
+    /// the `codesign -dv` team parse and the checker's degrade-to-manual
+    /// state, which must survive a same-version re-offer and clear on a new
+    /// release.
+    private static func testUpdateSignatureGate() {
+        // The one input that installs: both verifications pass and the teams
+        // match — the team read from the *running* bundle, not the release.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: "W2G9X7KLQC")),
+            .install, "verified same-team bundle installs")
+
+        // Verification error: codesign --verify exited non-zero (unsigned or
+        // self-inconsistent). The ruling's "verification fails" branch.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: false, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: "W2G9X7KLQC")),
+            .refuse(.codesignVerifyFailed), "codesign verification error refuses")
+
+        // Gatekeeper rejection: signed but spctl would not run it (e.g.
+        // Developer ID without notarization).
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: false,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: "W2G9X7KLQC")),
+            .refuse(.gatekeeperRejected), "Gatekeeper rejection refuses")
+
+        // Unsigned release: no team identifier at all (nil, ad-hoc "not
+        // set", or empty — all the same answer). The ruling's "release is
+        // not Developer ID signed" branch, and today's actual release shape.
+        for staged in [nil, "", "not set", "NOT SET"] {
+            expectEqual(SignatureGate.decide(SignatureGate.Input(
+                codesignVerified: true, gatekeeperAccepted: true,
+                stagedTeamIdentifier: staged, runningTeamIdentifier: "W2G9X7KLQC")),
+                .refuse(.releaseNotDeveloperIDSigned), "unsigned release refuses (staged team \(staged ?? "nil"))")
+        }
+
+        // Wrong team: the release is signed, but by someone else. The
+        // ruling's "wrong team" branch.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "XXXXXXXXXX", runningTeamIdentifier: "W2G9X7KLQC")),
+            .refuse(.teamMismatch(staged: "XXXXXXXXXX", running: "W2G9X7KLQC")),
+            "release signed by a different team refuses")
+
+        // Unsigned *running* app: provenance continuity cannot be
+        // established, so even a properly signed release refuses — the
+        // one-time hop to a signed build happens from the release page.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: nil)),
+            .refuse(.teamMismatch(staged: "W2G9X7KLQC", running: nil)),
+            "signed release over an unsigned running app refuses")
+
+        // Refusals are checked in the ruling's order: a bundle that fails
+        // codesign never reaches the (meaningless) team comparison.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: false, gatekeeperAccepted: false,
+            stagedTeamIdentifier: nil, runningTeamIdentifier: nil)),
+            .refuse(.codesignVerifyFailed), "the most fundamental failure is reported first")
+
+        // Team-identifier parsing from `codesign -dv` stderr.
+        let codesignOutput = """
+            Executable=/Applications/LLMMonitor.app/Contents/MacOS/LLMMonitor
+            Identifier=com.llm-monitor.app
+            Format=app bundle with Mach-O universal (x86_64 arm64)
+            CodeDirectory v=20400 size=582 flags=0x2(adhoc) hashes=11+5
+            TeamIdentifier=not set
+            """
+        expectEqual(SignatureGate.parseTeamIdentifier(from: codesignOutput), nil,
+                    "ad-hoc \"not set\" team parses to nil")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: """
+            Identifier=com.llm-monitor.app
+            TeamIdentifier=W2G9X7KLQC
+            Sealed Resources=none
+            """), "W2G9X7KLQC", "a real Developer ID team identifier parses")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: "code object is not signed at all"), nil,
+                    "unsigned bundle output parses to nil")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: ""), nil,
+                    "empty output parses to nil")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: "  TeamIdentifier=W2G9X7KLQC  \n"), "W2G9X7KLQC",
+                    "team parse trims surrounding whitespace")
+
+        // The degrade-to-manual state: not an install failure, offered
+        // version-scoped so a 24h re-check of the same refused release does
+        // not resurrect a button that would only download and refuse again.
+        let checker = UpdateChecker()
+        let unsignedOffer = UpdateInfo(
+            version: "9.9.9",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.9",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.9/LLMMonitor.zip",
+            sha256: String(repeating: "ab", count: 32))
+        let signedOffer = UpdateInfo(
+            version: "9.9.10",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.10",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.10/LLMMonitor.zip",
+            sha256: String(repeating: "cd", count: 32))
+        checker.apply(.offer(unsignedOffer))
+        checker.beginInstall()
+        checker.degradeToManualUpdate(SignatureGate.Refusal.releaseNotDeveloperIDSigned.shortReason)
+        expectEqual(checker.installState, .idle, "a signature refusal is not a failed install")
+        expectEqual(checker.manualUpdateReason, "the release is not Developer ID signed",
+                    "the refusal reason is the manual-update line")
+        expect(checker.updateAvailable != nil, "the offer stands after a refusal")
+        checker.apply(.offer(unsignedOffer))
+        expectEqual(checker.manualUpdateReason, "the release is not Developer ID signed",
+                    "re-offering the same release keeps its refusal")
+        checker.apply(.offer(signedOffer))
+        expectEqual(checker.manualUpdateReason, nil,
+                    "offering a different release clears the refusal for a fresh chance")
     }
 
     /// The hand-rolled SHA-256 against published FIPS 180-4 vectors — what

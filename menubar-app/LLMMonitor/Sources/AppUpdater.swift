@@ -5,12 +5,15 @@ import Foundation
 
 /// One-click self-install of a newer release (#323): download the
 /// `LLMMonitor.zip` asset over HTTPS, verify the bytes against the release's
-/// SHA-256 digest, stage and validate the bundle, replace the installed
-/// bundle at its current path, and relaunch once this instance has exited.
-/// The relaunch handoff waits for this process to disappear before opening
-/// the new bundle, which is strictly after `InstanceLock`'s flock releases
-/// at process exit — so the new version starts cleanly, never as a rejected
-/// "already running".
+/// SHA-256 digest, stage the bundle, pass the signature gate — `codesign
+/// --verify --deep --strict`, `spctl --assess --type execute`, and a
+/// Developer ID team identifier equal to the running bundle's own (operator
+/// ruling 2026-11-19: the checksum proves integrity, not origin) — validate
+/// id and version, replace the installed bundle at its current path, and
+/// relaunch once this instance has exited. The relaunch handoff waits for
+/// this process to disappear before opening the new bundle, which is
+/// strictly after `InstanceLock`'s flock releases at process exit — so the
+/// new version starts cleanly, never as a rejected "already running".
 ///
 /// Nothing here runs unless the user clicks "Update now"; the periodic check
 /// is read-only (`UpdateChecker.checkForUpdates`). Every failure path leaves
@@ -31,14 +34,26 @@ final class AppUpdater {
         case notHTTPS
         case downloadFailed(String)
         case digestMismatch
+        case signatureRefusal(SignatureGate.Refusal)
         case extractionFailed(Int32)
         case quarantineClearFailed(Int32)
         case bundleMissing
         case bundleIdentityUnexpected(identifier: String, version: String, expectedIdentifier: String, expectedVersion: String)
         case notAnInstalledBundle
+        case toolNeverExited(String)
         case replaceFailed(String)
         case restoreFailed(String)
         case relaunchFailed(String)
+
+        /// True for the one failure class that is deliberately *not* an
+        /// install failure: the signature gate refused the staged bundle, so
+        /// the app degrades to update-check-only (offer stays, updating
+        /// happens from the release page) instead of showing a Retry that
+        /// could only download and refuse again.
+        var isSignatureRefusal: Bool {
+            if case .signatureRefusal = self { return true }
+            return false
+        }
 
         /// The one-line reason every surface shows. Deliberately short: the
         /// popover has one caption-height line for it, and the actionable
@@ -51,6 +66,8 @@ final class AppUpdater {
                 return "download failed (\(why))"
             case .digestMismatch:
                 return "the downloaded archive did not match the release checksum"
+            case .signatureRefusal(let refusal):
+                return refusal.shortReason
             case .extractionFailed(let status):
                 return "could not extract the downloaded archive (ditto exit \(status))"
             case .quarantineClearFailed(let status):
@@ -61,6 +78,8 @@ final class AppUpdater {
                 return "the archive is not this app (bundle identifier or version mismatch)"
             case .notAnInstalledBundle:
                 return "this is not an installed app bundle — reinstall from LLMMonitor.zip to self-update"
+            case .toolNeverExited(let tool):
+                return "a helper tool (\(tool)) did not exit after being stopped"
             case .replaceFailed(let why):
                 return "could not replace the installed app (\(why))"
             case .restoreFailed(let backupPath):
@@ -145,16 +164,38 @@ final class AppUpdater {
             let stagedBundle = URL(fileURLWithPath: extractPath)
                 .appendingPathComponent("LLMMonitor.app", isDirectory: true)
             guard fm.fileExists(atPath: stagedBundle.path) else { throw InstallError.bundleMissing }
+
+            // 5. Signature gate (operator ruling 2026-11-19): the checksum
+            //    above proves integrity, not origin — it comes from the same
+            //    release as the archive — so the staged bundle must verify
+            //    with codesign, be accepted by Gatekeeper, and carry the
+            //    same Developer ID team as the *running* bundle before
+            //    anything is installed or de-quarantined. A refusal throws
+            //    `signatureRefusal`, which the catch below maps to
+            //    update-check-only (offer stays, release page opens) — never
+            //    an install, never a quarantine strip.
+            checker.updateInstallProgress("Verifying signature…")
+            let gateInput = await Self.measureSignatureGate(staged: stagedBundle, running: installedURL)
+            switch SignatureGate.decide(gateInput) {
+            case .install:
+                break
+            case .refuse(let refusal):
+                throw InstallError.signatureRefusal(refusal)
+            }
+
+            // 6. Quarantine clear — only now, on a bundle the signature gate
+            //    just verified: quarantine is never stripped from an
+            //    unverified bundle (ruling item 2).
             checker.updateInstallProgress("Preparing…")
             try await Self.clearQuarantine(at: stagedBundle)
             try Self.validateStagedBundle(stagedBundle, expectedVersion: info.version)
 
-            // 5. Replace at the installed path, keeping a same-volume backup
+            // 7. Replace at the installed path, keeping a same-volume backup
             //    to restore from if the swap fails.
             checker.updateInstallProgress("Installing…")
             try Self.replaceInstalledBundle(installedURL, with: stagedBundle)
 
-            // 6. Relaunch: a detached helper waits for this process to exit —
+            // 8. Relaunch: a detached helper waits for this process to exit —
             //    which is what releases the instance lock — then opens the
             //    new bundle. Success never returns from here.
             checker.updateInstallProgress("Relaunching…")
@@ -172,6 +213,19 @@ final class AppUpdater {
             // was refused (no delegate cancels termination today).
             throw InstallError.relaunchFailed("the app did not terminate")
         } catch {
+            // A signature-gate refusal is not an install failure: nothing is
+            // wrong with the machine, the release simply may not be
+            // one-click installed (unsigned, wrongly signed, or Gatekeeper
+            // rejected). Degrade to update-check-only — the offer stays and
+            // the user updates from the release page (ruling item 2).
+            if let installError = error as? InstallError, installError.isSignatureRefusal {
+                let reason = installError.shortReason
+                flog.warning("self-update refused by the signature gate: \(reason) — degrading to update-check-only", category: "Update")
+                checker.degradeToManualUpdate(reason)
+                try? FileManager.default.removeItem(atPath: stagingPath)
+                inFlight = false
+                return
+            }
             let reason = (error as? InstallError)?.shortReason ?? error.localizedDescription
             flog.warning("self-update failed: \(reason)", category: "Update")
             checker.failInstall(reason)
@@ -189,15 +243,53 @@ final class AppUpdater {
         return url
     }
 
-    /// Strip the quarantine attribute URLSession stamps on downloads. This
-    /// app ships unsigned, so a quarantined replacement would put the user
-    /// back into the right-click→Open Gatekeeper dance the updater exists to
-    /// remove — this step is required, not cosmetic. `xattr -c` succeeds
-    /// (exit 0) when there is nothing to clear; there are no signatures or
-    /// other attributes worth preserving on an unsigned bundle.
+    /// Strip the quarantine attribute URLSession stamps on downloads. Runs
+    /// **only after** the signature gate verified the bundle (ruling item 2:
+    /// never strip quarantine from an unverified bundle), so the
+    /// right-click→Open Gatekeeper dance this removes is one a verified,
+    /// Gatekeeper-accepted bundle would have passed anyway. `xattr -c`
+    /// succeeds (exit 0) when there is nothing to clear.
     private static func clearQuarantine(at bundle: URL) async throws {
         let status = try await runTool("/usr/bin/xattr", ["-r", "-c", bundle.path])
         guard status == 0 else { throw InstallError.quarantineClearFailed(status) }
+    }
+
+    // MARK: Signature gate (operator ruling 2026-11-19)
+
+    /// Measure everything `SignatureGate.decide` needs about the staged
+    /// bundle and the *running* one. A verification tool that fails to run or
+    /// never exits folds into its measured answer (`false` / nil team) with a
+    /// log line rather than a thrown error: the gate's contract is that any
+    /// failure to verify is a refusal, never an install.
+    private static func measureSignatureGate(staged: URL, running: URL) async -> SignatureGate.Input {
+        var input = SignatureGate.Input()
+        do {
+            input.codesignVerified = try await runTool(
+                "/usr/bin/codesign", ["--verify", "--deep", "--strict", staged.path],
+                timeout: 120) == 0
+        } catch {
+            FileLogger.shared.warning("codesign --verify could not run for the staged bundle: \(error.localizedDescription)", category: "Update")
+        }
+        do {
+            input.gatekeeperAccepted = try await runTool(
+                "/usr/sbin/spctl", ["--assess", "--type", "execute", staged.path],
+                timeout: 120) == 0
+        } catch {
+            FileLogger.shared.warning("spctl --assess could not run for the staged bundle: \(error.localizedDescription)", category: "Update")
+        }
+        input.stagedTeamIdentifier = await teamIdentifier(of: staged)
+        input.runningTeamIdentifier = await teamIdentifier(of: running)
+        return input
+    }
+
+    /// The Developer ID team identifier `codesign -dv` reports for a bundle
+    /// (nil when unsigned, ad-hoc, or unreadable). `codesign` writes its
+    /// details to stderr, which `runToolDetailed` captures.
+    private static func teamIdentifier(of bundle: URL) async -> String? {
+        guard let result = try? await runToolDetailed(
+            "/usr/bin/codesign", ["-dv", "--verbose=4", bundle.path],
+            timeout: 120), result.status == 0 else { return nil }
+        return SignatureGate.parseTeamIdentifier(from: result.stderrText)
     }
 
     /// The staged bundle must advertise this app's bundle identifier and the
@@ -266,6 +358,10 @@ final class AppUpdater {
     /// gone (bounding the wait, then opening regardless), then `open`s the
     /// replaced bundle. A spawned child is not killed by its parent's exit,
     /// and the app has no controlling terminal, so no SIGHUP reaches it.
+    /// The bundle path travels as `$1`, never interpolated into the script
+    /// body — inside double quotes `sh` still expands `$`/backticks and a
+    /// `"` ends the quoting, and a failed handoff is the one install failure
+    /// that reports nothing (#327).
     private static func relaunchAfterExit(opening bundle: URL) async throws {
         let pid = getpid()
         let script = """
@@ -273,12 +369,12 @@ final class AppUpdater {
           kill -0 \(pid) 2>/dev/null || break
           sleep 0.2
         done
-        exec /usr/bin/open "\(bundle.path)"
+        exec /usr/bin/open "$1"
         """
         SubprocessIO.ignoreSIGPIPE()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", script]
+        process.arguments = ["-c", script, "llm-monitor-relaunch", bundle.path]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -298,9 +394,20 @@ final class AppUpdater {
     /// dedicated `PipeDrain` threads, and the wait suspends via `Task.sleep`
     /// polling — never `Process.waitUntilExit()`, which spins a CFRunLoop
     /// and hangs off the main thread.
+    @discardableResult
     private static func runTool(
         _ executable: String, _ arguments: [String], timeout: TimeInterval = 180
     ) async throws -> Int32 {
+        try await runToolDetailed(executable, arguments, timeout: timeout).status
+    }
+
+    /// `runTool` with the child's captured output — what the signature
+    /// gate's team-identifier read needs (`codesign -dv` writes to stderr).
+    /// Output is snapshotted after the drains observed EOF, so nothing ever
+    /// blocks the main actor on a pipe.
+    private static func runToolDetailed(
+        _ executable: String, _ arguments: [String], timeout: TimeInterval = 180
+    ) async throws -> (status: Int32, stdoutText: String, stderrText: String) {
         SubprocessIO.ignoreSIGPIPE()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -325,13 +432,30 @@ final class AppUpdater {
                 process.terminate()
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                // Wait for the kill to land before touching
+                // `terminationStatus`: reading it while the child is still
+                // unreaped is the crash the operator ruling names (item 3) —
+                // terminate-then-wait, never read-while-running. SIGKILL is
+                // unconditional, so this normally clears on the first poll;
+                // a child that somehow survives it is reported, not read.
+                let exitDeadline = Date().addingTimeInterval(5)
+                while process.isRunning && Date() < exitDeadline {
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                }
+                if process.isRunning {
+                    await outDrain.finishAndClose(timeout: 1)
+                    await errDrain.finishAndClose(timeout: 1)
+                    throw InstallError.toolNeverExited(executable)
+                }
                 break
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         await outDrain.finishAndClose(timeout: 5)
         await errDrain.finishAndClose(timeout: 5)
-        return process.terminationStatus
+        let outText = String(data: outDrain.dataSoFar, encoding: .utf8) ?? ""
+        let errText = String(data: errDrain.dataSoFar, encoding: .utf8) ?? ""
+        return (process.terminationStatus, outText, errText)
     }
 
     /// Post-update cleanup at GUI launch: drop any staging directory a

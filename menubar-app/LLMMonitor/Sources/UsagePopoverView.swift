@@ -476,8 +476,10 @@ final class ResizeHandleView: NSView {
 /// The one in-app update affordance, shared verbatim by the popover's footer
 /// strip and the chart window's overlay, so both surfaces show the same
 /// state (offer / install progress / short failure) and take the same action
-/// — the self-install itself, never a browser link. Renders nothing when
-/// there is nothing to say, so "no newer release" costs no space anywhere.
+/// — the self-install itself, except in the signature-gate-refused state,
+/// where the action degrades to opening the release page (operator ruling
+/// 2026-11-19). Renders nothing when there is nothing to say, so "no newer
+/// release" costs no space anywhere.
 struct UpdateOfferControl: View {
     @ObservedObject var checker: UpdateChecker
 
@@ -489,29 +491,62 @@ struct UpdateOfferControl: View {
         switch checker.installState {
         case .idle:
             if let offer = checker.updateAvailable {
-                Button {
-                    AppUpdater.shared.installLatest(from: checker)
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("v\(offer.version) available")
-                        Text("Update Now").bold()
+                if let manualReason = checker.manualUpdateReason {
+                    // Signature gate refused this release: update-check-only.
+                    // The offer stays, the action opens the release page, and
+                    // nothing installs or strips quarantine by hand from
+                    // here.
+                    Button {
+                        if let url = URL(string: offer.releaseURL) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.up.right.square.fill")
+                            Text("v\(offer.version) available — download from GitHub")
+                        }
+                        .font(.caption)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.gray)
+                        .cornerRadius(6)
                     }
-                    .font(.caption)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.blue)
-                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+                    .pointerCursorOnHover()
+                    .help("""
+                        Self-install is unavailable: \(manualReason). The running \
+                        app is untouched and nothing was installed. This opens the \
+                        release page — download LLMMonitor.zip and replace the app \
+                        yourself. \(offer.releaseURL)
+                        """)
+                } else {
+                    Button {
+                        AppUpdater.shared.installLatest(from: checker)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("v\(offer.version) available")
+                            Text("Update Now").bold()
+                        }
+                        .font(.caption)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.blue)
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursorOnHover()
+                    .help("""
+                        Downloads the new LLMMonitor.zip from GitHub, verifies it against \
+                        the release's SHA-256 checksum and its code signature (codesign, \
+                        Gatekeeper, and the app's own Developer ID team), replaces this \
+                        app in place and relaunches. Settings and usage data are \
+                        untouched. Release notes: \
+                        \(offer.releaseURL)
+                        """)
                 }
-                .buttonStyle(.plain)
-                .pointerCursorOnHover()
-                .help("""
-                    Downloads the new LLMMonitor.zip from GitHub, verifies it against \
-                    the release's SHA-256 checksum, replaces this app in place and \
-                    relaunches. Settings and usage data are untouched. Release notes: \
-                    \(offer.releaseURL)
-                    """)
             } else if let failure = checker.lastCheckFailure {
                 HStack(spacing: 6) {
                     Image(systemName: "wifi.exclamationmark")

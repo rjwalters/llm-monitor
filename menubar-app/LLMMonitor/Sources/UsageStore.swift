@@ -1975,6 +1975,14 @@ class UpdateChecker: ObservableObject {
     /// not confirm it.
     @Published private(set) var lastCheckFailure: String?
     @Published private(set) var installState: UpdateInstallState = .idle
+    /// Why the standing offer cannot be self-installed: the signature gate
+    /// refused it (operator ruling 2026-11-19 — release unsigned, wrongly
+    /// signed, or Gatekeeper-rejected). While set, the app runs
+    /// update-check-only: the offer stays visible and updating happens from
+    /// the release page, never a one-click replace. Cleared when a
+    /// *different* release is offered, so a newly signed release gets a
+    /// fresh chance at self-install.
+    @Published private(set) var manualUpdateReason: String?
 
     static let shared = UpdateChecker()
 
@@ -2033,6 +2041,12 @@ class UpdateChecker: ObservableObject {
     func apply(_ outcome: ReleaseFeed.Outcome) {
         switch outcome {
         case .offer(let info):
+            // A *different* release gets a fresh chance at self-install (it
+            // may be properly signed where its predecessor was not); the
+            // same release keeps its signature-gate refusal, so a 24h
+            // re-check cannot resurrect an Update Now button that would only
+            // download and refuse again.
+            if info.version != updateAvailable?.version { manualUpdateReason = nil }
             updateAvailable = info
             lastCheckFailure = nil
             // A fresh, re-validated offer resets stale install state so its
@@ -2058,4 +2072,14 @@ class UpdateChecker: ObservableObject {
     }
 
     func failInstall(_ reason: String) { installState = .failed(reason) }
+
+    /// Degrade to update-check-only (operator ruling 2026-11-19): the
+    /// standing offer was refused by the signature gate, so it stays visible
+    /// with a download-from-GitHub action instead of a one-click install.
+    /// Not an install failure — nothing is wrong with the machine, which is
+    /// why the state goes back to idle rather than failed.
+    func degradeToManualUpdate(_ reason: String) {
+        manualUpdateReason = reason
+        installState = .idle
+    }
 }

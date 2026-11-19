@@ -125,9 +125,19 @@ Once installed, the app updates itself — no browser, unzip, or Finder step:
   Nothing is shown when the app is current.
 - **Update Now** downloads the release's `LLMMonitor.zip` over HTTPS,
   verifies the bytes against the SHA-256 digest GitHub publishes for that
-  asset, validates the bundle's identity and version, replaces the installed
-  app in place, and relaunches it. Your settings and usage data
+  asset, then verifies the extracted bundle's **code signature** —
+  `codesign --verify --deep --strict`, Gatekeeper (`spctl --assess`), and a
+  Developer ID team identifier matching the running app's own — before it
+  validates the bundle's identity and version, replaces the installed app in
+  place, and relaunches it. The checksum proves the download is intact; the
+  signature gate proves where it came from. Your settings and usage data
   (`~/.llm-monitor`) are untouched, and only one install can run at a time.
+- **If a release is not Developer ID signed (or fails verification), the app
+  degrades to update-check-only**: the version is still shown, but the
+  button opens the release page on GitHub instead of self-installing, and
+  nothing is downloaded-and-swapped or de-quarantined. Current releases are
+  not Developer ID signed, so this is the path users get until releases are
+  signed.
 - If a check, download, or validation fails, the running version stays put
   and the popover shows a short reason (details in `~/.llm-monitor/debug.log`
   under the `Update` category). A failed replace restores the previous
