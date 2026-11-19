@@ -1479,17 +1479,6 @@ struct SummaryRow: View {
         return ResetAdvisor.advise(record: usage, poolTally: poolTally, now: Date())
     }
 
-    /// True when the row's current reading reports nothing about resets at
-    /// all — the "resets: unknown" case. Every provider's accounts hold
-    /// stored limit resets (the issue's premise), so an unreadable or
-    /// unimplemented feed — a Claude token rejected on scope (#285), an
-    /// `app-server`/rollout Codex reading — is a statement about this
-    /// reading, shown as unknown and never rendered as 0.
-    private var resetsUnknown: Bool {
-        guard displayUsage != nil else { return false }
-        return !ResetAdvisor.resets(from: displayUsage?.resetCredits).isKnown
-    }
-
     /// Short badge text for a flagged row. The full reason — and the reset's
     /// expiry when the reading reports one — lives in the tooltip.
     private func resetBadgeText(_ advice: ResetAdvisor.Advice) -> String {
@@ -1583,8 +1572,10 @@ struct SummaryRow: View {
                         // #303: the reset advisor's verdict. Orange "use reset"
                         // when a stored reset should be spent (the operator
                         // triggers it by hand), a quieter grey notice when a
-                        // held reset expires soon, and "resets: unknown" when
-                        // the reading carries no reset data — never a zero.
+                        // held reset expires soon. A reading with no reset data
+                        // shows nothing: the row is silent unless there is
+                        // something to act on (a per-row "resets: unknown" was
+                        // noise on every account and was removed).
                         if let advice = resetAdvice, advice.state != .none {
                             Text(resetBadgeText(advice))
                                 .font(.caption2)
@@ -1601,11 +1592,6 @@ struct SummaryRow: View {
                                     )
                                 )
                                 .help(resetAdviceHelp(advice))
-                        } else if resetsUnknown {
-                            Text("resets: unknown")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .help("This reading carries no reset-credit data — unknown, not zero (e.g. an app-server or rollout reading).")
                         }
                     }
                     .opacity(isAbsent ? 0.6 : 1.0)
