@@ -161,44 +161,12 @@ func columnHeading(
 
 // MARK: - Sorting
 
-enum SummarySort: String {
-    case account, headroom, sessionPercent, sessionReset, weeklyPercent, weeklyReset, fablePercent, extraUsage, fresh, token
-
-    /// First-click direction for this column — "best first" intuition.
-    var defaultDirection: SortDirection {
-        switch self {
-        case .headroom: return .desc   // higher score = better, show first
-        default: return .asc           // lower % / sooner reset / fresher / better-status first
-        }
-    }
-}
-
-enum SortDirection: String {
-    case asc, desc
-    func toggled() -> SortDirection { self == .asc ? .desc : .asc }
-}
-
-// `headroomScore` now lives in the portable core (UsageStore.swift) and reads
-// through `UsageRecord.rateLimit`, so the headless Linux daemon scores accounts
-// the same way this popover does.
-
-/// Sort key for the Extra-usage column. Lower = more attention needed.
-/// nil (no probe yet) sorts last.
-func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
-    guard let usage = usage else { return nil }
-    switch usage.extraUsageState {
-    case .unknown:        return nil
-    case .empty:          return 0            // depleted — needs a recharge
-    case .percent(let r): return 1 + r        // metered: lower remaining sorts first
-    case .active:         return 200          // drawing (unmetered/unlimited) — fine
-    case .ready:          return 300          // available, unused
-    case .off:            return 400          // not configured
-    }
-}
-
-// Reset-time sorting now reads `RateLimitWindow.resetAt` (already a `Date`) via
-// `UsageRecord.rateLimit`, so the string-parsing helper that used to live here
-// is gone; `UsageRecord.parseISO` is the single ISO-8601 parse point.
+// The sort vocabulary (`SummarySort`, `SortDirection`), the extra-usage
+// urgency key, the token status rank and the sort pipeline itself now live in
+// the portable core (`PopoverSort.swift`) so `selftest` covers them on every
+// platform, not just where the popover renders (#333). This view resolves the
+// per-render inputs — provider column visibility, the token status lookup —
+// exactly once and hands them to it.
 
 // MARK: - Provider badge
 
@@ -379,19 +347,6 @@ private struct PixelSprite: View {
     }
 }
 
-/// Lower rank = "better" status (valid first, missing last).
-func tokenStatusRank(_ status: TokenStatus) -> Int {
-    switch status {
-    case .valid: return 0
-    case .refreshing: return 1
-    case .expired: return 2
-    case .revoked: return 3
-    case .error: return 4
-    case .drifted: return 5
-    case .missing: return 6
-    }
-}
-
 /// Drag strip along the popover's bottom edge that sets a manual height
 /// (`PopoverHeightManager.dragChanged`); double-click returns to auto-fit.
 ///
@@ -543,9 +498,22 @@ struct UsagePopoverView: View {
 
     /// Accounts paired with latest usage, sorted by the user-selected column.
     /// Recomputed every render so the table sorts live as usage updates.
+    ///
+    /// The pipeline itself lives in the portable core (`PopoverSort`, #333):
+    /// it resolves the effective column, each populated row's key from a
+    /// single snapshot, and the token status lookup once per sort instead of
+    /// per comparison. This site resolves the two provider-visibility answers
+    /// — the same `SummaryColumns.shows` rule the header, rows and width read
+    /// (#227) — exactly once and hands them in.
     private var sortedRows: [(account: Account, usage: UsageRecord?)] {
-        let pairs = store.accounts.map { ($0, store.latestUsage[$0.id]) }
-        return pairs.sorted { compareRows($0, $1) }
+        PopoverSort.sortedRows(
+            accounts: store.accounts,
+            latestUsage: store.latestUsage,
+            sortBy: sortBy,
+            direction: sortDir,
+            premiumColumnShown: SummaryColumns.shows(.premium, among: visibleProviders),
+            extraColumnShown: SummaryColumns.shows(.extra, among: visibleProviders),
+            tokenStatusByAccount: tokenStatusByAccount)
     }
 
     /// The sorted rows the selected provider tab asks for (#297). The filter
@@ -613,116 +581,6 @@ struct UsagePopoverView: View {
             if let id = cs.accountId { map[id] = cs.status }
         }
         return map
-    }
-
-    /// Final tiebreak when a column's primary comparison is exactly equal
-    /// (common for freshly-added or idle accounts that all read 0%): order by
-    /// natural display name instead of falling through to arbitrary
-    /// insertion/UUID order, and only fall back to account id when even the
-    /// display names are indistinguishable, so the order stays total and
-    /// stable.
-    private func stableTiebreak(_ a: Account, _ b: Account) -> Bool {
-        let cmp = NaturalSort.compare(a.displayName, b.displayName)
-        if cmp != .orderedSame { return cmp == .orderedAscending }
-        return a.id < b.id
-    }
-
-    /// Sort comparator for two rows under the current column/direction.
-    /// Rows without data sort to the bottom regardless of direction.
-    /// The sort actually applied: a column hidden by #227 cannot be the sort
-    /// key the user sees selected, so it falls back to the default.
-    private var effectiveSortBy: SummarySort {
-        switch sortBy {
-        case .fablePercent where !SummaryColumns.shows(.premium, among: visibleProviders),
-             .extraUsage where !SummaryColumns.shows(.extra, among: visibleProviders):
-            return .headroom
-        default:
-            return sortBy
-        }
-    }
-
-    private func compareRows(_ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?)) -> Bool {
-        // Account name sorts naturally: digit runs compare by value, so
-        // agent-10 follows agent-9 instead of landing next to agent-1.
-        if case .account = effectiveSortBy {
-            let cmp = NaturalSort.compare(a.0.displayName, b.0.displayName)
-            if cmp == .orderedSame { return stableTiebreak(a.0, b.0) }
-            return sortDir == .asc
-                ? (cmp == .orderedAscending)
-                : (cmp == .orderedDescending)
-        }
-
-        let (av, bv) = sortValues(a, b, for: effectiveSortBy)
-        switch (av, bv) {
-        case (nil, nil): return stableTiebreak(a.0, b.0)
-        case (nil, _):   return false          // nil rows go last
-        case (_, nil):   return true
-        case let (.some(x), .some(y)):
-            if x != y { return sortDir == .asc ? (x < y) : (x > y) }
-            if case .headroom = effectiveSortBy, let ordered = recoveryTiebreak(a.1, b.1) { return ordered }
-            return stableTiebreak(a.0, b.0)
-        }
-    }
-
-    /// Tiebreak for the Headroom column. Equal scores are the norm at the
-    /// bottom of the table, where every capped account reads 0 — so order those
-    /// by how soon they come back. The gating reset is the weekly one once the
-    /// week is spent, and the session one otherwise: a session window rolling
-    /// over in minutes means nothing to an account that is out for the week.
-    ///
-    /// Returns nil when the two rows are indistinguishable (equal or both
-    /// unknown), leaving the caller to fall through to the name tiebreak.
-    private func recoveryTiebreak(_ a: UsageRecord?, _ b: UsageRecord?) -> Bool? {
-        switch (a?.rateLimit.secondsUntilRecovery, b?.rateLimit.secondsUntilRecovery) {
-        case (nil, nil): return nil
-        case (nil, _):   return false          // unknown recovery goes last
-        case (_, nil):   return true
-        case let (.some(x), .some(y)):
-            if x == y { return nil }
-            // Coming back sooner is the better row, so it leads under the
-            // "best first" direction and trails when the sort is flipped.
-            return sortDir == .desc ? (x < y) : (x > y)
-        }
-    }
-
-    /// Numeric value to compare for each column. `nil` = no data → sorts last.
-    private func sortValues(
-        _ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?),
-        for column: SummarySort
-    ) -> (Double?, Double?) {
-        switch column {
-        case .headroom:
-            return (headroomScore(a.1), headroomScore(b.1))
-        case .sessionPercent:
-            // Read through the shared window model: a provider that reports no
-            // session window yields nil here and sorts last, rather than
-            // pretending to be at 0%.
-            return (a.1?.rateLimit.session?.usedPercent, b.1?.rateLimit.session?.usedPercent)
-        case .weeklyPercent:
-            return (a.1?.rateLimit.weekly?.usedPercent, b.1?.rateLimit.weekly?.usedPercent)
-        case .fablePercent:
-            // Sort by Fable used (asc = most remaining last, matching other % columns).
-            return (a.1?.fablePercent, b.1?.fablePercent)
-        case .extraUsage:
-            // Ascending = "needs attention first": empty → low balance → in use → ready → off.
-            return (extraUsageUrgency(a.1), extraUsageUrgency(b.1))
-        case .sessionReset:
-            return (a.1?.rateLimit.session?.resetAt?.timeIntervalSinceNow,
-                    b.1?.rateLimit.session?.resetAt?.timeIntervalSinceNow)
-        case .weeklyReset:
-            return (a.1?.rateLimit.weekly?.resetAt?.timeIntervalSinceNow,
-                    b.1?.rateLimit.weekly?.resetAt?.timeIntervalSinceNow)
-        case .fresh:
-            // Data age in seconds (lower = fresher). nil usage → nil → sorts last.
-            return (a.1.map { -$0.timestamp.timeIntervalSinceNow },
-                    b.1.map { -$0.timestamp.timeIntervalSinceNow })
-        case .token:
-            let lookup = tokenStatusByAccount
-            return (Double(tokenStatusRank(lookup[a.0.id] ?? .missing)),
-                    Double(tokenStatusRank(lookup[b.0.id] ?? .missing)))
-        case .account:
-            return (nil, nil)  // handled above
-        }
     }
 
     var body: some View {
