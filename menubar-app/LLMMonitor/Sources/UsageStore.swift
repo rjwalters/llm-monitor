@@ -1993,6 +1993,13 @@ class UpdateChecker: ObservableObject {
     /// *different* release is offered, so a newly signed release gets a
     /// fresh chance at self-install.
     @Published private(set) var manualUpdateReason: String?
+    /// Why the previous launch's self-update was rolled back (#323), recorded
+    /// by the relaunch helper and read at startup. Deliberately **not**
+    /// `installState`: the launch's own feed check re-offers the same
+    /// release and resets `installState`, which would erase the only
+    /// explanation of why the app is still old. It stays until the user
+    /// dismisses it or starts another install.
+    @Published private(set) var handoffFailure: String?
 
     static let shared = UpdateChecker()
 
@@ -2019,6 +2026,7 @@ class UpdateChecker: ObservableObject {
     var noticeRows: Int {
         if installState != .idle { return 1 }
         return (updateAvailable != nil ? 1 : 0) + (lastCheckFailure != nil ? 1 : 0)
+            + (handoffFailure != nil ? 1 : 0)
     }
 
     /// One release check against the canonical repository. Only the GUI's
@@ -2083,7 +2091,16 @@ class UpdateChecker: ObservableObject {
 
     // MARK: Install progress (driven by AppUpdater)
 
-    func beginInstall() { installState = .running("Downloading…") }
+    func beginInstall() {
+        handoffFailure = nil
+        installState = .running("Downloading…")
+    }
+
+    /// Record the rollback reason the relaunch helper left behind.
+    func recordHandoffFailure(_ reason: String) { handoffFailure = reason }
+
+    /// The user has seen the rollback reason.
+    func dismissHandoffFailure() { handoffFailure = nil }
 
     /// Advance the running label. Ignored unless an install is running, so a
     /// late progress step can never resurrect a failed state.

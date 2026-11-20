@@ -520,6 +520,22 @@ struct UpdateOfferControl: View {
                     unaffected, and the next scheduled check will try again.
                     """)
             }
+            if let rollback = checker.handoffFailure {
+                // The last self-update was rolled back; the feed check that
+                // follows launch re-offers the same release, so this line is
+                // the only explanation until the user dismisses it.
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.uturn.backward.circle.fill")
+                    Text("Last update was rolled back — \(rollback)")
+                        .lineLimit(2)
+                    Button("Dismiss") { checker.dismissHandoffFailure() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                .font(.caption)
+                .foregroundColor(.orange)
+                .help("The previous version was restored. Details are in ~/.llm-monitor/debug.log (category Update).")
+            }
             }
         case .running(let label):
             HStack(spacing: 6) {

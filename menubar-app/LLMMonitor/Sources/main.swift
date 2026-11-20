@@ -410,7 +410,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the *new* version to clean up (AppUpdater) — that is now.
         if let failure = AppUpdater.cleanUpAfterUpdate() {
             // The relaunch helper rolled the update back and recorded why.
-            UpdateChecker.shared.failInstall(failure)
+            UpdateChecker.shared.recordHandoffFailure(failure)
         }
     }
 

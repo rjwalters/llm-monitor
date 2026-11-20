@@ -1707,28 +1707,31 @@ enum SelfTest {
     /// the real script body under `/bin/sh` with a controllable launcher.
     private static func testUpdateHandoffScript() {
         struct Layout {
-            let installed: String, backup: String, failure: String, pending: String, log: String
+            let installed: String, backup: String, failure: String, pending: String, log: String, confirm: String
+            let token = "abcd1234"
         }
-        func withLayout(launcherExit: Int, _ body: (Layout, String) throws -> Void) {
+        func withLayout(launcherExit: Int, confirms: Bool = true, _ body: (Layout, String) throws -> Void) {
             withSelfTestTempDir("handoff") { dir in
                 do {
                     let fm = FileManager.default
                     let layout = Layout(
                         installed: dir.appendingPathComponent("LLMMonitor.app").path,
-                        backup: dir.appendingPathComponent(".LLMMonitor.app.old-test").path,
+                        backup: dir.appendingPathComponent(UpdateHandoff.backupName(token: "abcd1234")).path,
                         failure: dir.appendingPathComponent("failure.txt").path,
                         pending: dir.appendingPathComponent("pending.json").path,
-                        log: dir.appendingPathComponent("launches.log").path)
+                        log: dir.appendingPathComponent("launches.log").path,
+                        confirm: dir.appendingPathComponent(UpdateHandoff.confirmFileName).path)
                     for (path, marker) in [(layout.installed, "new"), (layout.backup, "old")] {
                         try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
                         try Data(marker.utf8).write(to: URL(fileURLWithPath: path + "/marker"))
                     }
                     try UpdateHandoff.writePending(
-                        UpdateHandoff.Pending(installedPath: layout.installed, backupPath: layout.backup,
+                        UpdateHandoff.Pending(installedPath: layout.installed, token: layout.token,
                                               expectedVersion: "9.9.9"), to: layout.pending)
                     let launcher = try writeStub(in: dir, name: "launcher", body: """
                         #!/bin/sh
                         echo "$1" >> '\(layout.log)'
+                        \(confirms && launcherExit == 0 ? "printf '%s' '\(layout.token)' > '\(layout.confirm)'" : ":")
                         exit \(launcherExit)
                         """)
                     try body(layout, launcher)
@@ -1748,7 +1751,7 @@ enum SelfTest {
             let result = try AccountSyncRemote.runProcess(
                 executable: "/bin/sh",
                 arguments: ["-c", UpdateHandoff.relaunchScript, "handoff", pid, layout.installed, layout.backup,
-                            layout.failure, launcher, polls, "0.05", layout.pending],
+                            layout.failure, launcher, polls, "0.05", layout.pending, layout.confirm, layout.token],
                 timeout: 30)
             expect(!result.timedOut, "the handoff script finishes")
             return result.status
@@ -1801,6 +1804,44 @@ enum SelfTest {
                         "the launch failure is recorded")
             expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped")
         }
+
+        // 4. The launcher accepts the request but the app never confirms it
+        //    reached startup: restore, relaunch the previous bundle, record why.
+        withLayout(launcherExit: 0, confirms: false) { layout, launcher in
+            let status = try run(layout, launcher, pid: exitedPid, polls: "4")
+            expectEqual(status, 1, "an unconfirmed launch fails the handoff")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored when startup is never confirmed")
+            expect(!FileManager.default.fileExists(atPath: layout.backup), "the backup was moved back")
+            expectEqual(launches(layout), [layout.installed, layout.installed],
+                        "the unconfirmed bundle is tried, then the previous bundle is relaunched")
+            expectEqual(UpdateHandoff.takeFailure(at: layout.failure),
+                        "the updated app did not finish starting; the previous version was restored",
+                        "the missing confirmation is recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped")
+        }
+
+        // 5. A confirmation carrying another install's token does not count.
+        withLayout(launcherExit: 0, confirms: false) { layout, _ in
+            let stub = try writeStub(in: URL(fileURLWithPath: layout.installed).deletingLastPathComponent(), name: "wrong-token-launcher", body: """
+                #!/bin/sh
+                echo "$1" >> '\(layout.log)'
+                printf '%s' 'ffffffff' > '\(layout.confirm)'
+                exit 0
+                """)
+            let status = try run(layout, stub, pid: exitedPid, polls: "4")
+            expectEqual(status, 1, "another install's confirmation does not satisfy the helper")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored")
+        }
+
+        // 6. A restore that cannot happen keeps the pending record that names
+        //    the backup.
+        withLayout(launcherExit: 1) { layout, launcher in
+            try FileManager.default.removeItem(atPath: layout.backup)
+            let status = try run(layout, launcher, pid: exitedPid, polls: "3")
+            expectEqual(status, 1, "an unrestorable launch failure still fails the handoff")
+            expect(UpdateHandoff.readPending(at: layout.pending) != nil,
+                   "the record survives when the backup could not be moved back")
+        }
     }
 
     /// The recovery backup belongs to the install that created it (#323): a
@@ -1810,12 +1851,14 @@ enum SelfTest {
     private static func testUpdateBackupOwnership() {
         let pending = UpdateHandoff.Pending(
             installedPath: "/Applications/LLMMonitor.app",
-            backupPath: "/Applications/.LLMMonitor.app.old-abc12345",
+            token: "abc12345",
             expectedVersion: "9.9.9")
+        let derivedBackup = "/Applications/.LLMMonitor.app.old-abc12345"
+        expectEqual(pending.backupPath, derivedBackup, "the backup is derived from the install location and token")
         expectEqual(
             UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor.app",
                                          runningVersion: "9.9.9"),
-            pending.backupPath, "the confirmed new install removes its backup")
+            derivedBackup, "the confirmed new install removes its backup")
         expectEqual(
             UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor 2.app",
                                          runningVersion: "9.9.9"),
@@ -1831,6 +1874,23 @@ enum SelfTest {
         expectEqual(
             UpdateHandoff.backupName(token: "abc12345"), ".LLMMonitor.app.old-abc12345",
             "backup names are per-install")
+
+        // A stale or malformed record cannot aim deletion elsewhere.
+        for bad in ["", "../../x", "/Users/x/Documents", "abc1234", "abc123456", "abc/2345", "ghijklmn"] {
+            let record = UpdateHandoff.Pending(
+                installedPath: "/Applications/LLMMonitor.app", token: bad, expectedVersion: "9.9.9")
+            expectEqual(record.backupPath, nil, "token \"\(bad)\" names no backup")
+            expectEqual(
+                UpdateHandoff.backupToRemove(pending: record, runningBundlePath: "/Applications/LLMMonitor.app",
+                                             runningVersion: "9.9.9"),
+                nil, "an invalid token deletes nothing")
+        }
+        expectEqual(
+            UpdateHandoff.backupPath(installedPath: "/Applications", token: "abc12345"), nil,
+            "an installed path that is not an app bundle names no backup")
+        expectEqual(
+            UpdateHandoff.backupPath(installedPath: "/Users/x/Apps/LLMMonitor.app", token: "ABC12345"),
+            "/Users/x/Apps/.LLMMonitor.app.old-ABC12345", "the backup stays beside the installed bundle")
 
         withSelfTestTempDir("handoff-pending") { dir in
             let path = dir.appendingPathComponent(UpdateHandoff.pendingFileName).path
@@ -1891,6 +1951,25 @@ enum SelfTest {
         c.degradeToManualUpdate("the release is not Developer ID signed")
         c.apply(.uptodate)
         expectEqual(c.manualUpdateReason, nil, "no offer, no manual-update reason")
+
+        // Startup after a rolled-back update: the recorded reason survives the
+        // launch's own successful feed refresh of the same release, until the
+        // user dismisses it or starts another install.
+        let d = UpdateChecker()
+        d.recordHandoffFailure("the updated app did not finish starting; the previous version was restored")
+        d.apply(.offer(offer))
+        expectEqual(d.handoffFailure,
+                    "the updated app did not finish starting; the previous version was restored",
+                    "a successful refresh keeps the rollback reason")
+        expectEqual(d.noticeRows, 2, "the offer and the rollback reason both render")
+        d.apply(.uptodate)
+        expectEqual(d.noticeRows, 1, "the rollback reason outlives the offer")
+        d.dismissHandoffFailure()
+        expect(!d.hasNotice, "dismissing clears it")
+        d.recordHandoffFailure("rolled back")
+        d.apply(.offer(offer))
+        d.beginInstall()
+        expectEqual(d.handoffFailure, nil, "starting another install clears the old reason")
     }
 
     /// The hand-rolled SHA-256 against published FIPS 180-4 vectors — what

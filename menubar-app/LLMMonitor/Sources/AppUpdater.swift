@@ -194,7 +194,7 @@ final class AppUpdater {
             // 7. Replace at the installed path, keeping a same-volume backup
             //    to restore from if the swap fails.
             checker.updateInstallProgress("Installing…")
-            let backupURL = try Self.replaceInstalledBundle(
+            let pending = try Self.replaceInstalledBundle(
                 installedURL, with: stagedBundle, expectedVersion: info.version)
 
             // 8. Relaunch: a detached helper waits for this process to exit —
@@ -202,12 +202,12 @@ final class AppUpdater {
             //    new bundle. Success never returns from here.
             checker.updateInstallProgress("Relaunching…")
             do {
-                try await Self.relaunchAfterExit(opening: installedURL, backup: backupURL)
+                try await Self.relaunchAfterExit(opening: installedURL, pending: pending)
             } catch {
                 // No helper is coming: put the previous bundle back so the
                 // installed app matches the version still running, then
                 // surface the relaunch failure.
-                Self.undoReplace(installedURL, backup: backupURL)
+                Self.undoReplace(installedURL, pending: pending)
                 throw error
             }
 
@@ -324,27 +324,29 @@ final class AppUpdater {
     /// to a uniquely named backup (same volume, atomic), move the staged one
     /// in, and restore the backup if that move fails — the running binary
     /// keeps working throughout; it stays mapped even once its directory
-    /// entry is renamed away. The backup is recorded in the pending file
+    /// entry is renamed away. The transaction is recorded in the pending file
     /// *before* anything moves, so a crash mid-swap still leaves the record
-    /// that names it. Returns the backup's URL.
+    /// that names the backup. An earlier replacement whose backup is still on
+    /// disk is **unresolved recovery data**: this retry refuses rather than
+    /// delete it or drop its record. Returns the new record.
     private static func replaceInstalledBundle(
         _ installed: URL, with staged: URL, expectedVersion: String
-    ) throws -> URL {
+    ) throws -> UpdateHandoff.Pending {
         let fm = FileManager.default
         let pendingPath = AppPaths.path(UpdateHandoff.pendingFileName)
-        // A backup an earlier, never-confirmed replacement of this same
-        // installed path left behind is superseded by this one.
         if let old = UpdateHandoff.readPending(at: pendingPath),
-           old.installedPath == installed.path {
-            try? fm.removeItem(atPath: old.backupPath)
+           let oldBackup = old.backupPath, fm.fileExists(atPath: oldBackup) {
+            throw InstallError.replaceFailed(
+                "an earlier update left its recovery backup beside the installed app; remove it once the app is confirmed working")
         }
-        let backup = installed.deletingLastPathComponent().appendingPathComponent(
-            UpdateHandoff.backupName(token: String(UUID().uuidString.prefix(8))), isDirectory: true)
-        try UpdateHandoff.writePending(
-            UpdateHandoff.Pending(
-                installedPath: installed.path, backupPath: backup.path,
-                expectedVersion: expectedVersion),
-            to: pendingPath)
+        let token = String(UUID().uuidString.prefix(8))
+        let pending = UpdateHandoff.Pending(
+            installedPath: installed.path, token: token, expectedVersion: expectedVersion)
+        guard let backupPath = pending.backupPath else {
+            throw InstallError.replaceFailed("could not name a recovery backup for \(installed.lastPathComponent)")
+        }
+        let backup = URL(fileURLWithPath: backupPath, isDirectory: true)
+        try UpdateHandoff.writePending(pending, to: pendingPath)
         // A failed rename here (e.g. no write access to /Applications) leaves
         // the installed bundle untouched — the plain `throw` is the whole
         // recovery story for the unwritable-destination case.
@@ -364,11 +366,12 @@ final class AppUpdater {
             } catch {
                 restored = false
             }
+            // Unrestored: the backup and its record both stay.
             if !restored { throw InstallError.restoreFailed(backup.path) }
             UpdateHandoff.clearPending(at: pendingPath)
             throw installError
         }
-        return backup
+        return pending
     }
 
     /// Put the previous bundle back after a failed relaunch handoff, so the
@@ -376,11 +379,11 @@ final class AppUpdater {
     /// caller has a relaunch error to report either way, and the running
     /// binary stays alive even when this fails (the new bundle at the
     /// installed path is validated, so it is still runnable by hand).
-    private static func undoReplace(_ installed: URL, backup: URL) {
+    private static func undoReplace(_ installed: URL, pending: UpdateHandoff.Pending) {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: backup.path) else { return }
+        guard let backupPath = pending.backupPath, fm.fileExists(atPath: backupPath) else { return }
         try? fm.removeItem(at: installed)
-        if (try? fm.moveItem(at: backup, to: installed)) != nil {
+        if (try? fm.moveItem(atPath: backupPath, toPath: installed.path)) != nil {
             UpdateHandoff.clearPending(at: AppPaths.path(UpdateHandoff.pendingFileName))
         }
     }
@@ -392,15 +395,19 @@ final class AppUpdater {
     /// its parent's exit, and the app has no controlling terminal, so no
     /// SIGHUP reaches it. Every path travels as a positional argument, never
     /// interpolated into the script body (#327).
-    private static func relaunchAfterExit(opening bundle: URL, backup: URL) async throws {
+    private static func relaunchAfterExit(opening bundle: URL, pending: UpdateHandoff.Pending) async throws {
+        guard let backupPath = pending.backupPath else {
+            throw InstallError.relaunchFailed("the recovery backup record is invalid")
+        }
         SubprocessIO.ignoreSIGPIPE()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [
             "-c", UpdateHandoff.relaunchScript, "llm-monitor-relaunch",
-            String(getpid()), bundle.path, backup.path,
+            String(getpid()), bundle.path, backupPath,
             AppPaths.path(UpdateHandoff.failureFileName), "/usr/bin/open",
             "150", "0.2", AppPaths.path(UpdateHandoff.pendingFileName),
+            AppPaths.path(UpdateHandoff.confirmFileName), pending.token,
         ]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -498,8 +505,14 @@ final class AppUpdater {
                pending: pending,
                runningBundlePath: Bundle.main.bundleURL.path,
                runningVersion: AppVersion.current) {
-            try? fm.removeItem(atPath: backup)
-            UpdateHandoff.clearPending(at: pendingPath)
+            // Tell the helper this install started, then drop the backup.
+            // A failed deletion keeps the record so the next launch retries
+            // instead of orphaning the backup.
+            try? UpdateHandoff.writeConfirmation(
+                token: pending.token, to: AppPaths.path(UpdateHandoff.confirmFileName))
+            if !fm.fileExists(atPath: backup) || (try? fm.removeItem(atPath: backup)) != nil {
+                UpdateHandoff.clearPending(at: pendingPath)
+            }
         }
         return failure
     }
