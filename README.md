@@ -904,6 +904,27 @@ llm-monitor accounts push loom-worker-1 --then-loom
 llm-monitor accounts pull robb-studio
 ```
 
+Accounts start with **work** scope. To keep an account on this host, set its
+scope to **personal** using its full email address or account ID. Use the ID
+when several accounts share an email address.
+
+```bash
+llm-monitor accounts scope me@example.com personal
+llm-monitor accounts list
+llm-monitor accounts scope me@example.com work
+```
+
+Personal accounts still poll normally and show a **Personal** badge in the
+popover. `accounts export`, `push`, and the source of a `pull` skip them by
+default and name them on stderr. Pass `--include-personal` to any of those
+three commands to include eligible personal accounts for that transfer.
+Codex accounts remain host-local. Popover **Copy Accounts** always skips
+personal accounts, including Codex identities, and reports how many it skipped.
+
+Scope stays on the host where you set it. A newly imported account starts as
+work, and an existing account keeps its local scope. Marking an account personal
+leaves copies already sent to other hosts in place.
+
 - **Nothing is written to disk on either side.** `push` serializes the bundle
   in memory and streams it into `accounts import -` on the destination over
   the ssh channel; `pull` is the same channel in reverse. There is no

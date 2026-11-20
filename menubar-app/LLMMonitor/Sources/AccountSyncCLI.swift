@@ -1,6 +1,6 @@
 import Foundation
 
-/// `llm-monitor accounts export|import|push|pull|list` — the CLI surface for
+/// `llm-monitor accounts export|import|push|pull|list|scope` — the CLI surface for
 /// `AccountSync` (issue #16) and its ssh fan-out (#188), plus the read-only
 /// per-provider pool summary (#297). Reachable directly on
 /// both macOS and Linux without requiring `--headless` or any GUI code, so it
@@ -27,6 +27,8 @@ enum AccountSyncCLI {
             runRemote(Array(args.dropFirst()), verb: .push)
         case "pull":
             runRemote(Array(args.dropFirst()), verb: .pull)
+        case "scope":
+            runScope(Array(args.dropFirst()))
         case "list":
             runList(Array(args.dropFirst()))
         case "--help", "-h", "help":
@@ -44,6 +46,7 @@ enum AccountSyncCLI {
     private static func runExport(_ args: [String]) -> Never {
         var outputPath: String?
         var pretty = true
+        var includePersonal = false
         var dbPath = AccountSync.defaultDBPath
 
         var i = 0
@@ -60,6 +63,8 @@ enum AccountSyncCLI {
                 case "--output", "-o":
                     outputPath = CLIArgs.requireValue(args, i, option: "--output")
                     i += 1
+                case "--include-personal":
+                    includePersonal = true
                 case "--compact":
                     pretty = false
                 default:
@@ -70,7 +75,9 @@ enum AccountSyncCLI {
         }
 
         do {
-            let data = try AccountSync.exportJSON(pretty: pretty, dbPath: dbPath)
+            let data = try AccountSync.exportJSON(pretty: pretty, dbPath: dbPath, includePersonal: includePersonal) {
+                FileHandle.standardError.write(Data("\($0)\n".utf8))
+            }
 
             FileHandle.standardError.write(Data("""
                 WARNING: this export contains OAuth access/refresh tokens in \
@@ -197,6 +204,55 @@ enum AccountSyncCLI {
         }
     }
 
+    // MARK: - scope
+
+    private static func runScope(_ args: [String]) -> Never {
+        var dbPath = AccountSync.defaultDBPath
+        var positional: [String] = []
+        var i = 0
+        while i < args.count {
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let path):
+                dbPath = path
+                i += 1
+            case .help:
+                printUsage()
+                exit(0)
+            case .notMatched:
+                guard !args[i].hasPrefix("-") else { CLIArgs.fail("Unknown option '\(args[i])'") }
+                positional.append(args[i])
+            }
+            i += 1
+        }
+        guard positional.count == 2, !positional[0].isEmpty, let scope = AccountScope(rawValue: positional[1]) else {
+            CLIArgs.fail("Expected accounts scope <email-or-id> personal|work")
+        }
+        let selector = positional[0]
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            CLIArgs.fail("No database found at \(dbPath)")
+        }
+        do {
+            let db = try openDatabase(dbPath)
+            // Resolve and update under the same lock so a concurrent import cannot
+            // add another account with this email between the check and the write.
+            try db.execute("BEGIN IMMEDIATE")
+            let match = "id = ? OR email = ? COLLATE NOCASE"
+            let count = try db.scalar("SELECT COUNT(*) FROM accounts WHERE \(match)", selector, selector) as? Int64
+            guard count != 0 else { CLIArgs.fail("Unknown account '\(selector)'") }
+            guard count == 1 else {
+                let ids = try db.scalar("SELECT group_concat(id, ', ') FROM accounts WHERE \(match)", selector, selector)
+                CLIArgs.fail("Ambiguous account '\(selector)'. Use one of these ids: \(ids as? String ?? "")")
+            }
+            UsageStore.addAccountScopeColumn(db)
+            try db.run("UPDATE accounts SET scope = ? WHERE \(match)", scope.rawValue, selector, selector)
+            try db.execute("COMMIT")
+            print("\(selector): \(scope.rawValue)")
+            exit(0)
+        } catch {
+            CLIArgs.fail("Could not set account scope: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - list (#297)
 
     /// Read-only per-provider pool summary: one table per provider, each with
@@ -277,7 +333,7 @@ enum AccountSyncCLI {
             let tally = ProviderPoolSummary.tally(rows)
             print("")
             print("\(provider.displayName) — \(ProviderPoolSummary.summaryLine(tally)) (\(tally.total) configured)")
-            print("  " + pad("ACCOUNT", 26) + pad("STATUS", 13) + pad("HEADROOM", 9) + pad("NEXT RESET", 27) + "RESET ADVICE")
+            print("  " + pad("ACCOUNT", 26) + pad("SCOPE", 10) + pad("STATUS", 13) + pad("HEADROOM", 9) + pad("NEXT RESET", 27) + "RESET ADVICE")
             for input in rows {
                 print("  " + listRow(input, poolTally: tally))
             }
@@ -306,12 +362,13 @@ enum AccountSyncCLI {
         _ input: PoolAccountInput,
         poolTally: ProviderPoolSummary.Tally
     ) -> String {
+        let identity = pad(input.account.displayName, 26) + pad(input.account.scope.rawValue, 10)
         if input.account.isAbsent {
-            return pad(input.account.displayName, 26) + pad(CodexCLI.absentLabel, 13) + pad("—", 9)
+            return identity + pad(CodexCLI.absentLabel, 13) + pad("—", 9)
                 + pad("—", 27) + "—"
         }
         guard let usage = input.usage else {
-            return pad(input.account.displayName, 26) + pad("no reading", 13) + pad("—", 9)
+            return identity + pad("no reading", 13) + pad("—", 9)
                 + pad("—", 27) + "—"
         }
         let stale = AccountFreshness.isStale(lastUpdated: usage.timestamp, pollInterval: 600)
@@ -326,7 +383,7 @@ enum AccountSyncCLI {
         // has not landed) says "resets: unknown" — never 0, never silence
         // that reads as 0.
         let advice = ResetAdvisor.displayLine(record: usage, poolTally: poolTally, now: Date()) ?? "—"
-        return pad(input.account.displayName, 26) + pad(status, 13) + pad(headroom, 9)
+        return identity + pad(status, 13) + pad(headroom, 9)
             + pad(reset, 27) + advice
     }
 
@@ -350,12 +407,13 @@ enum AccountSyncCLI {
             credentials across hosts (see README "Multi-Host Sync").
 
             Usage:
-              llm-monitor accounts push <HOST...> [--dry-run] [--then-loom]
+              llm-monitor accounts push <HOST...> [--dry-run] [--then-loom] [--include-personal]
                                           [--remote-bin <path>] [--ssh-option <opt>] [--db <path>]
-              llm-monitor accounts pull <HOST> [--dry-run] [--then-loom]
+              llm-monitor accounts pull <HOST> [--dry-run] [--then-loom] [--include-personal]
                                           [--remote-bin <path>] [--ssh-option <opt>] [--db <path>]
-              llm-monitor accounts export [--output <path>] [--compact] [--db <path>]
+              llm-monitor accounts export [--output <path>] [--compact] [--include-personal] [--db <path>]
               llm-monitor accounts import <path|-> [--dry-run] [--db <path>]
+              llm-monitor accounts scope <email-or-id> personal|work [--db <path>]
               llm-monitor accounts list [--provider claude|codex|zai] [--db <path>]
 
             push is the primary path: it exports this host's bundle in memory
@@ -368,6 +426,11 @@ enum AccountSyncCLI {
             pull is the same channel in reverse, for a fresh host bootstrapping
             from a peer: it runs `accounts export` on HOST and imports the
             result here. Exactly one HOST.
+
+            scope sets an account's sharing preference on this host. The default
+              is work. Personal accounts still appear locally and are skipped by
+              Copy, export, push, and the source of a pull. Pass --include-personal
+              to export, push, or pull to include eligible personal accounts.
 
             --dry-run (push and pull) only checks that each host is reachable
               and that llm-monitor resolves there, reporting its version.

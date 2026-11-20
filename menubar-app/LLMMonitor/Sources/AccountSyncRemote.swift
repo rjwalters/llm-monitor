@@ -62,6 +62,7 @@ enum AccountSyncRemote {
         var hosts: [String] = []
         var dryRun = false
         var thenLoom = false
+        var includePersonal = false
         var wantsHelp = false
         var dbPath = AccountSync.defaultDBPath
         var remoteBinary = defaultRemoteBinary
@@ -114,6 +115,8 @@ enum AccountSyncRemote {
                 switch args[i] {
                 case "--dry-run":
                     options.dryRun = true
+                case "--include-personal":
+                    options.includePersonal = true
                 case "--then-loom":
                     options.thenLoom = true
                 case "--remote-bin":
@@ -164,8 +167,8 @@ enum AccountSyncRemote {
 
     /// The source side of a `pull`. `--compact` because nothing reads this by
     /// eye — it goes straight into a decoder on this host.
-    static func remoteExportCommand(remoteBinary: String) -> String {
-        "\(shellQuote(remoteBinary)) accounts export --compact"
+    static func remoteExportCommand(remoteBinary: String, includePersonal: Bool = false) -> String {
+        "\(shellQuote(remoteBinary)) accounts export --compact" + (includePersonal ? " --include-personal" : "")
     }
 
     /// What `--dry-run` runs instead of shipping anything: proves the host is
@@ -427,7 +430,8 @@ enum AccountSyncRemote {
         let bundle: AccountSync.ExportBundle
         let data: Data
         do {
-            bundle = try AccountSync.exportBundle(dbPath: options.dbPath)
+            bundle = try AccountSync.exportBundle(dbPath: options.dbPath, includePersonal: options.includePersonal,
+                                                  reportSkipped: output.error)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             data = try encoder.encode(bundle)
@@ -504,7 +508,7 @@ enum AccountSyncRemote {
                 arguments: sshArguments(
                     host: host,
                     sshOptions: options.sshOptions,
-                    remoteCommand: remoteExportCommand(remoteBinary: options.remoteBinary)
+                    remoteCommand: remoteExportCommand(remoteBinary: options.remoteBinary, includePersonal: options.includePersonal)
                 ),
                 timeout: timeout
             )
@@ -513,11 +517,12 @@ enum AccountSyncRemote {
             return 1
         }
 
+        output.relay(result.stderr, host: host, asError: true)
+
         // `failureDescription` rather than a bare status check, so a child that
         // was killed on the timeout is reported as such instead of having its
         // truncated stdout handed to the decoder below.
         if let reason = failureDescription(result) {
-            output.relay(result.stderr, host: host, asError: true)
             output.error("Error: \(host): remote export failed (\(reason))")
             return 1
         }
@@ -528,7 +533,6 @@ enum AccountSyncRemote {
         } catch {
             // Deliberately reports only the size: the body is a credential, and
             // a decode failure is exactly when it would be tempting to dump it.
-            output.relay(result.stderr, host: host, asError: true)
             output.error("""
                 Error: \(host): could not parse the remote bundle (\(result.stdout.count) byte(s)). \
                 Check that `\(options.remoteBinary) accounts export` runs cleanly there and prints \
