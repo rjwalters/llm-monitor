@@ -40,7 +40,7 @@ final class AppUpdater {
         case bundleMissing
         case bundleIdentityUnexpected(identifier: String, version: String, expectedIdentifier: String, expectedVersion: String)
         case notAnInstalledBundle
-        case toolNeverExited(String)
+        case toolTimedOut(String)
         case replaceFailed(String)
         case restoreFailed(String)
         case relaunchFailed(String)
@@ -78,8 +78,8 @@ final class AppUpdater {
                 return "the archive is not this app (bundle identifier or version mismatch)"
             case .notAnInstalledBundle:
                 return "this is not an installed app bundle — reinstall from LLMMonitor.zip to self-update"
-            case .toolNeverExited(let tool):
-                return "a helper tool (\(tool)) did not exit after being stopped"
+            case .toolTimedOut(let tool):
+                return "a helper tool (\(tool)) timed out"
             case .replaceFailed(let why):
                 return "could not replace the installed app (\(why))"
             case .restoreFailed(let backupPath):
@@ -187,8 +187,8 @@ final class AppUpdater {
             //    just verified: quarantine is never stripped from an
             //    unverified bundle (ruling item 2).
             checker.updateInstallProgress("Preparing…")
-            try await Self.clearQuarantine(at: stagedBundle)
             try Self.validateStagedBundle(stagedBundle, expectedVersion: info.version)
+            try await Self.clearQuarantine(at: stagedBundle)
 
             // 7. Replace at the installed path, keeping a same-volume backup
             //    to restore from if the swap fails.
@@ -270,6 +270,7 @@ final class AppUpdater {
         } catch {
             FileLogger.shared.warning("codesign --verify could not run for the staged bundle: \(error.localizedDescription)", category: "Update")
         }
+        guard input.codesignVerified else { return input }
         do {
             input.gatekeeperAccepted = try await runTool(
                 "/usr/sbin/spctl", ["--assess", "--type", "execute", staged.path],
@@ -277,19 +278,24 @@ final class AppUpdater {
         } catch {
             FileLogger.shared.warning("spctl --assess could not run for the staged bundle: \(error.localizedDescription)", category: "Update")
         }
-        input.stagedTeamIdentifier = await teamIdentifier(of: staged)
-        input.runningTeamIdentifier = await teamIdentifier(of: running)
+        guard input.gatekeeperAccepted else { return input }
+        input.stagedTeamIdentifier = await developerIDTeam(of: staged)
+        input.runningTeamIdentifier = await developerIDTeam(of: running)
         return input
     }
 
-    /// The Developer ID team identifier `codesign -dv` reports for a bundle
-    /// (nil when unsigned, ad-hoc, or unreadable). `codesign` writes its
-    /// details to stderr, which `runToolDetailed` captures.
-    private static func teamIdentifier(of bundle: URL) async -> String? {
+    /// A team identifier alone does not establish the certificate class.
+    /// Have codesign check Apple's Developer ID chain and the leaf OU on
+    /// the bundle itself. Do this for both sides of the update.
+    private static func developerIDTeam(of bundle: URL) async -> String? {
         guard let result = try? await runToolDetailed(
             "/usr/bin/codesign", ["-dv", "--verbose=4", bundle.path],
-            timeout: 120), result.status == 0 else { return nil }
-        return SignatureGate.parseTeamIdentifier(from: result.stderrText)
+            timeout: 120), result.status == 0,
+              let team = SignatureGate.parseTeamIdentifier(from: result.stderrText),
+              let requirement = SignatureGate.developerIDRequirement(for: team) else { return nil }
+        let verified = try? await runTool(
+            "/usr/bin/codesign", ["--verify", "-R=\(requirement)", bundle.path], timeout: 120)
+        return verified == 0 ? team : nil
     }
 
     /// The staged bundle must advertise this app's bundle identifier and the
@@ -432,22 +438,17 @@ final class AppUpdater {
                 process.terminate()
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                // Wait for the kill to land before touching
-                // `terminationStatus`: reading it while the child is still
-                // unreaped is the crash the operator ruling names (item 3) —
-                // terminate-then-wait, never read-while-running. SIGKILL is
-                // unconditional, so this normally clears on the first poll;
-                // a child that somehow survives it is reported, not read.
+                // Give the child a bounded interval to exit before closing
+                // its drains. The timeout path never reads terminationStatus.
                 let exitDeadline = Date().addingTimeInterval(5)
                 while process.isRunning && Date() < exitDeadline {
                     try? await Task.sleep(nanoseconds: 20_000_000)
                 }
-                if process.isRunning {
-                    await outDrain.finishAndClose(timeout: 1)
-                    await errDrain.finishAndClose(timeout: 1)
-                    throw InstallError.toolNeverExited(executable)
-                }
-                break
+                await outDrain.finishAndClose(timeout: 1)
+                await errDrain.finishAndClose(timeout: 1)
+                // A tool can exit zero while handling SIGTERM. Its check
+                // still missed the deadline and cannot authorize an install.
+                throw InstallError.toolTimedOut(executable)
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }

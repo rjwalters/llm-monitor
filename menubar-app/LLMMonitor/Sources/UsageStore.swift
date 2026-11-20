@@ -1948,8 +1948,7 @@ struct AppVersion {
 /// rules live in `ReleaseFeed`; this is just the value they produce.
 struct UpdateInfo: Equatable {
     let version: String
-    /// The release's human page (tooltips only — nothing opens a browser on
-    /// its own any more).
+    /// The canonical release page for the manual update button and tooltips.
     let releaseURL: String
     /// HTTPS URL of the `LLMMonitor.zip` asset: the bytes the updater
     /// downloads and hash-checks.

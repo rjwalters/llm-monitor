@@ -114,8 +114,6 @@ Your usage data shows up in the menu bar immediately.
 
 ### Staying Current (macOS)
 
-Once installed, the app updates itself — no browser, unzip, or Finder step:
-
 - At launch, and then every 24 hours while running, it reads the latest
   stable release from
   [`2AMLogic/llm-monitor`](https://github.com/2AMLogic/llm-monitor/releases).
@@ -127,17 +125,16 @@ Once installed, the app updates itself — no browser, unzip, or Finder step:
   verifies the bytes against the SHA-256 digest GitHub publishes for that
   asset, then verifies the extracted bundle's **code signature** —
   `codesign --verify --deep --strict`, Gatekeeper (`spctl --assess`), and a
-  Developer ID team identifier matching the running app's own — before it
+  Developer ID Application certificate from the same team as the running app — before it
   validates the bundle's identity and version, replaces the installed app in
   place, and relaunches it. The checksum proves the download is intact; the
   signature gate proves where it came from. Your settings and usage data
   (`~/.llm-monitor`) are untouched, and only one install can run at a time.
-- **If a release is not Developer ID signed (or fails verification), the app
-  degrades to update-check-only**: the version is still shown, but the
-  button opens the release page on GitHub instead of self-installing, and
-  nothing is downloaded-and-swapped or de-quarantined. Current releases are
-  not Developer ID signed, so this is the path users get until releases are
-  signed.
+- If signature verification fails, the updater discards the staged download
+  with its quarantine intact. The version stays visible. Click **Download
+  from GitHub** to open its release page. The published v2.1.0 app is
+  ad-hoc signed, so moving from it to a Developer ID build requires a manual
+  update. Later releases signed by the same team can update in place.
 - If a check, download, or validation fails, the running version stays put
   and the popover shows a short reason (details in `~/.llm-monitor/debug.log`
   under the `Update` category). A failed replace restores the previous

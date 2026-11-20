@@ -107,11 +107,22 @@ enum SignatureGate {
         return nil
     }
 
-    /// A team identifier is a non-empty string that is not codesign's
-    /// "not set" placeholder. Whitespace-only and placeholder values are nil.
+    /// Apple's Developer ID Application certificate chain (TN3127). Bind the
+    /// reported team to the leaf certificate's OU before trusting it.
+    static func developerIDRequirement(for team: String) -> String? {
+        guard let team = normalized(team) else { return nil }
+        return """
+            anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+            and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+            and certificate leaf[subject.OU] = "\(team)"
+            """
+    }
+
+    /// Apple team IDs are ten uppercase ASCII letters or digits. Only that
+    /// alphabet may enter the code-signing requirement.
     private static func normalized(_ value: String?) -> String? {
-        guard let value, !value.isEmpty else { return nil }
-        if value.caseInsensitiveCompare("not set") == .orderedSame { return nil }
+        guard let value, value.utf8.count == 10,
+              value.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber) }) else { return nil }
         return value
     }
 }

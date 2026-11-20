@@ -74,7 +74,9 @@ enum ReleaseFeed {
             return .uptodate
         }
         guard Version.isNewer(version, than: currentVersion) else { return .uptodate }
-        let page = (json["html_url"] as? String) ?? download
+        // A refused update must open the release notes, even if html_url
+        // is missing. The validated stable tag is safe as a path component.
+        let page = "https://github.com/\(AppVersion.repoOwner)/\(AppVersion.repoName)/releases/tag/\(tagName)"
         return .offer(UpdateInfo(
             version: version,
             releaseURL: page,

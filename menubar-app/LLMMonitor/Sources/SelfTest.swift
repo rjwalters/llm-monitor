@@ -1402,7 +1402,8 @@ enum SelfTest {
         draft: Bool = false,
         macOSAssetName: String? = ReleaseFeed.macOSAssetName,
         digest: String? = "sha256:" + String(repeating: "ab", count: 32),
-        downloadURL: String = "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/LLMMonitor.zip"
+        downloadURL: String = "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/LLMMonitor.zip",
+        includeReleasePage: Bool = true
     ) -> Data {
         var assets: [[String: Any]] = []
         if let macOSAssetName {
@@ -1426,13 +1427,13 @@ enum SelfTest {
             "browser_download_url": "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/claude-monitor-linux-x64",
             "digest": "sha256:" + String(repeating: "ef", count: 32),
         ])
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "tag_name": tag,
             "prerelease": prerelease,
             "draft": draft,
-            "html_url": "https://github.com/2AMLogic/llm-monitor/releases/tag/\(tag)",
             "assets": assets,
         ]
+        if includeReleasePage { payload["html_url"] = "https://github.com/2AMLogic/llm-monitor/releases/tag/\(tag)" }
         // A fixture builder may never fail silently.
         return try! JSONSerialization.data(withJSONObject: payload)
     }
@@ -1470,7 +1471,10 @@ enum SelfTest {
         expectEqual(info.sha256, String(repeating: "ab", count: 32), "offered digest is the lowercase hex part")
         expect(info.archiveURL.hasPrefix("https://"), "offered archive URL is the asset's https URL")
         expectEqual(info.releaseURL, "https://github.com/2AMLogic/llm-monitor/releases/tag/v2.10.0",
-                    "release page URL comes from html_url")
+                    "manual update opens the canonical release page")
+        let noPage = releaseFeedFixture(tag: "v2.10.0", includeReleasePage: false)
+        expectEqual(ReleaseFeed.selection(currentVersion: current, payload: noPage, errorText: nil),
+                    .offer(info), "missing html_url still opens the release page")
 
         // Equal and older versions clear the offer (an equal version must
         // clear, not merely fail to set — that is the "clears the offer" AC).
@@ -1642,6 +1646,28 @@ enum SelfTest {
                     "empty output parses to nil")
         expectEqual(SignatureGate.parseTeamIdentifier(from: "  TeamIdentifier=W2G9X7KLQC  \n"), "W2G9X7KLQC",
                     "team parse trims surrounding whitespace")
+        expectEqual(SignatureGate.developerIDRequirement(for: "W2G9X7KLQ!"), nil,
+                    "malformed team cannot enter a signing requirement")
+        guard let requirement = SignatureGate.developerIDRequirement(for: "W2G9X7KLQC") else {
+            expect(false, "valid team produces a Developer ID Application requirement")
+            return
+        }
+        expect(requirement.contains("certificate leaf[subject.OU] = \"W2G9X7KLQC\""),
+               "the requirement binds the certificate to the reported team")
+        #if os(macOS)
+        do {
+            // Have Apple's tools compile the production requirement and
+            // evaluate it against a real, Apple-signed system executable.
+            let compiled = try AccountSyncRemote.runProcess(executable: "/usr/bin/csreq",
+                arguments: ["-r", "=\(requirement)", "-t"], timeout: 10)
+            expect(!compiled.timedOut && compiled.status == 0, "macOS compiles the Developer ID requirement")
+            let assessed = try AccountSyncRemote.runProcess(executable: "/usr/bin/codesign",
+                arguments: ["--verify", "-R=\(requirement)", "/usr/bin/true"], timeout: 10)
+            expect(!assessed.timedOut && assessed.status != 0, "an Apple platform binary fails the Developer ID team requirement")
+        } catch {
+            expect(false, "could not exercise macOS signing tools: \(error)")
+        }
+        #endif
 
         // The degrade-to-manual state: not an install failure, offered
         // version-scoped so a 24h re-check of the same refused release does
@@ -1685,7 +1711,7 @@ enum SelfTest {
                     "abc vector")
         expectEqual(SHA256.hex(Data("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".utf8)),
                     "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
-                    "55-byte vector (length field pushes into a second block)")
+                    "56-byte vector (length field pushes into a second block)")
         expectEqual(SHA256.hex(Data(repeating: 0x61, count: 64)),
                     "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
                     "exactly-one-block message")
