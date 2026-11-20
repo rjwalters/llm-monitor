@@ -568,6 +568,29 @@ browser console on a logged-in claude.ai page, never from the app itself.
 Minting can't be automated either: `claude setup-token` requires interactive
 browser OAuth.
 
+#### Limit resets (`cedar_ember`, undocumented)
+
+Per-account limit resets come from the same usage call the claude.ai Usage
+page makes, with one extra query parameter (undocumented; observed
+2026-11-17, not guaranteed stable):
+
+- `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1` with
+  `Authorization: Bearer <token>` and `anthropic-beta: oauth-2025-04-20`
+  (the claude.ai form, `GET https://claude.ai/api/organizations/{org}/usage?cedar_ember=1`,
+  is from a public report and unverified here).
+- Fields used: `cedar_ember.grants[]` with `id`, `label`, `type`
+  (`weekly`/`full`), `resets_left`, `resets_total`, `ends_at`, `usable_now`,
+  `clears[]`. Without the parameter `cedar_ember` is `null`.
+- A fleet **setup token** gets `403 OAuth token does not meet scope
+  requirement user:profile`; only a full `claude` login token works.
+
+The app never calls either endpoint and never spends a reset. Paste a saved
+body in by hand: `llm-monitor claude resets import --account <id|email> body.json`
+(or `-` for stdin). Only the grant fields above are stored. `accounts list`
+(`--json` too), `ranking.json` (`reset_credits`/`reset_advice`) and the popover
+show the count, scope and expiry with the paste's age, labelled stale when
+old; an account with no import reads `resets: unknown`.
+
 The script is defensive about known flakiness: it re-lists live tokens between
 revoke rounds and retries stragglers for up to 10 rounds, and a 403 on the
 list call means the browser is logged into a different account (the script

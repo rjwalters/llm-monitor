@@ -355,6 +355,23 @@ enum RankingExporter {
             if !resetCredits.isEmpty { obj["reset_credits"] = resetCredits }
         }
 
+        // reset_credits for Claude (#285): from the pasted cedar_ember reading,
+        // same keys as Codex's; `observed_at` says how old the paste is and
+        // `stale` marks one past the freshness threshold. Omitted when none.
+        if let claude = reading.claudeResets {
+            let r = ClaudeResetCredits.resets(from: claude)
+            var resetCredits: [String: Any] = [:]
+            if let count = r.count { resetCredits["available_count"] = count }
+            if let usable = r.usableNow {
+                resetCredits["applicable_available_count"] = usable ? (r.count ?? 1) : 0
+            }
+            if !resetCredits.isEmpty {
+                resetCredits["observed_at"] = iso8601(claude.observedAt)
+                if ClaudeResetCredits.isStale(claude) { resetCredits["stale"] = true }
+                obj["reset_credits"] = resetCredits
+            }
+        }
+
         // reset_advice (#303): whether this account should spend a stored
         // limit reset, from the latest reading and its provider's pool tally.
         // Read-only by design — the operator spends resets by hand, and
@@ -396,7 +413,8 @@ enum RankingExporter {
                 weeklyResetsAt: UsageRecord.parseISO(reading.weeklyReset),
                 sessionUsedPercent: reading.sessionPercent
             ),
-            resets: ResetAdvisor.resets(from: reading.resetCredits),
+            resets: reading.claudeResets.map { ClaudeResetCredits.resets(from: $0) }
+                ?? ResetAdvisor.resets(from: reading.resetCredits),
             pool: pool,
             now: Date()
         )
@@ -419,6 +437,8 @@ enum RankingExporter {
         /// `nil` is "unknown", never 0. Non-OpenAI and `app-server`/rollout
         /// readings never carry credits.
         let resetCredits: OpenAIUsageResponse.ResetCredits?
+        /// The latest pasted Claude reset reading (#285); nil = unknown.
+        var claudeResets: ClaudeResetCredits.Reading? = nil
 
         /// The reading as a minimal `UsageRecord`, for pool-eligibility
         /// inputs (#303): the timestamp feeds the staleness backstop and the
@@ -491,7 +511,8 @@ enum RankingExporter {
             sessionReset: sessionReset,
             weeklyReset: weeklyReset,
             updatedAt: updatedAt,
-            resetCredits: resetCredits
+            resetCredits: resetCredits,
+            claudeResets: UsageStore.loadClaudeResets(db: db, accountId: accountId)
         )
     }
 
