@@ -1603,7 +1603,7 @@ enum SelfTest {
             let dbPath = dir.appendingPathComponent("usage.db").path
             UsageStore(dbPath: dbPath).ensureDatabase()
             let db = try! openDatabase(dbPath)
-            try! db.run("INSERT INTO accounts (id, account_name, email, provider, sort_order) VALUES ('org-wrong18', 'agent-18', 'agent-18@x.com', 'anthropic', 7)")
+            try! db.run("INSERT INTO accounts (id, account_name, email, provider, sort_order, scope) VALUES ('org-wrong18', 'agent-18', 'agent-18@x.com', 'anthropic', 7, 'personal')")
             try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES ('org-other', 'other', 'other@x.com', 'anthropic')")
             try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic) VALUES ('org-wrong18', '2026-09-20T00:00:00Z', 40, 0)")
             try! db.run("INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers) VALUES ('org-wrong18', '2026-09-20T00:00:00Z', 'haiku', 200, '{}')")
@@ -1615,9 +1615,23 @@ enum SelfTest {
 
             expect(!UsageStore.rekeyAccount(db, from: "org-wrong18", to: "org-other"),
                    "re-keying onto an existing account is refused (that would merge two real accounts)")
-            expect(UsageStore.rekeyAccount(db, from: "org-wrong18", to: "org-real18"), "a mis-keyed row is re-keyed")
-
             func count(_ sql: String) -> Int64 { (try? db.scalar(sql)) as? Int64 ?? -1 }
+            try! db.execute("""
+                CREATE TRIGGER reject_history_move BEFORE UPDATE ON usage_history
+                BEGIN SELECT RAISE(ABORT, 'injected history failure'); END
+                """)
+            expect(!UsageStore.rekeyAccount(db, from: "org-wrong18", to: "org-real18"), "a failed history move aborts the re-key")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = 'org-real18'"), 0, "the copied row rolls back with its history")
+            try! db.execute("DROP TRIGGER reject_history_move")
+
+            // Re-keying copies the scope with the account row. Only a duplicate merge reconciles two scopes.
+            try! db.execute("""
+                CREATE TRIGGER reject_scope_update BEFORE UPDATE OF scope ON accounts
+                BEGIN SELECT RAISE(ABORT, 'unexpected scope update'); END
+                """)
+            expect(UsageStore.rekeyAccount(db, from: "org-wrong18", to: "org-real18"), "a mis-keyed row is re-keyed")
+            expectEqual(try? db.scalar("SELECT scope FROM accounts WHERE id = 'org-real18'") as? String,
+                        "personal", "a re-key preserves the personal scope in the row copy")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = 'org-wrong18'"), 0, "the old id is gone")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = 'org-real18' AND email = 'agent-18@x.com' AND sort_order = 7"), 1,
                         "the row keeps its email and position under the new id")

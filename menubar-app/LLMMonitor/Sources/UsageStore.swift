@@ -951,7 +951,14 @@ class UsageStore: ObservableObject {
             for (_, group) in groups where group.count > 1 {
                 let survivorId = pickMergeSurvivor(group.map { (id: $0.id, lastUpdated: $0.lastUpdated) })
                 for candidate in group where candidate.id != survivorId {
-                    mergeAccountRow(db, from: candidate.id, into: survivorId)
+                    mergeAccountRow(db, from: candidate.id, into: survivorId) {
+                        // Either duplicate may carry the local privacy preference.
+                        try db.run("""
+                            UPDATE accounts SET scope = ? WHERE id = ?
+                              AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND scope = ?)
+                        """, AccountScope.personal.rawValue, survivorId, candidate.id, AccountScope.personal.rawValue)
+                        return true
+                    }
                 }
             }
         } catch {
@@ -975,14 +982,20 @@ class UsageStore: ObservableObject {
 
     /// Merges `loserId`'s history, credential, and settings pin onto
     /// `survivorId`, then removes the now-empty `loserId` row. Runs inside a
-    /// transaction so a mid-merge failure never leaves history split across
-    /// two rows with neither id complete.
+    /// transaction with the caller's survivor preparation. Returning false
+    /// from that step cancels the merge before any history moves.
     // Pure function of its arguments — touches no instance/class main-actor
     // state.
     @discardableResult
-    nonisolated static func mergeAccountRow(_ db: Connection, from loserId: String, into survivorId: String) -> Bool {
+    private nonisolated static func mergeAccountRow(
+        _ db: Connection, from loserId: String, into survivorId: String, prepareSurvivor: () throws -> Bool
+    ) -> Bool {
         do {
-            try db.execute("BEGIN")
+            try db.execute("BEGIN IMMEDIATE")
+            guard try prepareSurvivor() else {
+                try db.execute("ROLLBACK")
+                return false
+            }
             try db.run("UPDATE usage_history SET account_id = ? WHERE account_id = ?", survivorId, loserId)
             try db.run("UPDATE probe_snapshots SET account_id = ? WHERE account_id = ?", survivorId, loserId)
             try db.run("UPDATE named_limits SET account_id = ? WHERE account_id = ?", survivorId, loserId)
@@ -1025,12 +1038,6 @@ class UsageStore: ObservableObject {
                 try db.run("DELETE FROM oauth_credentials WHERE account_id = ?", loserId)
             }
 
-            // Either row may carry the local privacy preference for this identity.
-            try db.run("""
-                UPDATE accounts SET scope = ? WHERE id = ?
-                  AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND scope = ?)
-            """, AccountScope.personal.rawValue, survivorId, loserId, AccountScope.personal.rawValue)
-
             // The user's pinned "primary" account (if it was the row being
             // removed) must keep pointing at a live account after the merge.
             try db.run("UPDATE settings SET value = ? WHERE key = ? AND value = ?",
@@ -1064,22 +1071,15 @@ class UsageStore: ObservableObject {
     /// two real accounts, not a re-key).
     @discardableResult
     nonisolated static func rekeyAccount(_ db: Connection, from oldId: String, to newId: String) -> Bool {
-        guard oldId != newId,
-              (try? db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", newId)) as? Int64 == 0,
-              (try? db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", oldId)) as? Int64 == 1 else { return false }
-        let others = tableColumns(db, "accounts").subtracting(["id"]).sorted()
-        let list = others.joined(separator: ", ")
-        do {
+        guard oldId != newId else { return false }
+        return mergeAccountRow(db, from: oldId, into: newId) {
+            guard (try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", newId)) as? Int64 == 0,
+                  (try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", oldId)) as? Int64 == 1 else { return false }
+            let others = tableColumns(db, "accounts").subtracting(["id"]).sorted()
+            let list = others.joined(separator: ", ")
             try db.run("INSERT INTO accounts (id, \(list)) SELECT ?, \(list) FROM accounts WHERE id = ?", newId, oldId)
-        } catch {
-            FileLogger.shared.error("rekeyAccount: could not copy \(oldId.prefix(8))…: \(error)", category: "DB")
-            return false
+            return true
         }
-        guard mergeAccountRow(db, from: oldId, into: newId) else {
-            try? db.run("DELETE FROM accounts WHERE id = ?", newId)
-            return false
-        }
-        return true
     }
 
     /// Seconds until the account has capacity again — the reset of whichever
