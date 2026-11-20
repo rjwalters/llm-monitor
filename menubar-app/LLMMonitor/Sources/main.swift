@@ -69,7 +69,7 @@ class PopoverHeightManager: ObservableObject {
     private static let showAllRows: CGFloat = 100_000
     private var rowCount = 0
     private var showsCalibrationNotice = false
-    private var showsUpdateNotice = false
+    private var updateNoticeRows = 0
     private var dragStartHeight: CGFloat?
     private var dragStartMouseY: CGFloat = 0
     /// The popover content's screen rect when the drag began.
@@ -90,7 +90,7 @@ class PopoverHeightManager: ObservableObject {
     /// one is most likely pending.
     func fittedHeight(rowCount: Int) -> CGFloat {
         guard rowCount > 0 else {
-            return Self.setupHeight + (showsUpdateNotice ? Self.updateNoticeHeight : 0)
+            return Self.setupHeight + CGFloat(updateNoticeRows) * Self.updateNoticeHeight
         }
         let content = contentHeight(rowCount: rowCount)
         return content.clamped(to: Self.minHeight...Self.maxHeight)
@@ -101,7 +101,7 @@ class PopoverHeightManager: ObservableObject {
     private func contentHeight(rowCount: Int) -> CGFloat {
         Self.chromeHeight + Self.providerTabsHeight
             + (showsCalibrationNotice ? Self.calibrationNoticeHeight : 0)
-            + (showsUpdateNotice ? Self.updateNoticeHeight : 0)
+            + CGFloat(updateNoticeRows) * Self.updateNoticeHeight
             + CGFloat(rowCount) * Self.rowHeight
     }
 
@@ -115,9 +115,11 @@ class PopoverHeightManager: ObservableObject {
     /// Account for the popover footer's in-app update line (#323) — offer,
     /// install progress, or short failure. Unlike the calibration notice this
     /// also applies to the zero-row setup state (see `fittedHeight`).
-    func setUpdateNotice(_ shown: Bool) {
-        guard shown != showsUpdateNotice else { return }
-        showsUpdateNotice = shown
+    /// `rows` is `UpdateChecker.noticeRows`: an offer and a refresh failure
+    /// stack as two lines.
+    func setUpdateNotice(rows: Int) {
+        guard rows != updateNoticeRows else { return }
+        updateNoticeRows = rows
         apply()
     }
 
@@ -406,7 +408,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // A completed self-update leaves its backup and staging directory for
         // the *new* version to clean up (AppUpdater) — that is now.
-        AppUpdater.cleanUpAfterUpdate()
+        if let failure = AppUpdater.cleanUpAfterUpdate() {
+            // The relaunch helper rolled the update back and recorded why.
+            UpdateChecker.shared.failInstall(failure)
+        }
     }
 
     // MARK: - Update checks (#323)

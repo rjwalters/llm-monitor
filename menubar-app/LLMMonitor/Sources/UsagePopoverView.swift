@@ -445,6 +445,10 @@ struct UpdateOfferControl: View {
     @ViewBuilder private var content: some View {
         switch checker.installState {
         case .idle:
+            // The offer and the last check's failure are independent facts: a
+            // failed re-check keeps the standing offer (UpdateChecker.apply),
+            // so both render, the failure beneath the offer.
+            VStack(alignment: .leading, spacing: 4) {
             if let offer = checker.updateAvailable {
                 if let manualReason = checker.manualUpdateReason {
                     // Signature gate refused this release: update-check-only.
@@ -502,7 +506,8 @@ struct UpdateOfferControl: View {
                         \(offer.releaseURL)
                         """)
                 }
-            } else if let failure = checker.lastCheckFailure {
+            }
+            if let failure = checker.lastCheckFailure {
                 HStack(spacing: 6) {
                     Image(systemName: "wifi.exclamationmark")
                     Text("Update check failed — \(failure)")
@@ -514,6 +519,7 @@ struct UpdateOfferControl: View {
                     The app could not read the latest release; the running version is \
                     unaffected, and the next scheduled check will try again.
                     """)
+            }
             }
         case .running(let label):
             HStack(spacing: 6) {
@@ -902,7 +908,7 @@ struct UsagePopoverView: View {
         .onAppear {
             heightManager.setVisibleProviders(visibleProviders)
             heightManager.setCalibrationNotice(calibrationNotice != nil)
-            heightManager.setUpdateNotice(updateChecker.hasNotice)
+            heightManager.setUpdateNotice(rows: updateChecker.noticeRows)
             heightManager.update(rowCount: effectiveRowCount)
             clipboardHasAccounts = Self.clipboardContainsAccounts()
             // A persisted tab for a provider that no longer has any account
@@ -915,8 +921,8 @@ struct UsagePopoverView: View {
         .onChange(of: calibrationNotice != nil) { _, shown in
             heightManager.setCalibrationNotice(shown)
         }
-        .onChange(of: updateChecker.hasNotice) { _, shown in
-            heightManager.setUpdateNotice(shown)
+        .onChange(of: updateChecker.noticeRows) { _, rows in
+            heightManager.setUpdateNotice(rows: rows)
         }
         .onChange(of: effectiveRowCount) { _, newCount in
             heightManager.update(rowCount: newCount)

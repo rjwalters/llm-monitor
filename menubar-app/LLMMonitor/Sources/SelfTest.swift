@@ -43,6 +43,9 @@ enum SelfTest {
         ("UpdateFeedSelection", { testUpdateFeedSelection() }),
         ("UpdateCheckerStateTransitions", { testUpdateCheckerStateTransitions() }),
         ("UpdateSignatureGate", { testUpdateSignatureGate() }),
+        ("UpdateHandoffScript", { testUpdateHandoffScript() }),
+        ("UpdateBackupOwnership", { testUpdateBackupOwnership() }),
+        ("UpdatePopoverStateConsistency", { testUpdatePopoverStateConsistency() }),
         ("SHA256KnownVectors", { testSHA256KnownVectors() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
@@ -1696,6 +1699,198 @@ enum SelfTest {
         checker.apply(.offer(signedOffer))
         expectEqual(checker.manualUpdateReason, nil,
                     "offering a different release clears the refusal for a fresh chance")
+    }
+
+    /// The relaunch helper (#323): it must never launch while the old process
+    /// is alive, and when the launcher fails it must restore the previous
+    /// bundle, relaunch it, record why, and drop the pending record. Runs
+    /// the real script body under `/bin/sh` with a controllable launcher.
+    private static func testUpdateHandoffScript() {
+        struct Layout {
+            let installed: String, backup: String, failure: String, pending: String, log: String
+        }
+        func withLayout(launcherExit: Int, _ body: (Layout, String) throws -> Void) {
+            withSelfTestTempDir("handoff") { dir in
+                do {
+                    let fm = FileManager.default
+                    let layout = Layout(
+                        installed: dir.appendingPathComponent("LLMMonitor.app").path,
+                        backup: dir.appendingPathComponent(".LLMMonitor.app.old-test").path,
+                        failure: dir.appendingPathComponent("failure.txt").path,
+                        pending: dir.appendingPathComponent("pending.json").path,
+                        log: dir.appendingPathComponent("launches.log").path)
+                    for (path, marker) in [(layout.installed, "new"), (layout.backup, "old")] {
+                        try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+                        try Data(marker.utf8).write(to: URL(fileURLWithPath: path + "/marker"))
+                    }
+                    try UpdateHandoff.writePending(
+                        UpdateHandoff.Pending(installedPath: layout.installed, backupPath: layout.backup,
+                                              expectedVersion: "9.9.9"), to: layout.pending)
+                    let launcher = try writeStub(in: dir, name: "launcher", body: """
+                        #!/bin/sh
+                        echo "$1" >> '\(layout.log)'
+                        exit \(launcherExit)
+                        """)
+                    try body(layout, launcher)
+                } catch {
+                    expect(false, "handoff scenario threw: \(error)")
+                }
+            }
+        }
+        func marker(_ path: String) -> String? {
+            FileManager.default.contents(atPath: path + "/marker").flatMap { String(data: $0, encoding: .utf8) }
+        }
+        func launches(_ layout: Layout) -> [String] {
+            (FileManager.default.contents(atPath: layout.log).flatMap { String(data: $0, encoding: .utf8) } ?? "")
+                .split(separator: "\n").map(String.init)
+        }
+        func run(_ layout: Layout, _ launcher: String, pid: String, polls: String) throws -> Int32 {
+            let result = try AccountSyncRemote.runProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", UpdateHandoff.relaunchScript, "handoff", pid, layout.installed, layout.backup,
+                            layout.failure, launcher, polls, "0.05", layout.pending],
+                timeout: 30)
+            expect(!result.timedOut, "the handoff script finishes")
+            return result.status
+        }
+        // A pid that has certainly exited: the shell that printed it is gone.
+        let exitedPid: String = {
+            let r = try? AccountSyncRemote.runProcess(
+                executable: "/bin/sh", arguments: ["-c", "echo $$"], timeout: 10)
+            return r.flatMap { String(data: $0.stdout, encoding: .utf8) }?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "999999"
+        }()
+
+        // 1. Old process gone, launch succeeds: new bundle stays, backup kept
+        //    for the new app to confirm, nothing recorded as failed.
+        withLayout(launcherExit: 0) { layout, launcher in
+            let status = try run(layout, launcher, pid: exitedPid, polls: "5")
+            expectEqual(status, 0, "a clean handoff exits 0")
+            expectEqual(launches(layout), [layout.installed], "the new bundle is launched exactly once")
+            expectEqual(marker(layout.installed), "new", "the new bundle stays installed")
+            expect(FileManager.default.fileExists(atPath: layout.backup), "the backup waits for the new app to confirm")
+            expect(!FileManager.default.fileExists(atPath: layout.failure), "no failure recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) != nil, "the pending record stays until confirmation")
+        }
+
+        // 2. Old process still alive after the poll budget: nothing launches,
+        //    the previous bundle is put back, and the reason is recorded.
+        withLayout(launcherExit: 0) { layout, launcher in
+            let status = try run(layout, launcher, pid: String(getpid()), polls: "3")
+            expectEqual(status, 1, "a never-exiting parent fails the handoff")
+            expectEqual(launches(layout), [], "the launcher is never reached while the old process lives")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored at the installed path")
+            expect(!FileManager.default.fileExists(atPath: layout.backup), "the backup was moved back")
+            expectEqual(UpdateHandoff.takeFailure(at: layout.failure),
+                        "the running app did not quit, so the update was rolled back",
+                        "the rollback reason is recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped with the backup")
+        }
+
+        // 3. Old process gone but the launcher fails: restore, relaunch the
+        //    previous bundle, record the error.
+        withLayout(launcherExit: 1) { layout, launcher in
+            let status = try run(layout, launcher, pid: exitedPid, polls: "5")
+            expectEqual(status, 1, "a failed launch fails the handoff")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored after a failed launch")
+            expect(!FileManager.default.fileExists(atPath: layout.backup), "the backup was moved back")
+            expectEqual(launches(layout), [layout.installed, layout.installed],
+                        "the new bundle is tried, then the restored previous bundle is relaunched")
+            expectEqual(UpdateHandoff.takeFailure(at: layout.failure),
+                        "the updated app could not be launched; the previous version was restored",
+                        "the launch failure is recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped")
+        }
+    }
+
+    /// The recovery backup belongs to the install that created it (#323): a
+    /// second copy launched beside it, or a rolled-back old version, must not
+    /// delete it; only the new bundle at the installed path, at the expected
+    /// version, may.
+    private static func testUpdateBackupOwnership() {
+        let pending = UpdateHandoff.Pending(
+            installedPath: "/Applications/LLMMonitor.app",
+            backupPath: "/Applications/.LLMMonitor.app.old-abc12345",
+            expectedVersion: "9.9.9")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor.app",
+                                         runningVersion: "9.9.9"),
+            pending.backupPath, "the confirmed new install removes its backup")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor 2.app",
+                                         runningVersion: "9.9.9"),
+            nil, "a second copy beside the backup must not delete it")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Users/x/Downloads/LLMMonitor.app",
+                                         runningVersion: "9.9.9"),
+            nil, "a copy elsewhere must not delete it")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor.app",
+                                         runningVersion: "2.2.0"),
+            nil, "the old version at the installed path has not confirmed the new one")
+        expectEqual(
+            UpdateHandoff.backupName(token: "abc12345"), ".LLMMonitor.app.old-abc12345",
+            "backup names are per-install")
+
+        withSelfTestTempDir("handoff-pending") { dir in
+            let path = dir.appendingPathComponent(UpdateHandoff.pendingFileName).path
+            do {
+                try UpdateHandoff.writePending(pending, to: path)
+                expectEqual(UpdateHandoff.readPending(at: path), pending, "the pending record round-trips")
+                UpdateHandoff.clearPending(at: path)
+                expect(UpdateHandoff.readPending(at: path) == nil, "clearing removes the record")
+                let failure = dir.appendingPathComponent(UpdateHandoff.failureFileName).path
+                try Data("  boom \n".utf8).write(to: URL(fileURLWithPath: failure))
+                expectEqual(UpdateHandoff.takeFailure(at: failure), "boom", "the failure line is trimmed")
+                expect(UpdateHandoff.takeFailure(at: failure) == nil, "a failure is reported once")
+            } catch {
+                expect(false, "pending record I/O threw: \(error)")
+            }
+        }
+    }
+
+    /// The popover's view of the last check and the install (#323): a failed
+    /// refresh is visible *alongside* a retained offer, and an obsolete install
+    /// failure clears once the offer goes away.
+    private static func testUpdatePopoverStateConsistency() {
+        let offer = UpdateInfo(
+            version: "9.9.9",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.9",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.9/LLMMonitor.zip",
+            sha256: String(repeating: "ab", count: 32))
+
+        // Offer, then a failed refresh: both are shown (two rows).
+        let a = UpdateChecker()
+        a.apply(.offer(offer))
+        expectEqual(a.noticeRows, 1, "an offer alone is one row")
+        a.apply(.failed("offline"))
+        expectEqual(a.updateAvailable, offer, "the offer is retained")
+        expectEqual(a.lastCheckFailure, "offline", "the refresh failure is recorded beside it")
+        expectEqual(a.noticeRows, 2, "offer and refresh failure both render")
+        a.apply(.offer(offer))
+        expectEqual(a.noticeRows, 1, "a successful refresh drops the failure line")
+
+        // Install failure, then the offer disappears (equal/older release):
+        // the stale failure must not keep the strip alive.
+        let b = UpdateChecker()
+        b.apply(.offer(offer))
+        b.beginInstall()
+        b.failInstall("could not replace the installed app")
+        expectEqual(b.noticeRows, 1, "an install failure is one row")
+        b.apply(.uptodate)
+        expectEqual(b.installState, .idle, "an obsolete install failure clears with the offer")
+        expect(!b.hasNotice, "nothing left to show")
+
+        // The same when a refresh fails after the offer is gone: failure only.
+        b.apply(.failed("offline"))
+        expectEqual(b.noticeRows, 1, "a refresh failure alone is one row")
+
+        // Up-to-date also clears a manual-update refusal tied to the old offer.
+        let c = UpdateChecker()
+        c.apply(.offer(offer))
+        c.degradeToManualUpdate("the release is not Developer ID signed")
+        c.apply(.uptodate)
+        expectEqual(c.manualUpdateReason, nil, "no offer, no manual-update reason")
     }
 
     /// The hand-rolled SHA-256 against published FIPS 180-4 vectors — what

@@ -2010,8 +2010,15 @@ class UpdateChecker: ObservableObject {
     /// True when any update line should render: an offer, install progress,
     /// or a failure reason. The one rule the popover strip and its height
     /// reservation both read, so they can never disagree.
-    var hasNotice: Bool {
-        updateAvailable != nil || lastCheckFailure != nil || installState != .idle
+    var hasNotice: Bool { noticeRows > 0 }
+
+    /// How many lines the update strip renders. While an install runs or has
+    /// failed only that one line shows; when idle, a standing offer and the
+    /// last check's failure are independent and stack (the failed re-check
+    /// keeps the offer, so the user sees both).
+    var noticeRows: Int {
+        if installState != .idle { return 1 }
+        return (updateAvailable != nil ? 1 : 0) + (lastCheckFailure != nil ? 1 : 0)
     }
 
     /// One release check against the canonical repository. Only the GUI's
@@ -2065,6 +2072,10 @@ class UpdateChecker: ObservableObject {
         case .uptodate:
             updateAvailable = nil
             lastCheckFailure = nil
+            manualUpdateReason = nil
+            // No offer left means an earlier install failure has nothing to
+            // retry into; leaving it would keep `hasNotice` true forever.
+            if case .failed = installState { installState = .idle }
         case .failed(let reason):
             lastCheckFailure = reason
         }
