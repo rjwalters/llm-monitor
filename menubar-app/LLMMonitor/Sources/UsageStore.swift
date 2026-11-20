@@ -1935,27 +1935,106 @@ class UsageStore: ObservableObject {
 
 struct AppVersion {
     static let current = "2.2.0"
-    static let repoOwner = "rjwalters"
+    /// The canonical repository whose Releases the in-app updater reads and
+    /// installs from (#323) — also the repo Quick Install links to. Before
+    /// #323 this named the previous repository owner, so the old chart-only
+    /// checker asked a stale fork for advice.
+    static let repoOwner = "2AMLogic"
     static let repoName = "llm-monitor"
 }
 
-struct UpdateInfo {
+/// A selected update candidate (#323): a *strictly newer, stable* release
+/// whose macOS archive is verifiable before anything installs it. Selection
+/// rules live in `ReleaseFeed`; this is just the value they produce.
+struct UpdateInfo: Equatable {
     let version: String
+    /// The canonical release page for the manual update button and tooltips.
     let releaseURL: String
+    /// HTTPS URL of the `LLMMonitor.zip` asset: the bytes the updater
+    /// downloads and hash-checks.
+    let archiveURL: String
+    /// Lowercase hex SHA-256 GitHub reports for that asset. The download is
+    /// rejected unless its own bytes hash to exactly this.
+    let sha256: String
 }
 
-// Only ever instantiated from a SwiftUI `@StateObject` in the macOS-only
-// chart window (UsageChartView.swift), so @MainActor isolation matches the
-// only actual caller rather than papering over the diagnostic.
+/// What an "Update now" click is doing, for every surface to render (#323):
+/// the popover footer strip and the chart overlay both switch on this.
+enum UpdateInstallState: Equatable {
+    case idle
+    /// Step label ("Downloading…", "Verifying…", "Extracting…",
+    /// "Installing…", "Relaunching…").
+    case running(String)
+    /// Short reason the install did not complete. The running app is intact
+    /// (or restored) when this is set — see `AppUpdater`.
+    case failed(String)
+}
+
+// Observed from SwiftUI views on the macOS main thread (the popover's footer
+// strip and the chart overlay), mutated from the app's main-thread call path
+// (AppDelegate's launch/24h schedule, AppUpdater's install task), and driven
+// offline by `SelfTest` — so @MainActor isolation matches the actual callers
+// rather than papering over a diagnostic.
 @MainActor
 class UpdateChecker: ObservableObject {
-    @Published var updateAvailable: UpdateInfo?
-    @Published var isChecking = false
+    @Published private(set) var updateAvailable: UpdateInfo?
+    @Published private(set) var isChecking = false
+    /// Short reason the most recent *check* failed (#323). Separate from
+    /// `installState` because a failed re-check must not disturb an offer a
+    /// previous check already validated — it only records why this one could
+    /// not confirm it.
+    @Published private(set) var lastCheckFailure: String?
+    @Published private(set) var installState: UpdateInstallState = .idle
+    /// Why the standing offer cannot be self-installed: the signature gate
+    /// refused it (operator ruling 2026-11-19 — release unsigned, wrongly
+    /// signed, or Gatekeeper-rejected). While set, the app runs
+    /// update-check-only: the offer stays visible and updating happens from
+    /// the release page, never a one-click replace. Cleared when a
+    /// *different* release is offered, so a newly signed release gets a
+    /// fresh chance at self-install.
+    @Published private(set) var manualUpdateReason: String?
+    /// Why the previous launch's self-update was rolled back (#323), recorded
+    /// by the relaunch helper and read at startup. Deliberately **not**
+    /// `installState`: the launch's own feed check re-offers the same
+    /// release and resets `installState`, which would erase the only
+    /// explanation of why the app is still old. It stays until the user
+    /// dismisses it or starts another install.
+    @Published private(set) var handoffFailure: String?
 
     static let shared = UpdateChecker()
 
+    /// The persistent macOS preference that disables both scheduled checks,
+    /// read fresh every time so toggling it takes effect without a relaunch:
+    ///
+    ///     defaults write com.llm-monitor.app DisableUpdateCheck -bool true
+    ///
+    /// Documented in README "Staying Current".
+    static let disablePreferenceKey = "DisableUpdateCheck"
+    static var disabledByPreference: Bool {
+        UserDefaults.standard.bool(forKey: disablePreferenceKey)
+    }
+
+    /// True when any update line should render: an offer, install progress,
+    /// or a failure reason. The one rule the popover strip and its height
+    /// reservation both read, so they can never disagree.
+    var hasNotice: Bool { noticeRows > 0 }
+
+    /// How many lines the update strip renders. While an install runs or has
+    /// failed only that one line shows; when idle, a standing offer and the
+    /// last check's failure are independent and stack (the failed re-check
+    /// keeps the offer, so the user sees both).
+    var noticeRows: Int {
+        if installState != .idle { return 1 }
+        return (updateAvailable != nil ? 1 : 0) + (lastCheckFailure != nil ? 1 : 0)
+            + (handoffFailure != nil ? 1 : 0)
+    }
+
+    /// One release check against the canonical repository. Only the GUI's
+    /// schedule (`AppDelegate.scheduleUpdateChecks`, #323) calls this — the
+    /// popover and charts observe the shared result and never start one.
     func checkForUpdates() {
         guard !isChecking else { return }
+        guard !Self.disabledByPreference else { return }
         isChecking = true
 
         let urlString = "https://api.github.com/repos/\(AppVersion.repoOwner)/\(AppVersion.repoName)/releases/latest"
@@ -1966,41 +2045,79 @@ class UpdateChecker: ObservableObject {
 
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+        request.setValue("llm-monitor/\(AppVersion.current)", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            // Pure selection off the main thread; state changes hop back.
+            let outcome = ReleaseFeed.selection(
+                currentVersion: AppVersion.current,
+                payload: data,
+                errorText: error.map { $0.localizedDescription })
             DispatchQueue.main.async {
                 self?.isChecking = false
-
-                guard let data = data, error == nil else { return }
-
-                do {
-                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let tagName = json["tag_name"] as? String,
-                       let htmlURL = json["html_url"] as? String {
-                        let latestVersion = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
-
-                        if self?.isNewerVersion(latestVersion, than: AppVersion.current) == true {
-                            self?.updateAvailable = UpdateInfo(version: latestVersion, releaseURL: htmlURL)
-                        }
-                    }
-                } catch {
-                    print("Failed to parse release info: \(error)")
-                }
+                self?.apply(outcome)
             }
         }.resume()
     }
 
-    private func isNewerVersion(_ new: String, than current: String) -> Bool {
-        let newParts = new.split(separator: ".").compactMap { Int($0) }
-        let currentParts = current.split(separator: ".").compactMap { Int($0) }
-
-        for i in 0..<max(newParts.count, currentParts.count) {
-            let newPart = i < newParts.count ? newParts[i] : 0
-            let currentPart = i < currentParts.count ? currentParts[i] : 0
-
-            if newPart > currentPart { return true }
-            if newPart < currentPart { return false }
+    /// Fold one check's outcome into the published state: offer → show,
+    /// up-to-date → clear, failed → keep any standing offer and record the
+    /// reason. Also the seam the self-test drives directly (no network).
+    func apply(_ outcome: ReleaseFeed.Outcome) {
+        switch outcome {
+        case .offer(let info):
+            // A *different* release gets a fresh chance at self-install (it
+            // may be properly signed where its predecessor was not); the
+            // same release keeps its signature-gate refusal, so a 24h
+            // re-check cannot resurrect an Update Now button that would only
+            // download and refuse again.
+            if info.version != updateAvailable?.version { manualUpdateReason = nil }
+            updateAvailable = info
+            lastCheckFailure = nil
+            // A fresh, re-validated offer resets stale install state so its
+            // button is live again.
+            installState = .idle
+        case .uptodate:
+            updateAvailable = nil
+            lastCheckFailure = nil
+            manualUpdateReason = nil
+            // No offer left means an earlier install failure has nothing to
+            // retry into; leaving it would keep `hasNotice` true forever.
+            if case .failed = installState { installState = .idle }
+        case .failed(let reason):
+            lastCheckFailure = reason
         }
-        return false
+    }
+
+    // MARK: Install progress (driven by AppUpdater)
+
+    func beginInstall() {
+        handoffFailure = nil
+        installState = .running("Downloading…")
+    }
+
+    /// Record the rollback reason the relaunch helper left behind.
+    func recordHandoffFailure(_ reason: String) { handoffFailure = reason }
+
+    /// The user has seen the rollback reason.
+    func dismissHandoffFailure() { handoffFailure = nil }
+
+    /// Advance the running label. Ignored unless an install is running, so a
+    /// late progress step can never resurrect a failed state.
+    func updateInstallProgress(_ label: String) {
+        guard case .running = installState else { return }
+        installState = .running(label)
+    }
+
+    func failInstall(_ reason: String) { installState = .failed(reason) }
+
+    /// Degrade to update-check-only (operator ruling 2026-11-19): the
+    /// standing offer was refused by the signature gate, so it stays visible
+    /// with a download-from-GitHub action instead of a one-click install.
+    /// Not an install failure — nothing is wrong with the machine, which is
+    /// why the state goes back to idle rather than failed.
+    func degradeToManualUpdate(_ reason: String) {
+        manualUpdateReason = reason
+        installState = .idle
     }
 }

@@ -153,6 +153,17 @@ final class PipeDrain: @unchecked Sendable {
         return reachedEOF
     }
 
+    /// Snapshot of everything read so far, without waiting. Complete once
+    /// `isFinished`; for a caller that has already observed `isFinished`
+    /// (e.g. via `finishAndClose`) this is the full output and costs no
+    /// blocking — the main-actor-safe way to capture a short-lived tool's
+    /// text where `waitForEOF`'s semaphore wait would pin the thread.
+    var dataSoFar: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
+    }
+
     /// Blocks the calling thread until the child closed this pipe. Returns
     /// everything read, or empty when a chunk handler consumed it instead.
     ///

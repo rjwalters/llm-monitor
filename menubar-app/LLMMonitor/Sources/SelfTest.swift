@@ -39,6 +39,14 @@ enum SelfTest {
         ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
         ("PoolInputAssembly", { testPoolInputAssembly() }),
         ("ResetAdvisor", { testResetAdvisor() }),
+        ("UpdateVersionComparison", { testUpdateVersionComparison() }),
+        ("UpdateFeedSelection", { testUpdateFeedSelection() }),
+        ("UpdateCheckerStateTransitions", { testUpdateCheckerStateTransitions() }),
+        ("UpdateSignatureGate", { testUpdateSignatureGate() }),
+        ("UpdateHandoffScript", { testUpdateHandoffScript() }),
+        ("UpdateBackupOwnership", { testUpdateBackupOwnership() }),
+        ("UpdatePopoverStateConsistency", { testUpdatePopoverStateConsistency() }),
+        ("SHA256KnownVectors", { testSHA256KnownVectors() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
         ("MissingSessionWindow", { testMissingSessionWindow() }),
@@ -1357,6 +1365,633 @@ enum SelfTest {
             ),
             "resets: unknown",
             "a reading with no reset-credit archive says unknown, never 0")
+    }
+
+    // MARK: - In-app update selection (#323)
+
+    /// Version arithmetic behind "strictly newer": zero-padded component
+    /// comparison, strict inequality, and malformed-never-newer (the failure
+    /// mode of the old `compactMap { Int($0) }` comparer, which silently
+    /// dropped the "-rc1" component and ranked prereleases as releases).
+    private static func testUpdateVersionComparison() {
+        expect(Version.isNewer("2.10.0", than: "2.9.0"), "2.10.0 beats 2.9.0 numerically, not lexically")
+        expect(Version.isNewer("2.2.1", than: "2.2.0"), "patch bump is newer")
+        expect(Version.isNewer("3.0", than: "2.99.99"), "major bump wins over lower components")
+        expect(!Version.isNewer("2.2", than: "2.2.0"), "2.2 equals 2.2.0 (zero padding)")
+        expect(!Version.isNewer("2.1.9", than: "2.2.0"), "older release is not newer")
+        expect(!Version.isNewer("2.1.0-rc1", than: "2.1.0"), "prerelease-suffixed tag is malformed, never newer")
+        expect(!Version.isNewer("release-2026", than: "2.0.0"), "non-numeric tag is malformed, never newer")
+        expect(!Version.isNewer("2.1.0", than: "release-9"), "malformed current version is never superseded")
+        expectEqual(Version.parse("2.10.0"), [2, 10, 0], "well-formed version parses to components")
+        expectEqual(Version.parse("v2.10.0"), nil, "parse takes the bare version; tag stripping is ReleaseFeed's job")
+        expectEqual(Version.parse(""), nil, "empty string is malformed")
+        expectEqual(Version.parse("2..3"), nil, "empty component is malformed")
+        expectEqual(Version.parse("2.-1.0"), nil, "negative component is malformed")
+        expectEqual(Version.parse("2.x.0"), nil, "non-numeric component is malformed")
+        expectEqual(Version.parse("99999999999999999999.0"), nil, "overflowing component is malformed")
+        expectEqual(ReleaseFeed.strippedTag("v2.10.0"), "2.10.0", "leading v is stripped")
+        expectEqual(ReleaseFeed.strippedTag("V2.10.0"), "2.10.0", "leading capital V is stripped")
+        expectEqual(ReleaseFeed.strippedTag("release-2.10.0"), nil, "prefixed tag stays malformed")
+        expectEqual(ReleaseFeed.strippedTag("v2.10.0-rc1"), nil, "suffixed tag stays malformed")
+    }
+
+    /// A GitHub Releases payload shaped like the real feed (verified against
+    /// `api.github.com/repos/2AMLogic/llm-monitor/releases/tags/v2.1.0`,
+    /// 2026-11: `LLMMonitor.zip` plus the two Linux binaries, each carrying a
+    /// `sha256:` digest), with the knobs the selection tests vary.
+    private static func releaseFeedFixture(
+        tag: String,
+        prerelease: Bool = false,
+        draft: Bool = false,
+        macOSAssetName: String? = ReleaseFeed.macOSAssetName,
+        digest: String? = "sha256:" + String(repeating: "ab", count: 32),
+        downloadURL: String = "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/LLMMonitor.zip",
+        includeReleasePage: Bool = true
+    ) -> Data {
+        var assets: [[String: Any]] = []
+        if let macOSAssetName {
+            var asset: [String: Any] = [
+                "name": macOSAssetName,
+                "browser_download_url": downloadURL,
+                "size": 2_563_992,
+            ]
+            if let digest { asset["digest"] = digest }
+            assets.append(asset)
+        }
+        // The Linux binaries ride along exactly as the real feed has them:
+        // the selector must skip them, not trip over them.
+        assets.append([
+            "name": "llm-monitor-linux-x64",
+            "browser_download_url": "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/llm-monitor-linux-x64",
+            "digest": "sha256:" + String(repeating: "cd", count: 32),
+        ])
+        assets.append([
+            "name": "claude-monitor-linux-x64",
+            "browser_download_url": "https://github.com/2AMLogic/llm-monitor/releases/download/fixture/claude-monitor-linux-x64",
+            "digest": "sha256:" + String(repeating: "ef", count: 32),
+        ])
+        var payload: [String: Any] = [
+            "tag_name": tag,
+            "prerelease": prerelease,
+            "draft": draft,
+            "assets": assets,
+        ]
+        if includeReleasePage { payload["html_url"] = "https://github.com/2AMLogic/llm-monitor/releases/tag/\(tag)" }
+        // A fixture builder may never fail silently.
+        return try! JSONSerialization.data(withJSONObject: payload)
+    }
+
+    private static func expectUptodate(_ payload: Data, current: String, _ label: String) {
+        let outcome = ReleaseFeed.selection(currentVersion: current, payload: payload, errorText: nil)
+        expectEqual(outcome, .uptodate, label)
+    }
+
+    private static func expectUpdateCheckFailure(
+        payload: Data?, errorText: String?, current: String, _ label: String
+    ) {
+        checks += 1
+        guard case .failed = ReleaseFeed.selection(currentVersion: current, payload: payload, errorText: errorText) else {
+            failures.append(label)
+            return
+        }
+    }
+
+    /// Release selection over fixtures: strictly-newer stable releases with a
+    /// verifiable macOS archive offer; equal/older, prereleases (flagged or
+    /// merely shaped), malformed tags, missing assets/digests and non-HTTPS
+    /// URLs clear the offer; unreadable feeds and network errors surface a
+    /// reason instead (#323's curated fixture matrix).
+    private static func testUpdateFeedSelection() {
+        let current = "2.9.0"
+        let happy = releaseFeedFixture(tag: "v2.10.0")
+
+        // The happy path: strictly newer stable release with a digest-verified zip.
+        guard case .offer(let info) = ReleaseFeed.selection(currentVersion: current, payload: happy, errorText: nil) else {
+            expect(false, "newer stable release with a digest-verified zip offers an update")
+            return
+        }
+        expectEqual(info.version, "2.10.0", "offered version strips the leading v")
+        expectEqual(info.sha256, String(repeating: "ab", count: 32), "offered digest is the lowercase hex part")
+        expect(info.archiveURL.hasPrefix("https://"), "offered archive URL is the asset's https URL")
+        expectEqual(info.releaseURL, "https://github.com/2AMLogic/llm-monitor/releases/tag/v2.10.0",
+                    "manual update opens the canonical release page")
+        let noPage = releaseFeedFixture(tag: "v2.10.0", includeReleasePage: false)
+        expectEqual(ReleaseFeed.selection(currentVersion: current, payload: noPage, errorText: nil),
+                    .offer(info), "missing html_url still opens the release page")
+
+        // Equal and older versions clear the offer (an equal version must
+        // clear, not merely fail to set — that is the "clears the offer" AC).
+        expectUptodate(releaseFeedFixture(tag: "v2.9.0"), current: current, "equal version is up-to-date")
+        expectUptodate(releaseFeedFixture(tag: "v2.9"), current: current, "equal version with fewer components is up-to-date")
+        expectUptodate(releaseFeedFixture(tag: "v2.9.1"), current: "2.10.0", "older version is up-to-date")
+
+        // Prereleases never offer — flagged by GitHub…
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", prerelease: true), current: current, "prerelease flag suppresses the offer")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", draft: true), current: current, "draft flag suppresses the offer")
+        // …and merely shaped like one even when mis-flagged stable.
+        expectUptodate(releaseFeedFixture(tag: "v2.11.0-rc1"), current: current, "prerelease-shaped tag never offers even when flagged stable")
+
+        // Malformed tags never offer and never crash.
+        expectUptodate(releaseFeedFixture(tag: "release-2026"), current: current, "non-numeric tag never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.x.0"), current: current, "non-numeric component never offers")
+        expectUpdateCheckFailure(payload: releaseFeedFixture(tag: ""), errorText: nil, current: current,
+                                 "empty tag_name is a failed check, not a silent all-clear")
+
+        // No verifiable macOS archive → no offer: the updater refuses to
+        // install bytes it cannot check or fetch securely.
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", macOSAssetName: nil), current: current, "feed without the macOS archive never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: nil), current: current, "asset without a digest never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: "sha256:" + String(repeating: "zz", count: 32)), current: current, "non-hex digest never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: "sha256:abc"), current: current, "truncated digest never offers")
+        expectUptodate(releaseFeedFixture(tag: "v2.10.0", digest: "md5:" + String(repeating: "ab", count: 16)), current: current, "non-SHA-256 digest never offers")
+        expectUptodate(
+            releaseFeedFixture(tag: "v2.10.0", downloadURL: "http://github.com/2AMLogic/llm-monitor/releases/download/fixture/LLMMonitor.zip"),
+            current: current, "non-https download URL never offers")
+
+        // A check that cannot read the feed is a failure with a reason, not
+        // "up-to-date": a failed re-check must not clear a standing offer.
+        expectUpdateCheckFailure(payload: nil, errorText: "offline", current: current, "network error is a failed check")
+        expectUpdateCheckFailure(payload: Data("not json".utf8), errorText: nil, current: current, "garbage payload is a failed check")
+        expectUpdateCheckFailure(payload: Data("{\"message\":\"Not Found\"}".utf8), errorText: nil, current: current, "tagless 404 body is a failed check")
+
+        // Digest parsing details.
+        expectEqual(ReleaseFeed.parseDigest("sha256:" + String(repeating: "0a", count: 32)),
+                    String(repeating: "0a", count: 32), "sha256 digest parses to lowercase hex")
+        expectEqual(ReleaseFeed.parseDigest("SHA256:" + String(repeating: "0A", count: 32)),
+                    String(repeating: "0a", count: 32), "digest parsing is case-insensitive")
+        expectEqual(ReleaseFeed.parseDigest("sha256:abc"), nil, "short digest is rejected")
+        expectEqual(ReleaseFeed.parseDigest("sha256:" + String(repeating: "0a", count: 33)), nil, "overlong digest is rejected")
+        expectEqual(ReleaseFeed.parseDigest(nil), nil, "absent digest is rejected")
+    }
+
+    /// The checker's published state machine, driven offline through the same
+    /// `apply` seam the network path uses: offers show, up-to-date clears, a
+    /// failed re-check keeps a standing offer, and install progress can never
+    /// resurrect a failed state (#323).
+    private static func testUpdateCheckerStateTransitions() {
+        let checker = UpdateChecker()
+        let offer = UpdateInfo(
+            version: "9.9.9",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.9",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.9/LLMMonitor.zip",
+            sha256: String(repeating: "ab", count: 32))
+
+        expect(!checker.hasNotice, "fresh checker has nothing to show")
+        expectEqual(checker.installState, UpdateInstallState.idle, "fresh checker is idle")
+
+        checker.apply(.offer(offer))
+        expect(checker.hasNotice, "offer publishes availability")
+        expectEqual(checker.updateAvailable, offer, "the offered candidate is the applied one")
+
+        checker.apply(.failed("offline"))
+        expectEqual(checker.updateAvailable, offer, "a failed re-check keeps the standing offer")
+        expectEqual(checker.lastCheckFailure, "offline", "a failed check records its reason")
+
+        checker.apply(.uptodate)
+        expect(!checker.hasNotice, "an up-to-date check clears offer and failure")
+
+        checker.apply(.failed("offline"))
+        expect(checker.hasNotice, "a failed check alone is still visible")
+
+        checker.beginInstall()
+        expectEqual(checker.installState, UpdateInstallState.running("Downloading…"), "install begins as running")
+        checker.updateInstallProgress("Verifying…")
+        expectEqual(checker.installState, .running("Verifying…"), "progress advances the label")
+        checker.failInstall("digest mismatch")
+        expectEqual(checker.installState, .failed("digest mismatch"), "failure records its reason")
+        checker.updateInstallProgress("Installing…")
+        expectEqual(checker.installState, .failed("digest mismatch"), "progress after failure is ignored")
+        checker.apply(.offer(offer))
+        expectEqual(checker.installState, .idle, "a fresh offer resets stale install state")
+    }
+
+    /// The signature gate over a staged update (operator ruling 2026-11-19):
+    /// every refusal branch — codesign verification error, Gatekeeper
+    /// rejection, unsigned release, wrong team, unsigned *running* app —
+    /// refuses, and only a fully-verified same-team bundle installs. Plus
+    /// the `codesign -dv` team parse and the checker's degrade-to-manual
+    /// state, which must survive a same-version re-offer and clear on a new
+    /// release.
+    private static func testUpdateSignatureGate() {
+        // The one input that installs: both verifications pass and the teams
+        // match — the team read from the *running* bundle, not the release.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: "W2G9X7KLQC")),
+            .install, "verified same-team bundle installs")
+
+        // Verification error: codesign --verify exited non-zero (unsigned or
+        // self-inconsistent). The ruling's "verification fails" branch.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: false, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: "W2G9X7KLQC")),
+            .refuse(.codesignVerifyFailed), "codesign verification error refuses")
+
+        // Gatekeeper rejection: signed but spctl would not run it (e.g.
+        // Developer ID without notarization).
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: false,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: "W2G9X7KLQC")),
+            .refuse(.gatekeeperRejected), "Gatekeeper rejection refuses")
+
+        // Unsigned release: no team identifier at all (nil, ad-hoc "not
+        // set", or empty — all the same answer). The ruling's "release is
+        // not Developer ID signed" branch, and today's actual release shape.
+        for staged in [nil, "", "not set", "NOT SET"] {
+            expectEqual(SignatureGate.decide(SignatureGate.Input(
+                codesignVerified: true, gatekeeperAccepted: true,
+                stagedTeamIdentifier: staged, runningTeamIdentifier: "W2G9X7KLQC")),
+                .refuse(.releaseNotDeveloperIDSigned), "unsigned release refuses (staged team \(staged ?? "nil"))")
+        }
+
+        // Wrong team: the release is signed, but by someone else. The
+        // ruling's "wrong team" branch.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "XXXXXXXXXX", runningTeamIdentifier: "W2G9X7KLQC")),
+            .refuse(.teamMismatch(staged: "XXXXXXXXXX", running: "W2G9X7KLQC")),
+            "release signed by a different team refuses")
+
+        // Unsigned *running* app: provenance continuity cannot be
+        // established, so even a properly signed release refuses — the
+        // one-time hop to a signed build happens from the release page.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: true, gatekeeperAccepted: true,
+            stagedTeamIdentifier: "W2G9X7KLQC", runningTeamIdentifier: nil)),
+            .refuse(.teamMismatch(staged: "W2G9X7KLQC", running: nil)),
+            "signed release over an unsigned running app refuses")
+
+        // Refusals are checked in the ruling's order: a bundle that fails
+        // codesign never reaches the (meaningless) team comparison.
+        expectEqual(SignatureGate.decide(SignatureGate.Input(
+            codesignVerified: false, gatekeeperAccepted: false,
+            stagedTeamIdentifier: nil, runningTeamIdentifier: nil)),
+            .refuse(.codesignVerifyFailed), "the most fundamental failure is reported first")
+
+        // Team-identifier parsing from `codesign -dv` stderr.
+        let codesignOutput = """
+            Executable=/Applications/LLMMonitor.app/Contents/MacOS/LLMMonitor
+            Identifier=com.llm-monitor.app
+            Format=app bundle with Mach-O universal (x86_64 arm64)
+            CodeDirectory v=20400 size=582 flags=0x2(adhoc) hashes=11+5
+            TeamIdentifier=not set
+            """
+        expectEqual(SignatureGate.parseTeamIdentifier(from: codesignOutput), nil,
+                    "ad-hoc \"not set\" team parses to nil")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: """
+            Identifier=com.llm-monitor.app
+            TeamIdentifier=W2G9X7KLQC
+            Sealed Resources=none
+            """), "W2G9X7KLQC", "a real Developer ID team identifier parses")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: "code object is not signed at all"), nil,
+                    "unsigned bundle output parses to nil")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: ""), nil,
+                    "empty output parses to nil")
+        expectEqual(SignatureGate.parseTeamIdentifier(from: "  TeamIdentifier=W2G9X7KLQC  \n"), "W2G9X7KLQC",
+                    "team parse trims surrounding whitespace")
+        expectEqual(SignatureGate.developerIDRequirement(for: "W2G9X7KLQ!"), nil,
+                    "malformed team cannot enter a signing requirement")
+        guard let requirement = SignatureGate.developerIDRequirement(for: "W2G9X7KLQC") else {
+            expect(false, "valid team produces a Developer ID Application requirement")
+            return
+        }
+        expect(requirement.contains("certificate leaf[subject.OU] = \"W2G9X7KLQC\""),
+               "the requirement binds the certificate to the reported team")
+        #if os(macOS)
+        do {
+            // Have Apple's tools compile the production requirement and
+            // evaluate it against a real, Apple-signed system executable.
+            let compiled = try AccountSyncRemote.runProcess(executable: "/usr/bin/csreq",
+                arguments: ["-r", "=\(requirement)", "-t"], timeout: 10)
+            expect(!compiled.timedOut && compiled.status == 0, "macOS compiles the Developer ID requirement")
+            let assessed = try AccountSyncRemote.runProcess(executable: "/usr/bin/codesign",
+                arguments: ["--verify", "-R=\(requirement)", "/usr/bin/true"], timeout: 10)
+            expect(!assessed.timedOut && assessed.status != 0, "an Apple platform binary fails the Developer ID team requirement")
+        } catch {
+            expect(false, "could not exercise macOS signing tools: \(error)")
+        }
+        #endif
+
+        // The degrade-to-manual state: not an install failure, offered
+        // version-scoped so a 24h re-check of the same refused release does
+        // not resurrect a button that would only download and refuse again.
+        let checker = UpdateChecker()
+        let unsignedOffer = UpdateInfo(
+            version: "9.9.9",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.9",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.9/LLMMonitor.zip",
+            sha256: String(repeating: "ab", count: 32))
+        let signedOffer = UpdateInfo(
+            version: "9.9.10",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.10",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.10/LLMMonitor.zip",
+            sha256: String(repeating: "cd", count: 32))
+        checker.apply(.offer(unsignedOffer))
+        checker.beginInstall()
+        checker.degradeToManualUpdate(SignatureGate.Refusal.releaseNotDeveloperIDSigned.shortReason)
+        expectEqual(checker.installState, .idle, "a signature refusal is not a failed install")
+        expectEqual(checker.manualUpdateReason, "the release is not Developer ID signed",
+                    "the refusal reason is the manual-update line")
+        expect(checker.updateAvailable != nil, "the offer stands after a refusal")
+        checker.apply(.offer(unsignedOffer))
+        expectEqual(checker.manualUpdateReason, "the release is not Developer ID signed",
+                    "re-offering the same release keeps its refusal")
+        checker.apply(.offer(signedOffer))
+        expectEqual(checker.manualUpdateReason, nil,
+                    "offering a different release clears the refusal for a fresh chance")
+    }
+
+    /// The relaunch helper (#323): it must never launch while the old process
+    /// is alive, and when the launcher fails it must restore the previous
+    /// bundle, relaunch it, record why, and drop the pending record. Runs
+    /// the real script body under `/bin/sh` with a controllable launcher.
+    private static func testUpdateHandoffScript() {
+        struct Layout {
+            let installed: String, backup: String, failure: String, pending: String, log: String, confirm: String
+            let token = "abcd1234"
+        }
+        func withLayout(launcherExit: Int, confirms: Bool = true, _ body: (Layout, String) throws -> Void) {
+            withSelfTestTempDir("handoff") { dir in
+                do {
+                    let fm = FileManager.default
+                    let layout = Layout(
+                        installed: dir.appendingPathComponent("LLMMonitor.app").path,
+                        backup: dir.appendingPathComponent(UpdateHandoff.backupName(token: "abcd1234")).path,
+                        failure: dir.appendingPathComponent("failure.txt").path,
+                        pending: dir.appendingPathComponent("pending.json").path,
+                        log: dir.appendingPathComponent("launches.log").path,
+                        confirm: dir.appendingPathComponent(UpdateHandoff.confirmFileName).path)
+                    for (path, marker) in [(layout.installed, "new"), (layout.backup, "old")] {
+                        try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+                        try Data(marker.utf8).write(to: URL(fileURLWithPath: path + "/marker"))
+                    }
+                    try UpdateHandoff.writePending(
+                        UpdateHandoff.Pending(installedPath: layout.installed, token: layout.token,
+                                              expectedVersion: "9.9.9"), to: layout.pending)
+                    let launcher = try writeStub(in: dir, name: "launcher", body: """
+                        #!/bin/sh
+                        echo "$1" >> '\(layout.log)'
+                        \(confirms && launcherExit == 0 ? "printf '%s' '\(layout.token)' > '\(layout.confirm)'" : ":")
+                        exit \(launcherExit)
+                        """)
+                    try body(layout, launcher)
+                } catch {
+                    expect(false, "handoff scenario threw: \(error)")
+                }
+            }
+        }
+        func marker(_ path: String) -> String? {
+            FileManager.default.contents(atPath: path + "/marker").flatMap { String(data: $0, encoding: .utf8) }
+        }
+        func launches(_ layout: Layout) -> [String] {
+            (FileManager.default.contents(atPath: layout.log).flatMap { String(data: $0, encoding: .utf8) } ?? "")
+                .split(separator: "\n").map(String.init)
+        }
+        func run(_ layout: Layout, _ launcher: String, pid: String, polls: String) throws -> Int32 {
+            let result = try AccountSyncRemote.runProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", UpdateHandoff.relaunchScript, "handoff", pid, layout.installed, layout.backup,
+                            layout.failure, launcher, polls, "0.05", layout.pending, layout.confirm, layout.token],
+                timeout: 30)
+            expect(!result.timedOut, "the handoff script finishes")
+            return result.status
+        }
+        // A pid that has certainly exited: the shell that printed it is gone.
+        let exitedPid: String = {
+            let r = try? AccountSyncRemote.runProcess(
+                executable: "/bin/sh", arguments: ["-c", "echo $$"], timeout: 10)
+            return r.flatMap { String(data: $0.stdout, encoding: .utf8) }?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "999999"
+        }()
+
+        // 1. Old process gone, launch succeeds: new bundle stays, backup kept
+        //    for the new app to confirm, nothing recorded as failed.
+        withLayout(launcherExit: 0) { layout, launcher in
+            let status = try run(layout, launcher, pid: exitedPid, polls: "5")
+            expectEqual(status, 0, "a clean handoff exits 0")
+            expectEqual(launches(layout), [layout.installed], "the new bundle is launched exactly once")
+            expectEqual(marker(layout.installed), "new", "the new bundle stays installed")
+            expect(FileManager.default.fileExists(atPath: layout.backup), "the backup waits for the new app to confirm")
+            expect(!FileManager.default.fileExists(atPath: layout.failure), "no failure recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) != nil, "the pending record stays until confirmation")
+        }
+
+        // 2. Old process still alive after the poll budget: nothing launches,
+        //    the previous bundle is put back, and the reason is recorded.
+        withLayout(launcherExit: 0) { layout, launcher in
+            let status = try run(layout, launcher, pid: String(getpid()), polls: "3")
+            expectEqual(status, 1, "a never-exiting parent fails the handoff")
+            expectEqual(launches(layout), [], "the launcher is never reached while the old process lives")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored at the installed path")
+            expect(!FileManager.default.fileExists(atPath: layout.backup), "the backup was moved back")
+            expectEqual(UpdateHandoff.takeFailure(at: layout.failure),
+                        "the running app did not quit, so the update was rolled back",
+                        "the rollback reason is recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped with the backup")
+        }
+
+        // 3. Old process gone but the launcher fails: restore, relaunch the
+        //    previous bundle, record the error.
+        withLayout(launcherExit: 1) { layout, launcher in
+            let status = try run(layout, launcher, pid: exitedPid, polls: "5")
+            expectEqual(status, 1, "a failed launch fails the handoff")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored after a failed launch")
+            expect(!FileManager.default.fileExists(atPath: layout.backup), "the backup was moved back")
+            expectEqual(launches(layout), [layout.installed, layout.installed],
+                        "the new bundle is tried, then the restored previous bundle is relaunched")
+            expectEqual(UpdateHandoff.takeFailure(at: layout.failure),
+                        "the updated app could not be launched; the previous version was restored",
+                        "the launch failure is recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped")
+        }
+
+        // 4. The launcher accepts the request but the app never confirms it
+        //    reached startup: restore, relaunch the previous bundle, record why.
+        withLayout(launcherExit: 0, confirms: false) { layout, launcher in
+            let status = try run(layout, launcher, pid: exitedPid, polls: "4")
+            expectEqual(status, 1, "an unconfirmed launch fails the handoff")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored when startup is never confirmed")
+            expect(!FileManager.default.fileExists(atPath: layout.backup), "the backup was moved back")
+            expectEqual(launches(layout), [layout.installed, layout.installed],
+                        "the unconfirmed bundle is tried, then the previous bundle is relaunched")
+            expectEqual(UpdateHandoff.takeFailure(at: layout.failure),
+                        "the updated app did not finish starting; the previous version was restored",
+                        "the missing confirmation is recorded")
+            expect(UpdateHandoff.readPending(at: layout.pending) == nil, "the pending record is dropped")
+        }
+
+        // 5. A confirmation carrying another install's token does not count.
+        withLayout(launcherExit: 0, confirms: false) { layout, _ in
+            let stub = try writeStub(in: URL(fileURLWithPath: layout.installed).deletingLastPathComponent(), name: "wrong-token-launcher", body: """
+                #!/bin/sh
+                echo "$1" >> '\(layout.log)'
+                printf '%s' 'ffffffff' > '\(layout.confirm)'
+                exit 0
+                """)
+            let status = try run(layout, stub, pid: exitedPid, polls: "4")
+            expectEqual(status, 1, "another install's confirmation does not satisfy the helper")
+            expectEqual(marker(layout.installed), "old", "the previous bundle is restored")
+        }
+
+        // 6. A restore that cannot happen keeps the pending record that names
+        //    the backup.
+        withLayout(launcherExit: 1) { layout, launcher in
+            try FileManager.default.removeItem(atPath: layout.backup)
+            let status = try run(layout, launcher, pid: exitedPid, polls: "3")
+            expectEqual(status, 1, "an unrestorable launch failure still fails the handoff")
+            expect(UpdateHandoff.readPending(at: layout.pending) != nil,
+                   "the record survives when the backup could not be moved back")
+        }
+    }
+
+    /// The recovery backup belongs to the install that created it (#323): a
+    /// second copy launched beside it, or a rolled-back old version, must not
+    /// delete it; only the new bundle at the installed path, at the expected
+    /// version, may.
+    private static func testUpdateBackupOwnership() {
+        let pending = UpdateHandoff.Pending(
+            installedPath: "/Applications/LLMMonitor.app",
+            token: "abc12345",
+            expectedVersion: "9.9.9")
+        let derivedBackup = "/Applications/.LLMMonitor.app.old-abc12345"
+        expectEqual(pending.backupPath, derivedBackup, "the backup is derived from the install location and token")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor.app",
+                                         runningVersion: "9.9.9"),
+            derivedBackup, "the confirmed new install removes its backup")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor 2.app",
+                                         runningVersion: "9.9.9"),
+            nil, "a second copy beside the backup must not delete it")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Users/x/Downloads/LLMMonitor.app",
+                                         runningVersion: "9.9.9"),
+            nil, "a copy elsewhere must not delete it")
+        expectEqual(
+            UpdateHandoff.backupToRemove(pending: pending, runningBundlePath: "/Applications/LLMMonitor.app",
+                                         runningVersion: "2.2.0"),
+            nil, "the old version at the installed path has not confirmed the new one")
+        expectEqual(
+            UpdateHandoff.backupName(token: "abc12345"), ".LLMMonitor.app.old-abc12345",
+            "backup names are per-install")
+
+        // A stale or malformed record cannot aim deletion elsewhere.
+        for bad in ["", "../../x", "/Users/x/Documents", "abc1234", "abc123456", "abc/2345", "ghijklmn"] {
+            let record = UpdateHandoff.Pending(
+                installedPath: "/Applications/LLMMonitor.app", token: bad, expectedVersion: "9.9.9")
+            expectEqual(record.backupPath, nil, "token \"\(bad)\" names no backup")
+            expectEqual(
+                UpdateHandoff.backupToRemove(pending: record, runningBundlePath: "/Applications/LLMMonitor.app",
+                                             runningVersion: "9.9.9"),
+                nil, "an invalid token deletes nothing")
+        }
+        expectEqual(
+            UpdateHandoff.backupPath(installedPath: "/Applications", token: "abc12345"), nil,
+            "an installed path that is not an app bundle names no backup")
+        expectEqual(
+            UpdateHandoff.backupPath(installedPath: "/Users/x/Apps/LLMMonitor.app", token: "ABC12345"),
+            "/Users/x/Apps/.LLMMonitor.app.old-ABC12345", "the backup stays beside the installed bundle")
+
+        withSelfTestTempDir("handoff-pending") { dir in
+            let path = dir.appendingPathComponent(UpdateHandoff.pendingFileName).path
+            do {
+                try UpdateHandoff.writePending(pending, to: path)
+                expectEqual(UpdateHandoff.readPending(at: path), pending, "the pending record round-trips")
+                UpdateHandoff.clearPending(at: path)
+                expect(UpdateHandoff.readPending(at: path) == nil, "clearing removes the record")
+                let failure = dir.appendingPathComponent(UpdateHandoff.failureFileName).path
+                try Data("  boom \n".utf8).write(to: URL(fileURLWithPath: failure))
+                expectEqual(UpdateHandoff.takeFailure(at: failure), "boom", "the failure line is trimmed")
+                expect(UpdateHandoff.takeFailure(at: failure) == nil, "a failure is reported once")
+            } catch {
+                expect(false, "pending record I/O threw: \(error)")
+            }
+        }
+    }
+
+    /// The popover's view of the last check and the install (#323): a failed
+    /// refresh is visible *alongside* a retained offer, and an obsolete install
+    /// failure clears once the offer goes away.
+    private static func testUpdatePopoverStateConsistency() {
+        let offer = UpdateInfo(
+            version: "9.9.9",
+            releaseURL: "https://github.com/2AMLogic/llm-monitor/releases/tag/v9.9.9",
+            archiveURL: "https://github.com/2AMLogic/llm-monitor/releases/download/v9.9.9/LLMMonitor.zip",
+            sha256: String(repeating: "ab", count: 32))
+
+        // Offer, then a failed refresh: both are shown (two rows).
+        let a = UpdateChecker()
+        a.apply(.offer(offer))
+        expectEqual(a.noticeRows, 1, "an offer alone is one row")
+        a.apply(.failed("offline"))
+        expectEqual(a.updateAvailable, offer, "the offer is retained")
+        expectEqual(a.lastCheckFailure, "offline", "the refresh failure is recorded beside it")
+        expectEqual(a.noticeRows, 2, "offer and refresh failure both render")
+        a.apply(.offer(offer))
+        expectEqual(a.noticeRows, 1, "a successful refresh drops the failure line")
+
+        // Install failure, then the offer disappears (equal/older release):
+        // the stale failure must not keep the strip alive.
+        let b = UpdateChecker()
+        b.apply(.offer(offer))
+        b.beginInstall()
+        b.failInstall("could not replace the installed app")
+        expectEqual(b.noticeRows, 1, "an install failure is one row")
+        b.apply(.uptodate)
+        expectEqual(b.installState, .idle, "an obsolete install failure clears with the offer")
+        expect(!b.hasNotice, "nothing left to show")
+
+        // The same when a refresh fails after the offer is gone: failure only.
+        b.apply(.failed("offline"))
+        expectEqual(b.noticeRows, 1, "a refresh failure alone is one row")
+
+        // Up-to-date also clears a manual-update refusal tied to the old offer.
+        let c = UpdateChecker()
+        c.apply(.offer(offer))
+        c.degradeToManualUpdate("the release is not Developer ID signed")
+        c.apply(.uptodate)
+        expectEqual(c.manualUpdateReason, nil, "no offer, no manual-update reason")
+
+        // Startup after a rolled-back update: the recorded reason survives the
+        // launch's own successful feed refresh of the same release, until the
+        // user dismisses it or starts another install.
+        let d = UpdateChecker()
+        d.recordHandoffFailure("the updated app did not finish starting; the previous version was restored")
+        d.apply(.offer(offer))
+        expectEqual(d.handoffFailure,
+                    "the updated app did not finish starting; the previous version was restored",
+                    "a successful refresh keeps the rollback reason")
+        expectEqual(d.noticeRows, 2, "the offer and the rollback reason both render")
+        d.apply(.uptodate)
+        expectEqual(d.noticeRows, 1, "the rollback reason outlives the offer")
+        d.dismissHandoffFailure()
+        expect(!d.hasNotice, "dismissing clears it")
+        d.recordHandoffFailure("rolled back")
+        d.apply(.offer(offer))
+        d.beginInstall()
+        expectEqual(d.handoffFailure, nil, "starting another install clears the old reason")
+    }
+
+    /// The hand-rolled SHA-256 against published FIPS 180-4 vectors — what
+    /// makes `AppUpdater`'s digest comparison trustworthy despite the
+    /// package's zero-dependency rule. Vectors cross-checked with
+    /// coreutils `sha256sum`.
+    private static func testSHA256KnownVectors() {
+        expectEqual(SHA256.hex(Data()),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "empty-message vector")
+        expectEqual(SHA256.hex(Data("abc".utf8)),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                    "abc vector")
+        expectEqual(SHA256.hex(Data("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".utf8)),
+                    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+                    "56-byte vector (length field pushes into a second block)")
+        expectEqual(SHA256.hex(Data(repeating: 0x61, count: 64)),
+                    "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+                    "exactly-one-block message")
+        expectEqual(SHA256.hex(Data(repeating: 0x61, count: 128)),
+                    "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e",
+                    "multi-block message")
     }
 
     // MARK: - Window model

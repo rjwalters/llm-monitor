@@ -80,7 +80,7 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 ### 2. Download
 
 Grab `LLMMonitor.zip` from
-[Releases](https://github.com/rjwalters/llm-monitor/releases), unzip, and
+[Releases](https://github.com/2AMLogic/llm-monitor/releases), unzip, and
 move `LLMMonitor.app` to `/Applications`.
 
 **First run:** right-click → **Open** (required for unsigned apps).
@@ -111,6 +111,48 @@ needed. If you ever need to revoke and replace one (e.g., after a leak), see
 3. Click **Add Account** (or **Register CODEX_HOME**).
 
 Your usage data shows up in the menu bar immediately.
+
+### Staying Current (macOS)
+
+- At launch, and then every 24 hours while running, it reads the latest
+  stable release from
+  [`2AMLogic/llm-monitor`](https://github.com/2AMLogic/llm-monitor/releases).
+- When a **strictly newer** release is out (prereleases never count), the
+  popover's footer and each chart window show the version with an
+  **Update Now** button — including on a fresh install with no accounts yet.
+  Nothing is shown when the app is current.
+- **Update Now** downloads the release's `LLMMonitor.zip` over HTTPS,
+  verifies the bytes against the SHA-256 digest GitHub publishes for that
+  asset, then verifies the extracted bundle's **code signature** —
+  `codesign --verify --deep --strict`, Gatekeeper (`spctl --assess`), and a
+  Developer ID Application certificate from the same team as the running app — before it
+  validates the bundle's identity and version, replaces the installed app in
+  place, and relaunches it. The checksum proves the download is intact; the
+  signature gate proves where it came from. Your settings and usage data
+  (`~/.llm-monitor`) are untouched, and only one install can run at a time.
+- If signature verification fails, the updater discards the staged download
+  with its quarantine intact. The version stays visible. Click **Download
+  from GitHub** to open its release page. The published v2.1.0 app is
+  ad-hoc signed, so moving from it to a Developer ID build requires a manual
+  update. Later releases signed by the same team can update in place.
+- If a check, download, or validation fails, the running version stays put
+  and the popover shows a short reason (details in `~/.llm-monitor/debug.log`
+  under the `Update` category). A failed replace restores the previous
+  bundle; the old version is kept beside the new one until the new version
+  has launched once.
+
+To disable the checks entirely (they are read-only; the button appears only
+when a newer release exists):
+
+```bash
+defaults write com.llm-monitor.app DisableUpdateCheck -bool true
+```
+
+Re-enable with `defaults delete com.llm-monitor.app DisableUpdateCheck` (or
+`-bool false`). The setting is read fresh on every check, so it takes effect
+without relaunching. Self-install requires the app to run from an installed
+`LLMMonitor.app` bundle (a `swift build` debug binary reports that instead of
+updating).
 
 ### Multiple Accounts
 
@@ -784,7 +826,7 @@ installs, upgrades, or troubleshooting.
 ### Build (Linux)
 
 The quickest path needs no Swift toolchain at all: every
-[GitHub Release](https://github.com/rjwalters/llm-monitor/releases) carries
+[GitHub Release](https://github.com/2AMLogic/llm-monitor/releases) carries
 a statically-linked `llm-monitor-linux-x64` asset (no dynamic Swift/
 Foundation dependency — verified in CI via `ldd`), so `curl`-ing it down and
 `chmod +x` is enough to run it on a bare host. To build from source instead:

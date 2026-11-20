@@ -426,12 +426,167 @@ final class ResizeHandleView: NSView {
     }
 }
 
+// MARK: - In-app update control (#323)
+
+/// The one in-app update affordance, shared verbatim by the popover's footer
+/// strip and the chart window's overlay, so both surfaces show the same
+/// state (offer / install progress / short failure) and take the same action
+/// — the self-install itself, except in the signature-gate-refused state,
+/// where the action degrades to opening the release page (operator ruling
+/// 2026-11-19). Renders nothing when there is nothing to say, so "no newer
+/// release" costs no space anywhere.
+struct UpdateOfferControl: View {
+    @ObservedObject var checker: UpdateChecker
+
+    var body: some View {
+        content
+    }
+
+    @ViewBuilder private var content: some View {
+        switch checker.installState {
+        case .idle:
+            // The offer and the last check's failure are independent facts: a
+            // failed re-check keeps the standing offer (UpdateChecker.apply),
+            // so both render, the failure beneath the offer.
+            VStack(alignment: .leading, spacing: 4) {
+            if let offer = checker.updateAvailable {
+                if let manualReason = checker.manualUpdateReason {
+                    // Signature gate refused this release: update-check-only.
+                    // The offer stays, the action opens the release page, and
+                    // nothing installs or strips quarantine by hand from
+                    // here.
+                    Button {
+                        if let url = URL(string: offer.releaseURL) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.up.right.square.fill")
+                            Text("v\(offer.version) available — download from GitHub")
+                        }
+                        .font(.caption)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.gray)
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursorOnHover()
+                    .help("""
+                        Self-install is unavailable: \(manualReason). The running \
+                        app is untouched and nothing was installed. This opens the \
+                        release page — download LLMMonitor.zip and replace the app \
+                        yourself. \(offer.releaseURL)
+                        """)
+                } else {
+                    Button {
+                        AppUpdater.shared.installLatest(from: checker)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("v\(offer.version) available")
+                            Text("Update Now").bold()
+                        }
+                        .font(.caption)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.blue)
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursorOnHover()
+                    .help("""
+                        Downloads the new LLMMonitor.zip from GitHub, verifies it against \
+                        the release's SHA-256 checksum and its code signature (codesign, \
+                        Gatekeeper, and the app's own Developer ID team), replaces this \
+                        app in place and relaunches. Settings and usage data are \
+                        untouched. Release notes: \
+                        \(offer.releaseURL)
+                        """)
+                }
+            }
+            if let failure = checker.lastCheckFailure {
+                HStack(spacing: 6) {
+                    Image(systemName: "wifi.exclamationmark")
+                    Text("Update check failed — \(failure)")
+                        .lineLimit(2)
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .help("""
+                    The app could not read the latest release; the running version is \
+                    unaffected, and the next scheduled check will try again.
+                    """)
+            }
+            if let rollback = checker.handoffFailure {
+                // The last self-update was rolled back; the feed check that
+                // follows launch re-offers the same release, so this line is
+                // the only explanation until the user dismisses it.
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.uturn.backward.circle.fill")
+                    Text("Last update was rolled back — \(rollback)")
+                        .lineLimit(2)
+                    Button("Dismiss") { checker.dismissHandoffFailure() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                .font(.caption)
+                .foregroundColor(.orange)
+                .help("The previous version was restored. Details are in ~/.llm-monitor/debug.log (category Update).")
+            }
+            }
+        case .running(let label):
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(label)
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .quaternaryLabelColor).opacity(0.35))
+            .cornerRadius(6)
+            .help("Updating in place — the running version stays alive until the new one relaunches.")
+        case .failed(let reason):
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text("Update failed — \(reason)")
+                    .lineLimit(2)
+                // Retry is offered only while the offer still stands: with no
+                // candidate, there is nothing to retry into.
+                if checker.updateAvailable != nil {
+                    Button("Retry") {
+                        AppUpdater.shared.installLatest(from: checker)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .font(.caption)
+            .foregroundColor(.red)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.red.opacity(0.08))
+            .cornerRadius(6)
+            .help("The running version is untouched. Details are in ~/.llm-monitor/debug.log (category Update).")
+        }
+    }
+}
+
 struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
     @ObservedObject var heightManager: PopoverHeightManager
     var onAddAccount: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
+    /// Shared release-check state (#323). Observed, never driven: the
+    /// popover renders whatever `UpdateChecker.shared` already knows and
+    /// starts no check of its own — the GUI schedule in `AppDelegate` owns
+    /// checking.
+    @ObservedObject private var updateChecker = UpdateChecker.shared
     @State private var showGitHubLink = false
     @State private var titleHoverTimer: Timer?
     @State private var showRemoveConfirmation = false
@@ -700,6 +855,18 @@ struct UsagePopoverView: View {
                     .help(notice.help)
             }
 
+            // In-app update (#323) — the same state and update action the
+            // chart shows: the offered version with an "Update Now" control,
+            // install progress, or a short failure reason. Rendered with zero
+            // accounts too (a fresh install can already be outdated);
+            // `PopoverHeightManager` reserves the row.
+            if updateChecker.hasNotice {
+                UpdateOfferControl(checker: updateChecker)
+                    .padding(.horizontal)
+                    .padding(.vertical, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             // Footer
             HStack {
                 Button(action: { onAddAccount?() }) {
@@ -757,6 +924,7 @@ struct UsagePopoverView: View {
         .onAppear {
             heightManager.setVisibleProviders(visibleProviders)
             heightManager.setCalibrationNotice(calibrationNotice != nil)
+            heightManager.setUpdateNotice(rows: updateChecker.noticeRows)
             heightManager.update(rowCount: effectiveRowCount)
             clipboardHasAccounts = Self.clipboardContainsAccounts()
             // A persisted tab for a provider that no longer has any account
@@ -768,6 +936,9 @@ struct UsagePopoverView: View {
         }
         .onChange(of: calibrationNotice != nil) { _, shown in
             heightManager.setCalibrationNotice(shown)
+        }
+        .onChange(of: updateChecker.noticeRows) { _, rows in
+            heightManager.setUpdateNotice(rows: rows)
         }
         .onChange(of: effectiveRowCount) { _, newCount in
             heightManager.update(rowCount: newCount)

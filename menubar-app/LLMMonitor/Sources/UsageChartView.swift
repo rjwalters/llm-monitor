@@ -778,26 +778,11 @@ struct UsageChartWindow: View {
         .frame(width: 620, height: 610)
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .bottomLeading) {
-            if let update = updateChecker.updateAvailable {
-                Button(action: {
-                    if let url = URL(string: update.releaseURL) {
-                        NSWorkspace.shared.open(url)
-                    }
-                }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("Update Available: v\(update.version)")
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.blue)
-                    .foregroundColor(.white)
-                    .cornerRadius(6)
-                }
-                .buttonStyle(.plain)
+            // Same state and action as the popover's footer strip (#323);
+            // this window never starts a check of its own — it only observes
+            // the shared `UpdateChecker.shared` result.
+            UpdateOfferControl(checker: updateChecker)
                 .padding(16)
-            }
         }
         .onAppear {
             // Initialize display name from account
@@ -810,7 +795,9 @@ struct UsageChartWindow: View {
                 rangeEnd = initial.end
                 hasInitializedRange = true
             }
-            updateChecker.checkForUpdates()
+            // No update check here (#323): AppDelegate's launch/24-hour
+            // schedule owns checking; charts and the popover only render the
+            // shared result.
         }
         .alert("Clear History?", isPresented: $showClearConfirmation) {
             Button("Cancel", role: .cancel) { }

@@ -40,6 +40,9 @@ class PopoverHeightManager: ObservableObject {
     /// Extra footer height while the calibration notice line (#243) is shown:
     /// one `.caption` line (~14) + its 4pt vertical padding × 2.
     static let calibrationNoticeHeight: CGFloat = 22
+    /// Extra footer height while the in-app update line (#323) is shown: one
+    /// caption-height capsule row (~26) + its 4pt vertical padding × 2.
+    static let updateNoticeHeight: CGFloat = 34
     /// Height of the provider tab strip row (#297): one row of small tab
     /// buttons plus its `.caption2` summary line, padded. Shown exactly
     /// whenever the table has rows — i.e. whenever `contentHeight` is called
@@ -66,6 +69,7 @@ class PopoverHeightManager: ObservableObject {
     private static let showAllRows: CGFloat = 100_000
     private var rowCount = 0
     private var showsCalibrationNotice = false
+    private var updateNoticeRows = 0
     private var dragStartHeight: CGFloat?
     private var dragStartMouseY: CGFloat = 0
     /// The popover content's screen rect when the drag began.
@@ -80,9 +84,14 @@ class PopoverHeightManager: ObservableObject {
 
     /// Content-fitted popover height for `rowCount` account rows, clamped to
     /// [minHeight, maxHeight]. With no rows (setup/empty/error state) a fixed
-    /// setup height is used so the guide isn't cramped.
+    /// setup height is used so the guide isn't cramped — plus the update
+    /// line's height when one is showing, because an update must be offerable
+    /// on a fresh install with no accounts yet (#323), which is exactly when
+    /// one is most likely pending.
     func fittedHeight(rowCount: Int) -> CGFloat {
-        guard rowCount > 0 else { return Self.setupHeight }
+        guard rowCount > 0 else {
+            return Self.setupHeight + CGFloat(updateNoticeRows) * Self.updateNoticeHeight
+        }
         let content = contentHeight(rowCount: rowCount)
         return content.clamped(to: Self.minHeight...Self.maxHeight)
     }
@@ -92,6 +101,7 @@ class PopoverHeightManager: ObservableObject {
     private func contentHeight(rowCount: Int) -> CGFloat {
         Self.chromeHeight + Self.providerTabsHeight
             + (showsCalibrationNotice ? Self.calibrationNoticeHeight : 0)
+            + CGFloat(updateNoticeRows) * Self.updateNoticeHeight
             + CGFloat(rowCount) * Self.rowHeight
     }
 
@@ -99,6 +109,17 @@ class PopoverHeightManager: ObservableObject {
     func setCalibrationNotice(_ shown: Bool) {
         guard shown != showsCalibrationNotice else { return }
         showsCalibrationNotice = shown
+        apply()
+    }
+
+    /// Account for the popover footer's in-app update line (#323) — offer,
+    /// install progress, or short failure. Unlike the calibration notice this
+    /// also applies to the zero-row setup state (see `fittedHeight`).
+    /// `rows` is `UpdateChecker.noticeRows`: an offer and a refresh failure
+    /// stack as two lines.
+    func setUpdateNotice(rows: Int) {
+        guard rows != updateNoticeRows else { return }
+        updateNoticeRows = rows
         apply()
     }
 
@@ -112,7 +133,7 @@ class PopoverHeightManager: ObservableObject {
     /// Popover height for `rowCount` rows: the user's dragged height if set
     /// (never taller than the content or the screen), else the content fit.
     func effectiveHeight(rowCount: Int) -> CGFloat {
-        guard rowCount > 0 else { return Self.setupHeight }
+        guard rowCount > 0 else { return fittedHeight(rowCount: 0) }
         guard let userHeight else { return fittedHeight(rowCount: rowCount) }
         return clampedUserHeight(userHeight)
     }
@@ -296,6 +317,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var popover: NSPopover?
     var timer: Timer?
+    var updateCheckTimer: Timer?
     var usageStore = UsageStore()
     var oauthPoller = OAuthPoller()
     var loginWizardWindow: NSWindow?
@@ -377,6 +399,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial load — sync accounts from the master + local list files, then
         // poll all accounts once (staggers their next-poll times).
         syncThenRefreshAll()
+
+        // In-app update checks (#323): once at launch, then every 24 hours.
+        // The persistent preference documented in README ("Staying Current")
+        // disables both. Only this schedule starts checks — the popover and
+        // charts observe the shared `UpdateChecker.shared` result.
+        scheduleUpdateChecks()
+
+        // A completed self-update leaves its backup and staging directory for
+        // the *new* version to clean up (AppUpdater) — that is now.
+        if let failure = AppUpdater.cleanUpAfterUpdate() {
+            // The relaunch helper rolled the update back and recorded why.
+            UpdateChecker.shared.recordHandoffFailure(failure)
+        }
+    }
+
+    // MARK: - Update checks (#323)
+
+    /// How often the running app re-checks for a newer release.
+    static let updateCheckInterval: TimeInterval = 24 * 60 * 60
+
+    func scheduleUpdateChecks() {
+        if UpdateChecker.disabledByPreference {
+            flog.info(
+                "Update checks disabled by preference (\(UpdateChecker.disablePreferenceKey))",
+                category: "Update")
+        } else {
+            UpdateChecker.shared.checkForUpdates()
+        }
+        // The timer always runs; the preference is re-read on every tick so
+        // toggling it takes effect without a relaunch.
+        updateCheckTimer = Timer.scheduledTimer(
+            withTimeInterval: AppDelegate.updateCheckInterval, repeats: true
+        ) { _ in
+            MainActor.assumeIsolated {
+                guard !UpdateChecker.disabledByPreference else { return }
+                UpdateChecker.shared.checkForUpdates()
+            }
+        }
     }
 
     /// Import accounts from ~/.llm-monitor/accounts.env (+ accounts.local.env)
