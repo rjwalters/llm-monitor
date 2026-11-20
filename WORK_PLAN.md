@@ -3,12 +3,12 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-19T23:50:14Z (snapshot; compare against live labels)_
+_Generated: 2026-11-20T05:52:54Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-_None._
+- **#325**: feat: add in-app update check and one-click self-install for macOS
 
 ## Very Important
 
@@ -47,7 +47,7 @@ _None._
 
 PRs that passed review (`loom:pr`). Held PRs require a human merge decision.
 
-_None._
+- **#325**: feat: add in-app update check and one-click self-install for macOS — closes #323
 
 ## Proposed
 
@@ -72,13 +72,13 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
+| Operator merge-risk holds | 1 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
 | In Progress (`loom:building`) | 4 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 0 |
+| Approved PRs awaiting merge | 1 |
 | Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
